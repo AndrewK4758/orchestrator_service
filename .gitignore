@@ -1,0 +1,15 @@
+# Binaries
+orchestrator_bin
+
+# Go workspace
+*.test
+*.out
+*.prof
+
+# OS specific
+.DS_Store
+.idea/
+.vscode/
+
+# Environment files
+.env
