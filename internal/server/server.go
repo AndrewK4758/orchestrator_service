@@ -57,19 +57,36 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	fileCount := len(req.GetPdfContents())
 	log.Printf("Received %d documents, assigned JobID: %s for Tenant: %s", fileCount, jobID, req.GetTenantId())
 
+	tenantID := req.GetTenantId()
+	if tenantID == "" {
+		tenantID = "SYSTEM_DEFAULT_TENANT"
+	}
+	userID := req.GetUserId()
+	if userID == "" {
+		userID = "SYSTEM_USER"
+	}
+	appID := req.GetAppId()
+	if appID == "" {
+		appID = "DocProcessorSystem"
+	}
+	correlationID := req.GetCorrelationId()
+	if correlationID == "" {
+		correlationID = jobID // Default to job ID to group it by itself
+	}
+
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
-			JobID:              jobID,
-			RawPDFs:            req.GetPdfContents(),
+			JobID:                  jobID,
+			RawPDFs:                req.GetPdfContents(),
 			Action:                 req.GetAction(),
 			Schema:                 req.GetExpectedSchema(),
 			CustomInstructions:     req.GetCustomInstructions(),
 			AllowedClassifications: req.GetAllowedClassifications(),
-			TenantID:               req.GetTenantId(),
-			UserID:             req.GetUserId(),
-			AppID:              req.GetAppId(),
-			DocumentType:       req.GetDocumentType(),
-			CorrelationID:      req.GetCorrelationId(),
+			TenantID:               tenantID,
+			UserID:                 userID,
+			AppID:                  appID,
+			DocumentType:           req.GetDocumentType(),
+			CorrelationID:          correlationID,
 		},
 		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
 	}
