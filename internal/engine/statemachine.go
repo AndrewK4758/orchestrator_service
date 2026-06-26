@@ -12,14 +12,14 @@ import (
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
-	JobID        string
-	RawPDF       []byte
-	Chunks       []pdf.Chunk
-	
+	JobID  string
+	RawPDF []byte
+	Chunks []pdf.Chunk
+
 	// Thread-safe map to store results from concurrent AI extractions
 	mu           sync.Mutex
-	ChunkResults map[int]string 
-	
+	ChunkResults map[int]string
+
 	// Audit trail for visibility
 	ExecutedSteps []string
 	Errors        []error
@@ -47,11 +47,11 @@ func (e *Engine) Register(action Action) {
 	e.registry[action.Name()] = action
 }
 
-// Run executes a defined sequential workflow. 
+// Run executes a defined sequential workflow.
 // Idempotency: Given the same state, it produces the same results.
 func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingState) error {
 	log.Printf("INFO: [Engine.Run] Starting workflow for Job: %s", state.JobID)
-	
+
 	for _, step := range workflow {
 		// Check for cancellation before starting the next step (Resiliency)
 		if err := ctx.Err(); err != nil {
@@ -122,32 +122,32 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 	}
 
 	state.ChunkResults = make(map[int]string)
-	
+
 	// We use an errgroup pattern for safe concurrent execution with fast-failure
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(state.Chunks))
 
 	prompt := "Review these pages. Identify the start and end pages of each distinct document within this chunk. Return a JSON array."
-	
+
 	for i, chunk := range state.Chunks {
 		wg.Add(1)
 		go func(idx int, c pdf.Chunk) {
 			defer wg.Done()
-			
+
 			// Note: We need a utility to convert c.PDFBytes into [][]byte of images before sending.
 			// For now, we mock the sending of native PDF bytes.
-			images := [][]byte{c.PDFBytes} 
-			
+			images := [][]byte{c.PDFBytes}
+
 			resp, err := a.aiClient.ExtractChunk(ctx, images, prompt, "")
 			if err != nil {
 				errChan <- fmt.Errorf("chunk %d extraction failed: %w", idx, err)
 				return
 			}
-			
+
 			state.mu.Lock()
 			state.ChunkResults[idx] = resp.ExtractedJson
 			state.mu.Unlock()
-			
+
 		}(i, chunk)
 	}
 

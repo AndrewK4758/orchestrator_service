@@ -5,10 +5,9 @@ RUN apk add --no-cache git
 
 WORKDIR /app
 
-# In order to support the local `replace ai_service => ../ai_service` go.mod directive,
-# we set the Docker build context to the root doc_processor_Service directory 
-# and copy both services into the builder container.
-COPY ai_service/ ./ai_service/
+# In order to support the local `replace shared_protos` go.mod directive,
+# we set the Docker build context to the root directory
+COPY shared_protos/ ./shared_protos/
 COPY orchestrator_service/ ./orchestrator_service/
 
 WORKDIR /app/orchestrator_service

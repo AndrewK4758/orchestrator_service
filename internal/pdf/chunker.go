@@ -14,7 +14,7 @@ type Chunk struct {
 	StartIndex int
 	EndIndex   int
 	// PDFBytes contains the raw bytes of this specific chunk
-	PDFBytes   []byte
+	PDFBytes []byte
 }
 
 // Chunker is responsible for taking a large PDF and safely splitting it into manageable pieces.
@@ -73,11 +73,11 @@ func (c *Chunker) SplitPDF(ctx context.Context, rawPDF []byte, pagesPerChunk int
 
 		// Extract the specific page range
 		pageSelection := []string{fmt.Sprintf("%d-%d", i, endPage)}
-		
+
 		// Reset reader for extraction
 		reader.Seek(0, 0)
 		var chunkBuffer bytes.Buffer
-		
+
 		err := api.Trim(reader, &chunkBuffer, pageSelection, nil)
 		if err != nil {
 			wrappedErr := fmt.Errorf("failed to extract pages %d to %d from PDF: %w", i, endPage, err)

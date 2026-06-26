@@ -8,8 +8,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	// Import the AI Service's generated protobufs
-	aipb "ai_service/proto"
+	aipb "doc_processor/shared_protos"
 )
 
 // Client wraps the gRPC connection to the AI Service.
@@ -21,7 +20,7 @@ type Client struct {
 // NewClient connects to the AI Service at the given address (e.g., "localhost:50051").
 func NewClient(aiServiceAddress string) (*Client, error) {
 	log.Printf("Connecting to AI Service at %s...", aiServiceAddress)
-	
+
 	// Use insecure credentials for internal microservice communication
 	conn, err := grpc.NewClient(aiServiceAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {

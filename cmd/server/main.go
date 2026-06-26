@@ -10,7 +10,7 @@ import (
 
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/server"
-	pb "orchestrator_service/proto"
+	pb "doc_processor/shared_protos"
 )
 
 func main() {
