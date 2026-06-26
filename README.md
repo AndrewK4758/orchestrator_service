@@ -44,24 +44,35 @@ go run cmd/server/main.go
 
 ## 🧪 Testing with the Dummy Client
 
-This repository includes a test script that mimics a frontend application. It submits a PDF and listens to the live gRPC stream to print the State Machine's progress.
+This repository includes a test script that mimics the C# Dotnet Client application. It demonstrates the multi-turn **CLASSIFY -> PARSE** workflow on a single document.
 
 ```bash
-cd /home/ak/projects/doc_processor_Service/orchestrator_service
+cd /home/ak/projects/doc_processor_service/orchestrator_service
 go run scripts/test_client/main.go /path/to/any/dummy.pdf
 ```
 
 ### Expected Output:
 ```text
-Submitting document to Orchestrator...
-Success! Received Async JobID: job_17000000000
---------------------------------------------------
-Opening gRPC Stream to listen for live progress...
-[STARTING] Initializing workflow
-[CHUNKING] Splitting PDF into batches
-[PROCESSING] Entering state: PROCESSING
-[COMPLETE] Workflow finished successfully
+==================================================
+🚀 STARTING C#-STYLE WORKFLOW SIMULATION
+==================================================
 
-FINAL AI RESULTS:
-[{"document": 1, "status": "success"}]
+[STEP 1] 🧠 Sending 'dummy.pdf' for CLASSIFICATION...
+   -> [Classification] Job job_17000000000 assigned. Waiting for completion...
+      - STARTING: Initializing workflow
+
+📋 CLASSIFICATION RESULT: 
+[{"document_type": "Legal Disclaimer", ...}]
+
+[STEP 2] ⚙️ C# Client Business Logic triggered...
+   - Switch statement activated based on classification
+   - Database queried for required schema fields
+   - Selected Schema for Parsing: {...}
+
+[STEP 3] 🔍 Sending 'dummy.pdf' for FULL PARSING...
+   -> [Parsing] Job job_17000000001 assigned. Waiting for completion...
+      - STARTING: Initializing workflow
+
+✅ FINAL PARSED DATA (Ready for C# Persistence): 
+[{"BorrowerName": "John Doe", "DocumentState": "NEW YORK"}]
 ```

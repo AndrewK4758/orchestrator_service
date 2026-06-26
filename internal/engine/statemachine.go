@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 
 	"orchestrator_service/internal/ai_client"
@@ -14,6 +16,12 @@ import (
 type ProcessingState struct {
 	JobID  string
 	RawPDF []byte
+
+	// Dynamic parameters from the client
+	Action             string
+	Schema             string
+	CustomInstructions string
+
 	Chunks []pdf.Chunk
 
 	// Thread-safe map to store results from concurrent AI extractions
@@ -96,11 +104,27 @@ func NewChunkAction(chunker *pdf.Chunker) *ChunkAction {
 func (a *ChunkAction) Name() string { return "ChunkPDF" }
 
 func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error {
-	// Standardize on 20 pages per chunk to prevent LLM attention loss
-	chunks, err := a.chunker.SplitPDF(ctx, state.RawPDF, 20)
+	// If we are classifying, we just need the first page. Otherwise, standard chunking.
+	pagesPerChunk := 20
+	if envPages := os.Getenv("ORCHESTRATOR_PAGES_PER_CHUNK"); envPages != "" {
+		if p, err := strconv.Atoi(envPages); err == nil && p > 0 {
+			pagesPerChunk = p
+		}
+	}
+	if state.Action == "CLASSIFY" {
+		pagesPerChunk = 1
+	}
+
+	chunks, err := a.chunker.SplitPDF(ctx, state.RawPDF, pagesPerChunk)
 	if err != nil {
 		return err // Error is already wrapped cleanly by the chunker
 	}
+
+	// If classifying, we ONLY want the very first chunk (first page)
+	if state.Action == "CLASSIFY" && len(chunks) > 0 {
+		chunks = chunks[:1]
+	}
+
 	state.Chunks = chunks
 	return nil
 }
@@ -127,18 +151,27 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(state.Chunks))
 
-	prompt := "Review these pages. Identify the start and end pages of each distinct document within this chunk. Return a JSON array."
+	prompt := state.CustomInstructions
+	if prompt == "" {
+		if state.Action == "CLASSIFY" {
+			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_CLASSIFY_PROMPT")
+			if prompt == "" {
+				prompt = "Analyze this page and determine the classification type of this document. Return ONLY a single string matching the document type."
+			}
+		} else {
+			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_PARSE_PROMPT")
+			if prompt == "" {
+				prompt = "Extract data from this document according to the requested schema."
+			}
+		}
+	}
 
 	for i, chunk := range state.Chunks {
 		wg.Add(1)
 		go func(idx int, c pdf.Chunk) {
 			defer wg.Done()
 
-			// Note: We need a utility to convert c.PDFBytes into [][]byte of images before sending.
-			// For now, we mock the sending of native PDF bytes.
-			images := [][]byte{c.PDFBytes}
-
-			resp, err := a.aiClient.ExtractChunk(ctx, images, prompt, "")
+			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, prompt, state.Schema)
 			if err != nil {
 				errChan <- fmt.Errorf("chunk %d extraction failed: %w", idx, err)
 				return

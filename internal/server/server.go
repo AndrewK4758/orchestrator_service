@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
+	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/pdf"
-	pb "doc_processor/shared_protos"
 )
 
 // JobTracker holds the state and update channel for a single job
@@ -55,8 +55,11 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
-			JobID:  jobID,
-			RawPDF: req.GetPdfContent(),
+			JobID:              jobID,
+			RawPDF:             req.GetPdfContent(),
+			Action:             req.GetAction(),
+			Schema:             req.GetExpectedSchema(),
+			CustomInstructions: req.GetCustomInstructions(),
 		},
 		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
 	}
@@ -103,8 +106,25 @@ func (s *OrchestratorServer) runWorkflowAsync(tracker *JobTracker) {
 	}
 
 	// At this point, state.ChunkResults contains the map of extracted JSONs.
-	// For now, we simulate returning it.
-	sendProgress("COMPLETE", "Workflow finished successfully")
+	// We'll stitch them together into a JSON array for the client
+	var finalJSON string
+	if len(tracker.State.ChunkResults) > 0 {
+		finalJSON = "["
+		for _, result := range tracker.State.ChunkResults {
+			if finalJSON != "[" {
+				finalJSON += ","
+			}
+			finalJSON += result
+		}
+		finalJSON += "]"
+	}
+
+	tracker.Updates <- &pb.ProgressUpdate{
+		JobId:            tracker.State.JobID,
+		Status:           "COMPLETE",
+		Message:          "Workflow finished successfully",
+		FinalResultsJson: finalJSON,
+	}
 }
 
 // ListenForProgress streams real-time updates back to the client via gRPC Server Streaming.

@@ -41,9 +41,9 @@ func (c *Client) Close() error {
 }
 
 // ExtractChunk synchronously calls the AI Service to process a chunk of PDF pages.
-func (c *Client) ExtractChunk(ctx context.Context, pageImages [][]byte, prompt string, jsonSchema string) (*aipb.ExtractResponse, error) {
+func (c *Client) ExtractChunk(ctx context.Context, chunkPdf []byte, prompt string, jsonSchema string) (*aipb.ExtractResponse, error) {
 	req := &aipb.ExtractRequest{
-		PageImages:  pageImages,
+		ChunkPdf:    chunkPdf,
 		Prompt:      prompt,
 		JsonSchema:  jsonSchema,
 		ModelChoice: aipb.ModelChoice_MODEL_CHOICE_LOCAL,
