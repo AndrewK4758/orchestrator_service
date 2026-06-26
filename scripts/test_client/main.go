@@ -80,9 +80,8 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for CLASSIFICATION...\n", fileName)
 
 	classifyReq := &pb.SubmitDocumentRequest{
-		PdfContent: pdfBytes,
-		FileName:   fileName,
-		Action:     "CLASSIFY", // Tells Orchestrator to only run a classification workflow
+		PdfContents: [][]byte{pdfBytes},
+		Action:      "CLASSIFY", // Tells Orchestrator to only run a classification workflow
 	}
 
 	classifyRes, err := client.SubmitDocument(context.Background(), classifyReq)
@@ -131,8 +130,7 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 	fmt.Printf("\n[STEP 3] 🔍 Sending '%s' for FULL PARSING...\n", fileName)
 
 	parseReq := &pb.SubmitDocumentRequest{
-		PdfContent:     pdfBytes,
-		FileName:       fileName,
+		PdfContents:    [][]byte{pdfBytes},
 		Action:         "PARSE",
 		ExpectedSchema: mockJSONSchema,
 	}

@@ -51,12 +51,13 @@ func NewServer(aiClient *ai_client.Client) *OrchestratorServer {
 // It returns a job_id instantly while starting the async workflow.
 func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitDocumentRequest) (*pb.SubmitDocumentResponse, error) {
 	jobID := "job_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	log.Printf("Received document: %s, size: %d bytes, assigned JobID: %s", req.GetFileName(), len(req.GetPdfContent()), jobID)
+	fileCount := len(req.GetPdfContents())
+	log.Printf("Received %d documents, assigned JobID: %s", fileCount, jobID)
 
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
 			JobID:              jobID,
-			RawPDF:             req.GetPdfContent(),
+			RawPDFs:            req.GetPdfContents(),
 			Action:             req.GetAction(),
 			Schema:             req.GetExpectedSchema(),
 			CustomInstructions: req.GetCustomInstructions(),

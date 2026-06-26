@@ -5,15 +5,19 @@ import (
 	"net"
 	"os"
 
+	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
+	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/server"
-	pb "doc_processor/shared_protos"
 )
 
 func main() {
+	// Attempt to load .env, ignore error if it doesn't exist
+	_ = godotenv.Load()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "50052" // Using 50052 since ai_service uses 50051

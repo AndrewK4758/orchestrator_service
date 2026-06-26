@@ -14,8 +14,8 @@ import (
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
-	JobID  string
-	RawPDF []byte
+	JobID   string
+	RawPDFs [][]byte
 
 	// Dynamic parameters from the client
 	Action             string
@@ -115,17 +115,21 @@ func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error
 		pagesPerChunk = 1
 	}
 
-	chunks, err := a.chunker.SplitPDF(ctx, state.RawPDF, pagesPerChunk)
-	if err != nil {
-		return err // Error is already wrapped cleanly by the chunker
+	var allChunks []pdf.Chunk
+	for _, raw := range state.RawPDFs {
+		chunks, err := a.chunker.SplitPDF(ctx, raw, pagesPerChunk)
+		if err != nil {
+			return err // Error is already wrapped cleanly by the chunker
+		}
+		allChunks = append(allChunks, chunks...)
 	}
 
 	// If classifying, we ONLY want the very first chunk (first page)
-	if state.Action == "CLASSIFY" && len(chunks) > 0 {
-		chunks = chunks[:1]
+	if state.Action == "CLASSIFY" && len(allChunks) > 0 {
+		allChunks = allChunks[:1]
 	}
 
-	state.Chunks = chunks
+	state.Chunks = allChunks
 	return nil
 }
 
