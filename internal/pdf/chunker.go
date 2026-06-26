@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // Chunk represents a subset of pages from the original PDF.
@@ -45,7 +46,8 @@ func (c *Chunker) SplitPDF(ctx context.Context, rawPDF []byte, pagesPerChunk int
 
 	// 1. Get the total page count
 	reader := bytes.NewReader(rawPDF)
-	pageCount, err := api.PageCount(reader, nil)
+	conf := model.NewDefaultConfiguration()
+	pageCount, err := api.PageCount(reader, conf)
 	if err != nil {
 		// Wrap the error with deep context for visibility
 		wrappedErr := fmt.Errorf("failed to extract page count from PDF (likely corrupt or invalid format): %w", err)
@@ -78,7 +80,7 @@ func (c *Chunker) SplitPDF(ctx context.Context, rawPDF []byte, pagesPerChunk int
 		reader.Seek(0, 0)
 		var chunkBuffer bytes.Buffer
 
-		err := api.Trim(reader, &chunkBuffer, pageSelection, nil)
+		err := api.Trim(reader, &chunkBuffer, pageSelection, conf)
 		if err != nil {
 			wrappedErr := fmt.Errorf("failed to extract pages %d to %d from PDF: %w", i, endPage, err)
 			log.Printf("ERROR: [Chunker.SplitPDF] %v", wrappedErr)
