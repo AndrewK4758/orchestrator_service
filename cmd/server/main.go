@@ -11,6 +11,7 @@ import (
 
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/server"
 )
 
@@ -40,10 +41,21 @@ func main() {
 	}
 	defer aiClient.Close()
 
+	// Connect to NATS JetStream
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = "nats://localhost:4222"
+	}
+	pub, err := events.NewPublisher(natsURL)
+	if err != nil {
+		log.Fatalf("Failed to create NATS publisher: %v", err)
+	}
+	defer pub.Close()
+
 	grpcServer := grpc.NewServer()
 
-	// Register the Orchestrator service and inject the AI Client
-	orchestratorServer := server.NewServer(aiClient)
+	// Register the Orchestrator service and inject the AI Client & Publisher
+	orchestratorServer := server.NewServer(aiClient, pub)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it

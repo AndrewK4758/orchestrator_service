@@ -6,9 +6,12 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/pdf"
 )
 
@@ -17,10 +20,18 @@ type ProcessingState struct {
 	JobID   string
 	RawPDFs [][]byte
 
+	// Compliance & Traceability Metadata
+	TenantID      string
+	UserID        string
+	AppID         string
+	DocumentType  string
+	CorrelationID string
+
 	// Dynamic parameters from the client
-	Action             string
-	Schema             string
-	CustomInstructions string
+	Action                 string
+	Schema                 string
+	CustomInstructions     string
+	AllowedClassifications []string
 
 	Chunks []pdf.Chunk
 
@@ -42,11 +53,13 @@ type Action interface {
 // Engine manages the registration and execution of Actions.
 type Engine struct {
 	registry map[string]Action
+	pub      *events.Publisher
 }
 
-func NewEngine() *Engine {
+func NewEngine(pub *events.Publisher) *Engine {
 	return &Engine{
 		registry: make(map[string]Action),
+		pub:      pub,
 	}
 }
 
@@ -61,10 +74,10 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 	log.Printf("INFO: [Engine.Run] Starting workflow for Job: %s", state.JobID)
 
 	for _, step := range workflow {
-		// Check for cancellation before starting the next step (Resiliency)
 		if err := ctx.Err(); err != nil {
 			err = fmt.Errorf("job %s cancelled at step %s: %w", state.JobID, step, err)
 			state.Errors = append(state.Errors, err)
+			e.publishJobFailed(ctx, state, err.Error())
 			return err
 		}
 
@@ -72,14 +85,15 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 		if !exists {
 			err := fmt.Errorf("critical error: unknown action '%s' in workflow", step)
 			state.Errors = append(state.Errors, err)
+			e.publishJobFailed(ctx, state, err.Error())
 			return err
 		}
 
 		log.Printf("INFO: [Engine.Run] Executing Step: %s", step)
 		if err := action.Execute(ctx, state); err != nil {
-			// Wrap and record the error for full visibility
 			wrappedErr := fmt.Errorf("action '%s' failed: %w", step, err)
 			state.Errors = append(state.Errors, wrappedErr)
+			e.publishJobFailed(ctx, state, wrappedErr.Error())
 			return wrappedErr
 		}
 
@@ -87,7 +101,34 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 	}
 
 	log.Printf("INFO: [Engine.Run] Successfully completed workflow for Job: %s", state.JobID)
+	
+	e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:     events.EventJobCompleted,
+		Timestamp:     time.Now(),
+		TenantID:      state.TenantID,
+		UserID:        state.UserID,
+		AppID:         state.AppID,
+		JobID:         state.JobID,
+		DocumentType:  state.DocumentType,
+		CorrelationID: state.CorrelationID,
+	})
 	return nil
+}
+
+func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, errorMsg string) {
+	e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:     events.EventJobFailed,
+		Timestamp:     time.Now(),
+		TenantID:      state.TenantID,
+		UserID:        state.UserID,
+		AppID:         state.AppID,
+		JobID:         state.JobID,
+		DocumentType:  state.DocumentType,
+		CorrelationID: state.CorrelationID,
+		Error:         errorMsg,
+	})
 }
 
 // --- CORE ACTIONS ---
@@ -136,10 +177,11 @@ func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error
 // ParallelExtractAction fires the chunks to the AI service concurrently.
 type ParallelExtractAction struct {
 	aiClient *ai_client.Client
+	pub      *events.Publisher
 }
 
-func NewParallelExtractAction(client *ai_client.Client) *ParallelExtractAction {
-	return &ParallelExtractAction{aiClient: client}
+func NewParallelExtractAction(client *ai_client.Client, pub *events.Publisher) *ParallelExtractAction {
+	return &ParallelExtractAction{aiClient: client, pub: pub}
 }
 
 func (a *ParallelExtractAction) Name() string { return "ParallelExtract" }
@@ -151,18 +193,50 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 
 	state.ChunkResults = make(map[int]string)
 
-	// We use an errgroup pattern for safe concurrent execution with fast-failure
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(state.Chunks))
 
-	prompt := state.CustomInstructions
-	if prompt == "" {
-		if state.Action == "CLASSIFY" {
+	var prompt string
+	if state.Action == "CLASSIFY" {
+		prompt = state.CustomInstructions
+		if prompt == "" {
 			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_CLASSIFY_PROMPT")
 			if prompt == "" {
-				prompt = "Analyze this page and determine the classification type of this document. Return ONLY a single string matching the document type."
+				prompt = "Analyze this page and determine the classification type of this document."
 			}
-		} else {
+		}
+		
+		// Dynamic Restricted Classification
+		if len(state.AllowedClassifications) > 0 {
+			allowedList := strings.Join(state.AllowedClassifications, ", ")
+			prompt += fmt.Sprintf(" You must strictly choose one of the following classification types: [%s]. If the document cannot be parsed into any of these types, return exactly 'FLAGGED FOR REVIEW'.", allowedList)
+		}
+
+		// Force a strict JSON schema for classification so the client can reliably parse it
+		if state.Schema == "" {
+			// Build the enum list
+			enumValues := ""
+			if len(state.AllowedClassifications) > 0 {
+				for _, allowed := range state.AllowedClassifications {
+					enumValues += fmt.Sprintf(`"%s", `, allowed)
+				}
+			}
+			enumValues += `"FLAGGED FOR REVIEW"`
+
+			state.Schema = fmt.Sprintf(`{
+				"type": "object",
+				"properties": {
+					"classification_type": { 
+						"type": "string",
+						"enum": [%s]
+					}
+				},
+				"required": ["classification_type"]
+			}`, enumValues)
+		}
+	} else {
+		prompt = state.CustomInstructions
+		if prompt == "" {
 			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_PARSE_PROMPT")
 			if prompt == "" {
 				prompt = "Extract data from this document according to the requested schema."
@@ -175,11 +249,53 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 		go func(idx int, c pdf.Chunk) {
 			defer wg.Done()
 
+			a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+				EventID:       fmt.Sprintf("evt_chunk_%s_%d", state.JobID, idx),
+				EventType:     events.EventChunkStarted,
+				Timestamp:     time.Now(),
+				TenantID:      state.TenantID,
+				UserID:        state.UserID,
+				AppID:         state.AppID,
+				JobID:         state.JobID,
+				DocumentType:  state.DocumentType,
+				CorrelationID: state.CorrelationID,
+				ChunkIndex:    idx,
+				TotalChunks:   len(state.Chunks),
+			})
+
 			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, prompt, state.Schema)
 			if err != nil {
+				a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+					EventID:       fmt.Sprintf("evt_chunk_fail_%s_%d", state.JobID, idx),
+					EventType:     events.EventChunkFailed,
+					Timestamp:     time.Now(),
+					TenantID:      state.TenantID,
+					UserID:        state.UserID,
+					AppID:         state.AppID,
+					JobID:         state.JobID,
+					DocumentType:  state.DocumentType,
+					CorrelationID: state.CorrelationID,
+					ChunkIndex:    idx,
+					TotalChunks:   len(state.Chunks),
+					Error:         err.Error(),
+				})
 				errChan <- fmt.Errorf("chunk %d extraction failed: %w", idx, err)
 				return
 			}
+
+			a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+				EventID:       fmt.Sprintf("evt_chunk_comp_%s_%d", state.JobID, idx),
+				EventType:     events.EventChunkCompleted,
+				Timestamp:     time.Now(),
+				TenantID:      state.TenantID,
+				UserID:        state.UserID,
+				AppID:         state.AppID,
+				JobID:         state.JobID,
+				DocumentType:  state.DocumentType,
+				CorrelationID: state.CorrelationID,
+				ChunkIndex:    idx,
+				TotalChunks:   len(state.Chunks),
+			})
 
 			state.mu.Lock()
 			state.ChunkResults[idx] = resp.ExtractedJson
@@ -188,14 +304,10 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 		}(i, chunk)
 	}
 
-	// Wait for all goroutines to finish
 	wg.Wait()
 	close(errChan)
 
-	// Collect any errors
 	for err := range errChan {
-		// If even one chunk fails, we return the error.
-		// Idempotency allows the client to retry safely since we don't mutate external state yet.
 		return err
 	}
 

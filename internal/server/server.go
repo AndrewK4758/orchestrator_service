@@ -10,6 +10,7 @@ import (
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/engine"
+	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/pdf"
 )
 
@@ -25,24 +26,26 @@ type OrchestratorServer struct {
 
 	eng      *engine.Engine
 	aiClient *ai_client.Client
+	pub      *events.Publisher
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
 }
 
 // NewServer creates a new instance of the OrchestratorServer.
-func NewServer(aiClient *ai_client.Client) *OrchestratorServer {
-	// 1. Initialize the State Machine Engine
-	eng := engine.NewEngine()
+func NewServer(aiClient *ai_client.Client, pub *events.Publisher) *OrchestratorServer {
+	// 1. Initialize the State Machine Engine with Publisher
+	eng := engine.NewEngine(pub)
 
 	// 2. Register Actions (the nodes in our DAG)
 	chunker := pdf.NewChunker()
 	eng.Register(engine.NewChunkAction(chunker))
-	eng.Register(engine.NewParallelExtractAction(aiClient))
+	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
 
 	return &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
+		pub:        pub,
 		activeJobs: make(map[string]*JobTracker),
 	}
 }
@@ -52,17 +55,40 @@ func NewServer(aiClient *ai_client.Client) *OrchestratorServer {
 func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitDocumentRequest) (*pb.SubmitDocumentResponse, error) {
 	jobID := "job_" + fmt.Sprintf("%d", time.Now().UnixNano())
 	fileCount := len(req.GetPdfContents())
-	log.Printf("Received %d documents, assigned JobID: %s", fileCount, jobID)
+	log.Printf("Received %d documents, assigned JobID: %s for Tenant: %s", fileCount, jobID, req.GetTenantId())
 
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
 			JobID:              jobID,
 			RawPDFs:            req.GetPdfContents(),
-			Action:             req.GetAction(),
-			Schema:             req.GetExpectedSchema(),
-			CustomInstructions: req.GetCustomInstructions(),
+			Action:                 req.GetAction(),
+			Schema:                 req.GetExpectedSchema(),
+			CustomInstructions:     req.GetCustomInstructions(),
+			AllowedClassifications: req.GetAllowedClassifications(),
+			TenantID:               req.GetTenantId(),
+			UserID:             req.GetUserId(),
+			AppID:              req.GetAppId(),
+			DocumentType:       req.GetDocumentType(),
+			CorrelationID:      req.GetCorrelationId(),
 		},
 		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
+	}
+
+	// Publish Job Started Trace Event
+	err := s.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:     events.EventJobStarted,
+		Timestamp:     time.Now(),
+		TenantID:      tracker.State.TenantID,
+		UserID:        tracker.State.UserID,
+		AppID:         tracker.State.AppID,
+		JobID:         jobID,
+		DocumentType:  tracker.State.DocumentType,
+		CorrelationID: tracker.State.CorrelationID,
+		Message:       fmt.Sprintf("Received %d documents for processing", fileCount),
+	})
+	if err != nil {
+		log.Printf("ERROR: Failed to publish trace event: %v", err)
 	}
 
 	s.mu.Lock()

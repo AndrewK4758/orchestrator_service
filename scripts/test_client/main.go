@@ -79,9 +79,15 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 	// ---------------------------------------------------------
 	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for CLASSIFICATION...\n", fileName)
 
+	correlationID := fmt.Sprintf("corr_%d", time.Now().UnixNano())
 	classifyReq := &pb.SubmitDocumentRequest{
-		PdfContents: [][]byte{pdfBytes},
-		Action:      "CLASSIFY", // Tells Orchestrator to only run a classification workflow
+		PdfContents:   [][]byte{pdfBytes},
+		Action:        "CLASSIFY", // Tells Orchestrator to only run a classification workflow
+		TenantId:      "LawFirm_StaticTest",
+		UserId:        "static.user@test.com",
+		AppId:         "StaticTestClient_Go",
+		CorrelationId: correlationID,
+		DocumentType:  "Unknown",
 	}
 
 	classifyRes, err := client.SubmitDocument(context.Background(), classifyReq)
@@ -133,6 +139,11 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 		PdfContents:    [][]byte{pdfBytes},
 		Action:         "PARSE",
 		ExpectedSchema: mockJSONSchema,
+		TenantId:       "LawFirm_StaticTest",
+		UserId:         "static.user@test.com",
+		AppId:          "StaticTestClient_Go",
+		CorrelationId:  correlationID,
+		DocumentType:   "Attorney Closing Statement", // Mocked classification
 	}
 
 	parseRes, err := client.SubmitDocument(context.Background(), parseReq)
