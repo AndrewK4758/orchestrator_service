@@ -81,7 +81,9 @@ func (c *Chunker) SplitPDF(ctx context.Context, rawPDF []byte, pagesPerChunk int
 		pageSelection := []string{fmt.Sprintf("%d-%d", i, endPage)}
 
 		// Reset reader for extraction
-		reader.Seek(0, 0)
+		if _, err := reader.Seek(0, 0); err != nil {
+			return nil, fmt.Errorf("failed to seek PDF reader for chunk extraction: %w", err)
+		}
 		var chunkBuffer bytes.Buffer
 
 		err := api.Trim(reader, &chunkBuffer, pageSelection, conf)

@@ -103,7 +103,7 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 
 	log.Printf("INFO: [Engine.Run] Successfully completed workflow for Job: %s", state.JobID)
 
-	e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+	err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
 		EventType:     events.EventJobCompleted,
 		Timestamp:     time.Now(),
@@ -114,11 +114,14 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 		DocumentType:  state.DocumentType,
 		CorrelationID: state.CorrelationID,
 	})
+	if err != nil {
+		log.Printf("ERROR: Failed to publish trace event: %v", err)
+	}
 	return nil
 }
 
 func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, errorMsg string) {
-	e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+	err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
 		EventType:     events.EventJobFailed,
 		Timestamp:     time.Now(),
@@ -130,6 +133,9 @@ func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, e
 		CorrelationID: state.CorrelationID,
 		Error:         errorMsg,
 	})
+	if err != nil {
+		log.Printf("ERROR: Failed to publish failure trace event: %v", err)
+	}
 }
 
 // --- CORE ACTIONS ---
@@ -259,7 +265,7 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 		go func(idx int, c pdf.Chunk) {
 			defer wg.Done()
 
-			a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			err := a.pub.PublishTrace(ctx, events.TraceabilityEvent{
 				EventID:       fmt.Sprintf("evt_chunk_%s_%d", state.JobID, idx),
 				EventType:     events.EventChunkStarted,
 				Timestamp:     time.Now(),
@@ -272,10 +278,13 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				ChunkIndex:    idx,
 				TotalChunks:   len(state.Chunks),
 			})
+			if err != nil {
+				log.Printf("ERROR: Failed to publish trace event: %v", err)
+			}
 
 			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, c.TextContent, prompt, state.Schema)
 			if err != nil {
-				a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+				err := a.pub.PublishTrace(ctx, events.TraceabilityEvent{
 					EventID:       fmt.Sprintf("evt_chunk_fail_%s_%d", state.JobID, idx),
 					EventType:     events.EventChunkFailed,
 					Timestamp:     time.Now(),
@@ -289,11 +298,14 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 					TotalChunks:   len(state.Chunks),
 					Error:         err.Error(),
 				})
+				if err != nil {
+					log.Printf("ERROR: Failed to publish failure trace event: %v", err)
+				}
 				errChan <- fmt.Errorf("chunk %d extraction failed: %w", idx, err)
 				return
 			}
 
-			a.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			err = a.pub.PublishTrace(ctx, events.TraceabilityEvent{
 				EventID:       fmt.Sprintf("evt_chunk_comp_%s_%d", state.JobID, idx),
 				EventType:     events.EventChunkCompleted,
 				Timestamp:     time.Now(),
@@ -306,6 +318,9 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				ChunkIndex:    idx,
 				TotalChunks:   len(state.Chunks),
 			})
+			if err != nil {
+				log.Printf("ERROR: Failed to publish trace event: %v", err)
+			}
 
 			state.mu.Lock()
 			state.ChunkResults[idx] = resp.ExtractedJson
