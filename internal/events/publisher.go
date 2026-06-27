@@ -28,6 +28,16 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
 
+	// Ensure the Trace Stream exists
+	ctx := context.Background()
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "TRACE_EVENTS",
+		Subjects: []string{"trace.>"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update jetstream stream: %w", err)
+	}
+
 	return &Publisher{
 		nc: nc,
 		js: js,
@@ -43,8 +53,8 @@ func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) e
 
 	// Publish to a specific subject, e.g., "trace.job.started"
 	subject := fmt.Sprintf("trace.%s", event.EventType)
-	
-	// jetstream.Publish requires a context for the new API
+
+	// Use JetStream publish for guaranteed delivery
 	_, err = p.js.Publish(ctx, subject, eventBytes)
 	if err != nil {
 		return fmt.Errorf("failed to publish trace event to jetstream: %w", err)
