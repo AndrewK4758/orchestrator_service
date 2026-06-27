@@ -161,6 +161,11 @@ func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error
 	}
 	if state.Action == "CLASSIFY" {
 		pagesPerChunk = 1
+		if envClassify := os.Getenv("CLASSIFY_PAGES_LIMIT"); envClassify != "" {
+			if p, err := strconv.Atoi(envClassify); err == nil && p > 0 {
+				pagesPerChunk = p
+			}
+		}
 	}
 
 	var allChunks []pdf.Chunk

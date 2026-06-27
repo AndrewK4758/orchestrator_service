@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -91,13 +93,19 @@ func (p *Publisher) PublishJob(ctx context.Context, jobID string, payload []byte
 	return nil
 }
 
-// ConsumeJobs starts a consumer that processes incoming jobs using the provided handler.
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
+	maxAckPending := 5
+	if envMax := os.Getenv("MAX_ACK_PENDING"); envMax != "" {
+		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
+			maxAckPending = m
+		}
+	}
+
 	cons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
 		Durable:       "orchestrator_jobs_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       30 * time.Minute, // Give AI service up to 30 minutes to process
-		MaxAckPending: 5,                // Concurrency control: max 5 jobs processing simultaneously per instance
+		MaxAckPending: maxAckPending,    // Concurrency control: max jobs processing simultaneously per instance
 		FilterSubject: "jobs.incoming",
 	})
 	if err != nil {

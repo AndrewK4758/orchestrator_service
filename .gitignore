@@ -12,4 +12,4 @@ orchestrator_bin
 .vscode/
 
 # Environment files
-.env
+# .env is committed as this is a private repo
