@@ -12,6 +12,7 @@ import (
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/pdf"
+	"orchestrator_service/internal/registry_client"
 )
 
 // JobTracker holds the state and update channel for a single job
@@ -27,13 +28,14 @@ type OrchestratorServer struct {
 	eng      *engine.Engine
 	aiClient *ai_client.Client
 	pub      *events.Publisher
+    regClient *registry_client.Client
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
 }
 
 // NewServer creates a new instance of the OrchestratorServer.
-func NewServer(aiClient *ai_client.Client, pub *events.Publisher) *OrchestratorServer {
+func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *registry_client.Client) *OrchestratorServer {
 	// 1. Initialize the State Machine Engine with Publisher
 	eng := engine.NewEngine(pub)
 
@@ -41,11 +43,13 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher) *OrchestratorS
 	chunker := pdf.NewChunker()
 	eng.Register(engine.NewChunkAction(chunker))
 	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
+    eng.Register(engine.NewClassifyAction(aiClient, regClient, pub))
 
 	return &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
 		pub:        pub,
+        regClient:  regClient,
 		activeJobs: make(map[string]*JobTracker),
 	}
 }
@@ -138,8 +142,13 @@ func (s *OrchestratorServer) runWorkflowAsync(tracker *JobTracker) {
 
 	ctx := context.Background() // A real app might have a global cancellation context here
 
-	// Define the strict sequential workflow array
-	workflow := []string{"ChunkPDF", "ParallelExtract"}
+	// Define the strict sequential workflow array based on Action
+	var workflow []string
+	if tracker.State.Action == "CLASSIFY" {
+		workflow = []string{"Classify", "ChunkPDF", "ParallelExtract"}
+	} else {
+		workflow = []string{"ChunkPDF", "ParallelExtract"}
+	}
 
 	// Run the engine
 	err := s.eng.Run(ctx, workflow, tracker.State)
