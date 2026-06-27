@@ -173,11 +173,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	s.mu.Lock()
 	s.activeJobs[state.JobID] = tracker
 	s.mu.Unlock()
-	``
-	// Launch the async workflow synchronously relative to the message handler,
-	// because JetStream handles concurrency and acking. Wait, if we run it synchronously,
-	// the consumer will wait for the workflow to finish before pulling the next one.
-	// But we want to ack only when done!
+
 	s.runWorkflowSync(tracker)
 
 	return nil
