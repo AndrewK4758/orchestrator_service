@@ -40,10 +40,11 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// ExtractChunk synchronously calls the AI Service to process a chunk of PDF pages.
-func (c *Client) ExtractChunk(ctx context.Context, chunkPdf []byte, prompt string, jsonSchema string) (*aipb.ExtractResponse, error) {
+// ExtractChunk synchronously calls the AI Service to process a chunk of PDF pages or raw text.
+func (c *Client) ExtractChunk(ctx context.Context, chunkPdf []byte, chunkText string, prompt string, jsonSchema string) (*aipb.ExtractResponse, error) {
 	req := &aipb.ExtractRequest{
 		ChunkPdf:    chunkPdf,
+		ChunkText:   chunkText,
 		Prompt:      prompt,
 		JsonSchema:  jsonSchema,
 		ModelChoice: aipb.ModelChoice_MODEL_CHOICE_LOCAL,

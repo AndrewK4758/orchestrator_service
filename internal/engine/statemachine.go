@@ -17,8 +17,9 @@ import (
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
-	JobID   string
-	RawPDFs [][]byte
+	JobID           string
+	RawPDFs         [][]byte
+	RawTextContents []string
 
 	// Compliance & Traceability Metadata
 	TenantID      string
@@ -101,7 +102,7 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 	}
 
 	log.Printf("INFO: [Engine.Run] Successfully completed workflow for Job: %s", state.JobID)
-	
+
 	e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
 		EventType:     events.EventJobCompleted,
@@ -165,6 +166,15 @@ func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error
 		allChunks = append(allChunks, chunks...)
 	}
 
+	for _, text := range state.RawTextContents {
+		allChunks = append(allChunks, pdf.Chunk{
+			StartIndex:  1,
+			EndIndex:    1,
+			IsText:      true,
+			TextContent: text,
+		})
+	}
+
 	// If classifying, we ONLY want the very first chunk (first page)
 	if state.Action == "CLASSIFY" && len(allChunks) > 0 {
 		allChunks = allChunks[:1]
@@ -205,7 +215,7 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				prompt = "Analyze this page and determine the classification type of this document."
 			}
 		}
-		
+
 		// Dynamic Restricted Classification
 		if len(state.AllowedClassifications) > 0 {
 			allowedList := strings.Join(state.AllowedClassifications, ", ")
@@ -263,7 +273,7 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				TotalChunks:   len(state.Chunks),
 			})
 
-			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, prompt, state.Schema)
+			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, c.TextContent, prompt, state.Schema)
 			if err != nil {
 				a.pub.PublishTrace(ctx, events.TraceabilityEvent{
 					EventID:       fmt.Sprintf("evt_chunk_fail_%s_%d", state.JobID, idx),

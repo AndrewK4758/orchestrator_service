@@ -10,12 +10,16 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// Chunk represents a subset of pages from the original PDF.
+// Chunk represents a subset of pages from the original PDF or a raw text document.
 type Chunk struct {
 	StartIndex int
 	EndIndex   int
 	// PDFBytes contains the raw bytes of this specific chunk
 	PDFBytes []byte
+
+	// Support for raw text chunks
+	IsText      bool
+	TextContent string
 }
 
 // Chunker is responsible for taking a large PDF and safely splitting it into manageable pieces.

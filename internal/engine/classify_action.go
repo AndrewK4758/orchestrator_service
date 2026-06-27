@@ -33,16 +33,23 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 	log.Printf("[ClassifyAction] Starting classification for Job: %s", state.JobID)
 
 	// Combine PDFs if there are multiple, or just classify the first one to determine type
-	if len(state.RawPDFs) == 0 {
-		return fmt.Errorf("no pdf contents provided for classification")
+	if len(state.RawPDFs) == 0 && len(state.RawTextContents) == 0 {
+		return fmt.Errorf("no pdf or text contents provided for classification")
 	}
 
-	pdfBytes := state.RawPDFs[0] // Classify based on the first document for now
+	var pdfBytes []byte
+	var textContent string
+
+	if len(state.RawPDFs) > 0 {
+		pdfBytes = state.RawPDFs[0] // Classify based on the first document for now
+	} else if len(state.RawTextContents) > 0 {
+		textContent = state.RawTextContents[0]
+	}
 
 	// 1. Call AI to Classify
-	prompt := "You are a classification AI. Look at this document and classify it. Output ONLY ONE of the following words: CLOSING, TITLE_OPINION, UNKNOWN."
+	prompt := "You are a classification AI. Look at this document and classify it."
 
-	resp, err := a.aiClient.ExtractChunk(ctx, pdfBytes, prompt, `{"type": "object", "properties": {"classification": {"type": "string"}}}`)
+	resp, err := a.aiClient.ExtractChunk(ctx, pdfBytes, textContent, prompt, `{"type": "object", "properties": {"classification": {"type": "string"}}}`)
 	if err != nil {
 		return fmt.Errorf("AI classification failed: %w", err)
 	}
@@ -82,7 +89,7 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 	state.DocumentType = classification
 	state.CustomInstructions = rulesText
 	state.Schema = schema
-	
+
 	// Change action to EXTRACT so it can proceed to ParallelExtract if desired by the workflow
 	state.Action = "EXTRACT"
 

@@ -25,10 +25,10 @@ type JobTracker struct {
 type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
 
-	eng      *engine.Engine
-	aiClient *ai_client.Client
-	pub      *events.Publisher
-    regClient *registry_client.Client
+	eng       *engine.Engine
+	aiClient  *ai_client.Client
+	pub       *events.Publisher
+	regClient *registry_client.Client
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
@@ -43,13 +43,13 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *reg
 	chunker := pdf.NewChunker()
 	eng.Register(engine.NewChunkAction(chunker))
 	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
-    eng.Register(engine.NewClassifyAction(aiClient, regClient, pub))
+	eng.Register(engine.NewClassifyAction(aiClient, regClient, pub))
 
 	return &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
 		pub:        pub,
-        regClient:  regClient,
+		regClient:  regClient,
 		activeJobs: make(map[string]*JobTracker),
 	}
 }
@@ -82,6 +82,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		State: &engine.ProcessingState{
 			JobID:                  jobID,
 			RawPDFs:                req.GetPdfContents(),
+			RawTextContents:        req.GetRawTextContents(),
 			Action:                 req.GetAction(),
 			Schema:                 req.GetExpectedSchema(),
 			CustomInstructions:     req.GetCustomInstructions(),
