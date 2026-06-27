@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/pdf"
 	"orchestrator_service/internal/registry_client"
+
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // JobTracker holds the state and update channel for a single job
@@ -45,13 +48,22 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *reg
 	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
 	eng.Register(engine.NewClassifyAction(aiClient, regClient, pub))
 
-	return &OrchestratorServer{
+	srv := &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
 		pub:        pub,
 		regClient:  regClient,
 		activeJobs: make(map[string]*JobTracker),
 	}
+
+	// Start consuming incoming jobs from NATS JetStream
+	ctx := context.Background()
+	err := srv.pub.ConsumeJobs(ctx, srv.handleJobMessage)
+	if err != nil {
+		log.Printf("ERROR: Failed to start job consumer: %v", err)
+	}
+
+	return srv
 }
 
 // SubmitDocument handles the initial client request to process a PDF.
@@ -112,13 +124,33 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	if err != nil {
 		log.Printf("ERROR: Failed to publish trace event: %v", err)
 	}
+	state := &engine.ProcessingState{
+		JobID:                  jobID,
+		RawPDFs:                req.GetPdfContents(),
+		RawTextContents:        req.GetRawTextContents(),
+		Action:                 req.GetAction(),
+		Schema:                 req.GetExpectedSchema(),
+		CustomInstructions:     req.GetCustomInstructions(),
+		AllowedClassifications: req.GetAllowedClassifications(),
+		TenantID:               tenantID,
+		UserID:                 userID,
+		AppID:                  appID,
+		DocumentType:           req.GetDocumentType(),
+		CorrelationID:          correlationID,
+	}
 
-	s.mu.Lock()
-	s.activeJobs[jobID] = tracker
-	s.mu.Unlock()
+	// Serialize state and publish to JetStream
+	payload, err := json.Marshal(state)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal job state: %v", err)
+		return nil, fmt.Errorf("failed to process job request")
+	}
 
-	// Launch the async workflow in a background goroutine
-	go s.runWorkflowAsync(tracker)
+	err = s.pub.PublishJob(ctx, jobID, payload)
+	if err != nil {
+		log.Printf("ERROR: Failed to publish job to queue: %v", err)
+		return nil, fmt.Errorf("failed to queue job")
+	}
 
 	return &pb.SubmitDocumentResponse{
 		JobId:  jobID,
@@ -126,8 +158,33 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	}, nil
 }
 
-// runWorkflowAsync is the background orchestrator thread for a specific job
-func (s *OrchestratorServer) runWorkflowAsync(tracker *JobTracker) {
+// handleJobMessage is invoked by the JetStream consumer for each new job
+func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
+	var state engine.ProcessingState
+	if err := json.Unmarshal(msg.Data(), &state); err != nil {
+		return fmt.Errorf("failed to unmarshal job state: %w", err)
+	}
+
+	tracker := &JobTracker{
+		State:   &state,
+		Updates: make(chan *pb.ProgressUpdate, 100),
+	}
+
+	s.mu.Lock()
+	s.activeJobs[state.JobID] = tracker
+	s.mu.Unlock()
+	``
+	// Launch the async workflow synchronously relative to the message handler,
+	// because JetStream handles concurrency and acking. Wait, if we run it synchronously,
+	// the consumer will wait for the workflow to finish before pulling the next one.
+	// But we want to ack only when done!
+	s.runWorkflowSync(tracker)
+
+	return nil
+}
+
+// runWorkflowSync executes the orchestrator workflow for a specific job inline.
+func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 	defer close(tracker.Updates)
 
 	// Helper to push progress to the gRPC stream channel
