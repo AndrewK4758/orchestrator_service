@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -48,6 +49,12 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 
 	// 1. Call AI to Classify
 	prompt := "You are a classification AI. Look at this document and classify it."
+	if state.CustomInstructions != "" {
+		prompt += "\n" + state.CustomInstructions
+	}
+	if len(state.AllowedClassifications) > 0 {
+		prompt += fmt.Sprintf("\nYou MUST classify it as exactly one of these: %s. If it doesn't match, return 'UNKNOWN'.", strings.Join(state.AllowedClassifications, ", "))
+	}
 
 	resp, err := a.aiClient.ExtractChunk(ctx, pdfBytes, textContent, prompt, `{"type": "object", "properties": {"classification": {"type": "string"}}}`)
 	if err != nil {
@@ -60,30 +67,50 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 
 	log.Printf("[ClassifyAction] AI Raw Response: %s", resp.ExtractedJson)
 
-	// Very simple parsing since the prompt says to return JSON
-	// The AI will return {"classification": "CLOSING"}
-	classification := "UNKNOWN"
-	if strings.Contains(strings.ToUpper(resp.ExtractedJson), "CLOSING") {
-		classification = "CLOSING"
-	} else if strings.Contains(strings.ToUpper(resp.ExtractedJson), "TITLE_OPINION") {
-		classification = "TITLE_OPINION"
+	type ClassifyResult struct {
+		Classification string `json:"classification"`
+	}
+	var result ClassifyResult
+	if err := json.Unmarshal([]byte(resp.ExtractedJson), &result); err != nil {
+		log.Printf("Failed to unmarshal AI response: %v", err)
+	}
+	
+	classification := strings.ToUpper(strings.TrimSpace(result.Classification))
+	if classification == "" {
+		classification = "UNKNOWN"
 	}
 
 	log.Printf("[ClassifyAction] Classified as: %s", classification)
 
 	if classification == "UNKNOWN" {
-		// Log and possibly halt or fallback
+		// Log and continue, let the client or subsequent steps handle UNKNOWN
 		log.Printf("Classification UNKNOWN for Job: %s", state.JobID)
-		return fmt.Errorf("could not classify document")
+		state.DocumentType = "UNKNOWN"
+		// If it's CLASSIFY_ONLY, we just return nil so it can send the final JSON.
+		// If it's a full workflow, it will probably fail in the next step (or we can just let it try).
+		return nil
+	}
+
+	if state.Action == "CLASSIFY_ONLY" {
+		log.Printf("[ClassifyAction] Action is CLASSIFY_ONLY, skipping schema lookup for %s", classification)
+		state.DocumentType = classification
+		return nil
 	}
 
 	// 2. Fetch Rules and Schema from Artemis Registry
 	rulesText, schema, err := a.registryClient.GetRules(ctx, classification)
 	if err != nil {
-		return fmt.Errorf("failed to get rules from Artemis for %s: %w", classification, err)
+		log.Printf("Warning: failed to get rules from Artemis for %s: %v", classification, err)
+		if state.Schema != "" {
+			log.Printf("Falling back to provided schema and instructions for %s", classification)
+			rulesText = state.CustomInstructions
+			schema = state.Schema
+		} else {
+			return fmt.Errorf("failed to get rules from Artemis and no fallback schema provided: %w", err)
+		}
+	} else {
+		log.Printf("[ClassifyAction] Successfully fetched rules and schema for %s", classification)
 	}
-
-	log.Printf("[ClassifyAction] Successfully fetched rules and schema for %s", classification)
 
 	// 3. Update State
 	state.DocumentType = classification
@@ -92,6 +119,6 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 
 	// Change action to EXTRACT so it can proceed to ParallelExtract if desired by the workflow
 	state.Action = "EXTRACT"
-
+	
 	return nil
 }

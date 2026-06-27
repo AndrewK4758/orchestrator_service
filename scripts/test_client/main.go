@@ -74,15 +74,24 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 	}
 	fileName := filepath.Base(inputPath)
 
-	// ---------------------------------------------------------
-	// STEP 1: CLASSIFY
-	// ---------------------------------------------------------
-	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for CLASSIFICATION...\n", fileName)
+	mockJSONSchema := `{
+		"type": "object",
+		"properties": {
+			"OrderNumber": {"type": "string"},
+			"BorrowerName": {"type": "string"},
+			"DocumentState": {"type": "string", "description": "The state mentioned in the closing attorney's statement"}
+		},
+		"required": ["BorrowerName", "DocumentState"]
+	}`
+
+	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for FULL PIPELINE (Classify -> Parse)...\n", fileName)
 
 	correlationID := fmt.Sprintf("corr_%d", time.Now().UnixNano())
-	classifyReq := &pb.SubmitDocumentRequest{
-		PdfContents:   [][]byte{pdfBytes},
-		Action:        "CLASSIFY", // Tells Orchestrator to only run a classification workflow
+	req := &pb.SubmitDocumentRequest{
+		PdfContents:    [][]byte{pdfBytes},
+		Action:         "CLASSIFY", // Tells Orchestrator to run classification, then automatically parse
+		ExpectedSchema: mockJSONSchema, // Provide fallback schema in case Artemis is unreachable
+		CustomInstructions: "Extract the fields accurately.",
 		TenantId:      "LawFirm_StaticTest",
 		UserId:        "static.user@test.com",
 		AppId:         "StaticTestClient_Go",
@@ -90,75 +99,17 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 		DocumentType:  "Unknown",
 	}
 
-	classifyRes, err := client.SubmitDocument(context.Background(), classifyReq)
+	res, err := client.SubmitDocument(context.Background(), req)
 	if err != nil {
-		log.Printf("Failed to submit classification request: %v", err)
+		log.Printf("Failed to submit request: %v", err)
 		return
 	}
 
-	classificationJSON := listenForResults(client, classifyRes.GetJobId(), "Classification")
-	fmt.Printf("\n📋 CLASSIFICATION RESULT: \n%s\n", classificationJSON)
-
-	// ---------------------------------------------------------
-	// STEP 2: MOCK C# BUSINESS LOGIC (SWITCH STATEMENT)
-	// ---------------------------------------------------------
-	fmt.Println("\n[STEP 2] ⚙️ C# Client Business Logic triggered...")
-	fmt.Println("   - Switch statement activated based on classification")
-	fmt.Println("   - Database queried for required schema fields")
-
-	// We'll assume the LLM classified it as an "Attorney Closing Statement" for this test file
-	mockJSONSchema := `{
-		"type": "object",
-		"properties": {
-			"OrderNumber": {"type": "string"},
-			"BorrowerName": {"type": "string"},
-			"StreetNumber": {"type": "string"},
-			"StreetName": {"type": "string"},
-			"StreetSuffix": {"type": "string"},
-			"City": {"type": "string"},
-			"State": {"type": "string"},
-			"ZipCode": {"type": "string"},
-			"County": {"type": ["string", "null"]},
-			"LoanNumber": {"type": "string"},
-			"AttorneyName": {"type": "string"},
-			"DocumentState": {"type": "string", "description": "The state mentioned in the closing attorney's statement, e.g., NEW YORK"},
-			"RocketCloseIdentifier": {"type": "string"},
-			"SenderId": {"type": "string"}
-		},
-		"required": ["BorrowerName", "DocumentState"]
-	}`
-
-	fmt.Printf("   - Selected Schema for Parsing: \n%s\n", mockJSONSchema)
-
-	// ---------------------------------------------------------
-	// STEP 3: PARSE
-	// ---------------------------------------------------------
-	fmt.Printf("\n[STEP 3] 🔍 Sending '%s' for FULL PARSING...\n", fileName)
-
-	parseReq := &pb.SubmitDocumentRequest{
-		PdfContents:    [][]byte{pdfBytes},
-		Action:         "PARSE",
-		ExpectedSchema: mockJSONSchema,
-		TenantId:       "LawFirm_StaticTest",
-		UserId:         "static.user@test.com",
-		AppId:          "StaticTestClient_Go",
-		CorrelationId:  correlationID,
-		DocumentType:   "Attorney Closing Statement", // Mocked classification
-	}
-
-	parseRes, err := client.SubmitDocument(context.Background(), parseReq)
-	if err != nil {
-		log.Printf("Failed to submit parse request: %v", err)
-		return
-	}
-
-	parsedJSON := listenForResults(client, parseRes.GetJobId(), "Parsing")
-	fmt.Printf("\n✅ FINAL PARSED DATA (Ready for C# Persistence): \n%s\n", parsedJSON)
+	finalJSON := listenForResults(client, res.GetJobId(), "Pipeline")
+	fmt.Printf("\n✅ FINAL PARSED DATA (Ready for C# Persistence): \n%s\n", finalJSON)
 
 	fmt.Println("\n==================================================")
 	fmt.Println("🏁 WORKFLOW COMPLETE FOR", fileName)
-	fmt.Println("   - C# Client would now save this to the DB")
-	fmt.Println("   - C# Client would trigger automated emails")
 	fmt.Println("==================================================")
 }
 

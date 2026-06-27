@@ -70,7 +70,7 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *reg
 // It returns a job_id instantly while starting the async workflow.
 func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitDocumentRequest) (*pb.SubmitDocumentResponse, error) {
 	jobID := "job_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	fileCount := len(req.GetPdfContents())
+	fileCount := len(req.GetPdfContents()) + len(req.GetRawTextContents())
 	log.Printf("Received %d documents, assigned JobID: %s for Tenant: %s", fileCount, jobID, req.GetTenantId())
 
 	tenantID := req.GetTenantId()
@@ -200,6 +200,8 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 	var workflow []string
 	if tracker.State.Action == "CLASSIFY" {
 		workflow = []string{"Classify", "ChunkPDF", "ParallelExtract"}
+	} else if tracker.State.Action == "CLASSIFY_ONLY" {
+		workflow = []string{"Classify"}
 	} else {
 		workflow = []string{"ChunkPDF", "ParallelExtract"}
 	}
@@ -215,7 +217,10 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 	// At this point, state.ChunkResults contains the map of extracted JSONs.
 	// We'll stitch them together into a JSON array for the client
 	var finalJSON string
-	if len(tracker.State.ChunkResults) > 0 {
+	if tracker.State.Action == "CLASSIFY_ONLY" {
+		// Just return the classification type in the final JSON
+		finalJSON = fmt.Sprintf(`{"classification_type": "%s"}`, tracker.State.DocumentType)
+	} else if len(tracker.State.ChunkResults) > 0 {
 		finalJSON = "["
 		for _, result := range tracker.State.ChunkResults {
 			if finalJSON != "[" {
@@ -239,12 +244,23 @@ func (s *OrchestratorServer) ListenForProgress(req *pb.ListenRequest, stream pb.
 	jobID := req.GetJobId()
 	log.Printf("Client listening for progress on job: %s", jobID)
 
-	s.mu.RLock()
-	tracker, exists := s.activeJobs[jobID]
-	s.mu.RUnlock()
+	var tracker *JobTracker
+	var exists bool
+	
+	// Wait up to 30 seconds for the JetStream consumer to pick up the job and populate activeJobs
+	for i := 0; i < 30; i++ {
+		s.mu.RLock()
+		tracker, exists = s.activeJobs[jobID]
+		s.mu.RUnlock()
+
+		if exists {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
 
 	if !exists {
-		return fmt.Errorf("job %s not found or already expired", jobID)
+		return fmt.Errorf("job %s not found or already expired after waiting", jobID)
 	}
 
 	// Read from the Go channel and push over the gRPC network stream

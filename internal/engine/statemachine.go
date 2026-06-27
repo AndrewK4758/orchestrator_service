@@ -51,13 +51,18 @@ type Action interface {
 	Execute(ctx context.Context, state *ProcessingState) error
 }
 
+// TracePublisher allows decoupling the engine from the concrete JetStream publisher.
+type TracePublisher interface {
+	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
+}
+
 // Engine manages the registration and execution of Actions.
 type Engine struct {
 	registry map[string]Action
-	pub      *events.Publisher
+	pub      TracePublisher
 }
 
-func NewEngine(pub *events.Publisher) *Engine {
+func NewEngine(pub TracePublisher) *Engine {
 	return &Engine{
 		registry: make(map[string]Action),
 		pub:      pub,
@@ -103,38 +108,42 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 
 	log.Printf("INFO: [Engine.Run] Successfully completed workflow for Job: %s", state.JobID)
 
-	err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType:     events.EventJobCompleted,
-		Timestamp:     time.Now(),
-		TenantID:      state.TenantID,
-		UserID:        state.UserID,
-		AppID:         state.AppID,
-		JobID:         state.JobID,
-		DocumentType:  state.DocumentType,
-		CorrelationID: state.CorrelationID,
-	})
-	if err != nil {
-		log.Printf("ERROR: Failed to publish trace event: %v", err)
+	if e.pub != nil {
+		err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+			EventType:     events.EventJobCompleted,
+			Timestamp:     time.Now(),
+			TenantID:      state.TenantID,
+			UserID:        state.UserID,
+			AppID:         state.AppID,
+			JobID:         state.JobID,
+			DocumentType:  state.DocumentType,
+			CorrelationID: state.CorrelationID,
+		})
+		if err != nil {
+			log.Printf("ERROR: Failed to publish trace event: %v", err)
+		}
 	}
 	return nil
 }
 
 func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, errorMsg string) {
-	err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType:     events.EventJobFailed,
-		Timestamp:     time.Now(),
-		TenantID:      state.TenantID,
-		UserID:        state.UserID,
-		AppID:         state.AppID,
-		JobID:         state.JobID,
-		DocumentType:  state.DocumentType,
-		CorrelationID: state.CorrelationID,
-		Error:         errorMsg,
-	})
-	if err != nil {
-		log.Printf("ERROR: Failed to publish failure trace event: %v", err)
+	if e.pub != nil {
+		err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+			EventType:     events.EventJobFailed,
+			Timestamp:     time.Now(),
+			TenantID:      state.TenantID,
+			UserID:        state.UserID,
+			AppID:         state.AppID,
+			JobID:         state.JobID,
+			DocumentType:  state.DocumentType,
+			CorrelationID: state.CorrelationID,
+			Error:         errorMsg,
+		})
+		if err != nil {
+			log.Printf("ERROR: Failed to publish failure trace event: %v", err)
+		}
 	}
 }
 

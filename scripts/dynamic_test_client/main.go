@@ -97,23 +97,25 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string, config C
 	
 	strictClassificationRules := `
 Analyze this page and determine the classification type of this document. 
-CRITICAL RULES:
-- If the document is explicitly titled "Closing Disclosure" or "Settlement Statement", it MUST be classified as "Closing" immediately.
-- Otherwise, to classify as "Closing", the document MUST physically contain explicit labels and values for at least 60% of these fields: OrderNumber (or File Number), LoanNumber, BorrowerName, PropertyAddress, ClosingDate, DisbursementDate.
-- To classify as "Title Opinion", the document MUST physically contain explicit labels and values for at least 60% of these fields: OrderType, OrderDate, PrimaryInsuredLender, PrimaryLoanAmount, PurchasePrice, PropertyTaxNumber.
-- Generic legal disclaimers or blank templates (even if they contain the word 'closing') should be returned as 'FLAGGED FOR REVIEW'.
+Just choose the most appropriate category based on the content.
 `
+
+	// Create a list of allowed classifications from the config map
+	var allowedClassifications []string
+	for k := range config.Mappings {
+		allowedClassifications = append(allowedClassifications, k)
+	}
 
 	classifyReq := &pb.SubmitDocumentRequest{
 		PdfContents:            [][]byte{pdfBytes},
-		Action:                 "CLASSIFY",
+		Action:                 "CLASSIFY_ONLY",
 		CustomInstructions:     strictClassificationRules,
 		TenantId:               "LawFirm_SmithAndJones",
 		UserId:                 "john.doe@smithjones.com",
 		AppId:                  "DynamicTestClient_Go",
 		CorrelationId:          correlationID,
-		DocumentType:           "Unknown", // We don't know the type yet
-		AllowedClassifications: []string{"Closing", "Title Opinion"}, // Restrict LLM to exactly these
+		DocumentType:           "Unknown",
+		AllowedClassifications: allowedClassifications,
 	}
 
 	classifyRes, err := client.SubmitDocument(context.Background(), classifyReq)
@@ -155,7 +157,16 @@ CRITICAL RULES:
 
 	// STEP 2: LOOKUP IN CONFIG
 	fmt.Println("\n[STEP 2] ⚙️ Dynamic Business Logic triggered...")
-	mapping, exists := config.Mappings[classificationString]
+	var mapping Mapping
+	var exists bool
+	for k, v := range config.Mappings {
+		if strings.EqualFold(k, classificationString) {
+			mapping = v
+			exists = true
+			break
+		}
+	}
+
 	if !exists {
 		fmt.Printf("   - ⚠️ Unknown classification '%s'. Falling back to FLAGGED FOR REVIEW.\n", classificationString)
 		fmt.Println("   - Aborting parsing step. The document should be sent to a human queue.")
