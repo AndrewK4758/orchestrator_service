@@ -17,22 +17,22 @@ import (
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
-	JobID           string
-	RawPDFs         [][]byte
-	RawTextContents []string
+	JobID           string   `json:"job_id"`
+	RawPDFs         [][]byte `json:"pdf_contents"`
+	RawTextContents []string `json:"raw_text_contents"`
 
 	// Compliance & Traceability Metadata
-	TenantID      string
-	UserID        string
-	AppID         string
-	DocumentType  string
-	CorrelationID string
+	TenantID      string `json:"tenant_id"`
+	UserID        string `json:"user_id"`
+	AppID         string `json:"app_id"`
+	DocumentType  string `json:"document_type"`
+	CorrelationID string `json:"correlation_id"`
 
 	// Dynamic parameters from the client
-	Action                 string
-	Schema                 string
-	CustomInstructions     string
-	AllowedClassifications []string
+	Action                 string   `json:"action"`
+	Schema                 string   `json:"expected_schema"`
+	CustomInstructions     string   `json:"custom_instructions"`
+	AllowedClassifications []string `json:"allowed_classifications"`
 
 	Chunks []pdf.Chunk
 
