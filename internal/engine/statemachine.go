@@ -337,8 +337,19 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				log.Printf("ERROR: Failed to publish trace event: %v", err)
 			}
 
+			cleanJson := strings.TrimSpace(resp.ExtractedJson)
+			if strings.HasPrefix(cleanJson, "```json") {
+				cleanJson = strings.TrimPrefix(cleanJson, "```json")
+			} else if strings.HasPrefix(cleanJson, "```") {
+				cleanJson = strings.TrimPrefix(cleanJson, "```")
+			}
+			if strings.HasSuffix(cleanJson, "```") {
+				cleanJson = strings.TrimSuffix(cleanJson, "```")
+			}
+			cleanJson = strings.TrimSpace(cleanJson)
+
 			state.mu.Lock()
-			state.ChunkResults[idx] = resp.ExtractedJson
+			state.ChunkResults[idx] = cleanJson
 			state.mu.Unlock()
 
 		}(i, chunk)

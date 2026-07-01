@@ -65,16 +65,27 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 		return fmt.Errorf("AI classification returned error: %s", resp.ErrorMessage)
 	}
 
-	log.Printf("[ClassifyAction] AI Raw Response: %s", resp.ExtractedJson)
+	cleanJson := strings.TrimSpace(resp.ExtractedJson)
+	if strings.HasPrefix(cleanJson, "```json") {
+		cleanJson = strings.TrimPrefix(cleanJson, "```json")
+	} else if strings.HasPrefix(cleanJson, "```") {
+		cleanJson = strings.TrimPrefix(cleanJson, "```")
+	}
+	if strings.HasSuffix(cleanJson, "```") {
+		cleanJson = strings.TrimSuffix(cleanJson, "```")
+	}
+	cleanJson = strings.TrimSpace(cleanJson)
+
+	log.Printf("[ClassifyAction] AI Raw Response: %s", cleanJson)
 
 	type ClassifyResult struct {
 		Classification string `json:"classification"`
 	}
 	var result ClassifyResult
-	if err := json.Unmarshal([]byte(resp.ExtractedJson), &result); err != nil {
+	if err := json.Unmarshal([]byte(cleanJson), &result); err != nil {
 		log.Printf("Failed to unmarshal AI response: %v", err)
 	}
-	
+
 	classification := strings.ToUpper(strings.TrimSpace(result.Classification))
 	if classification == "" {
 		classification = "UNKNOWN"
@@ -121,6 +132,6 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 
 	// Change action to EXTRACT so it can proceed to ParallelExtract if desired by the workflow
 	state.Action = "EXTRACT"
-	
+
 	return nil
 }
