@@ -94,7 +94,7 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string, config C
 	// STEP 1: CLASSIFY
 	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for CLASSIFICATION...\n", fileName)
 	correlationID := fmt.Sprintf("corr_%d", time.Now().UnixNano())
-	
+
 	strictClassificationRules := `
 Analyze this page and determine the classification type of this document. 
 Just choose the most appropriate category based on the content.
@@ -107,15 +107,19 @@ Just choose the most appropriate category based on the content.
 	}
 
 	classifyReq := &pb.SubmitDocumentRequest{
-		PdfContents:            [][]byte{pdfBytes},
-		Action:                 "CLASSIFY_ONLY",
-		CustomInstructions:     strictClassificationRules,
-		TenantId:               "LawFirm_SmithAndJones",
-		UserId:                 "john.doe@smithjones.com",
-		AppId:                  "DynamicTestClient_Go",
-		CorrelationId:          correlationID,
-		DocumentType:           "Unknown",
-		AllowedClassifications: allowedClassifications,
+		PdfContents: [][]byte{pdfBytes},
+		Steps: []*pb.WorkflowStep{
+			{
+				StepName:           "Classification Phase",
+				CustomInstructions: strictClassificationRules,
+				ExpectedSchema:     `{"type": "object", "properties": {"classification": {"type": "string"}}}`,
+			},
+		},
+		TenantId:      "LawFirm_SmithAndJones",
+		UserId:        "john.doe@smithjones.com",
+		AppId:         "DynamicTestClient_Go",
+		CorrelationId: correlationID,
+		DocumentType:  "Unknown",
 	}
 
 	classifyRes, err := client.SubmitDocument(context.Background(), classifyReq)
@@ -123,18 +127,18 @@ Just choose the most appropriate category based on the content.
 		log.Printf("Failed to submit classification request: %v", err)
 		return
 	}
-	
+
 	classificationJSON := listenForResults(client, classifyRes.GetJobId(), "Classification")
-	
+
 	// We force the AI service to return a strict schema: {"classification_type": "..."}
 	// The AI service usually returns an array of objects (one per chunk).
 	type ClassifyResult struct {
 		ClassificationType string `json:"classification_type"`
 	}
-	
+
 	var results []ClassifyResult
 	var classificationString string
-	
+
 	if err := json.Unmarshal([]byte(classificationJSON), &results); err == nil && len(results) > 0 {
 		classificationString = results[0].ClassificationType
 	} else {
@@ -146,7 +150,7 @@ Just choose the most appropriate category based on the content.
 			classificationString = strings.TrimSpace(strings.ReplaceAll(classificationJSON, "\"", ""))
 		}
 	}
-	
+
 	fmt.Printf("\n📋 CLASSIFICATION RESULT: '%s'\n", classificationString)
 
 	if strings.ToUpper(classificationString) == "FLAGGED FOR REVIEW" {
@@ -172,21 +176,25 @@ Just choose the most appropriate category based on the content.
 		fmt.Println("   - Aborting parsing step. The document should be sent to a human queue.")
 		return
 	}
-	
+
 	fmt.Println("   - ✅ Found exact mapping for classification.")
 
 	// STEP 3: PARSE
 	fmt.Printf("\n[STEP 3] 🔍 Sending '%s' for FULL PARSING using matched schema...\n", fileName)
 	parseReq := &pb.SubmitDocumentRequest{
-		PdfContents:        [][]byte{pdfBytes},
-		Action:             "PARSE",
-		ExpectedSchema:     mapping.Schema,
-		CustomInstructions: mapping.CustomInstructions,
-		TenantId:           "LawFirm_SmithAndJones",
-		UserId:             "john.doe@smithjones.com",
-		AppId:              "DynamicTestClient_Go",
-		CorrelationId:      correlationID, // Reusing the same correlation ID for tracking
-		DocumentType:       classificationString, // Now we know the document type!
+		PdfContents: [][]byte{pdfBytes},
+		Steps: []*pb.WorkflowStep{
+			{
+				StepName:           "Extraction Phase",
+				ExpectedSchema:     mapping.Schema,
+				CustomInstructions: mapping.CustomInstructions,
+			},
+		},
+		TenantId:      "LawFirm_SmithAndJones",
+		UserId:        "john.doe@smithjones.com",
+		AppId:         "DynamicTestClient_Go",
+		CorrelationId: correlationID,        // Reusing the same correlation ID for tracking
+		DocumentType:  classificationString, // Now we know the document type!
 	}
 
 	parseRes, err := client.SubmitDocument(context.Background(), parseReq)
@@ -194,14 +202,14 @@ Just choose the most appropriate category based on the content.
 		log.Printf("Failed to submit parse request: %v", err)
 		return
 	}
-	
+
 	parsedJSON := listenForResults(client, parseRes.GetJobId(), "Parsing")
 	fmt.Printf("\n✅ FINAL PARSED DATA:\n%s\n", parsedJSON)
 }
 
 func listenForResults(client pb.OrchestratorServiceClient, jobID string, stage string) string {
 	fmt.Printf("   -> [%s] Job %s assigned. Waiting for completion...\n", stage, jobID)
-	
+
 	stream, err := client.ListenForProgress(context.Background(), &pb.ListenRequest{JobId: jobID})
 	if err != nil {
 		log.Fatalf("Failed to open progress stream: %v", err)
@@ -223,7 +231,7 @@ func listenForResults(client pb.OrchestratorServiceClient, jobID string, stage s
 			finalResult = update.GetFinalResultsJson()
 		}
 	}
-	
+
 	time.Sleep(500 * time.Millisecond)
 	return finalResult
 }

@@ -4,16 +4,21 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/events"
-	"orchestrator_service/internal/pdf"
 )
+
+// WorkflowStep represents a single action step and its associated instructions.
+type WorkflowStep struct {
+	StepName           string `json:"step_name"`
+	CustomInstructions string `json:"custom_instructions"`
+	Schema             string `json:"expected_schema"`
+	CallbackAddress    string `json:"callback_address"`
+}
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
@@ -29,27 +34,21 @@ type ProcessingState struct {
 	CorrelationID string `json:"correlation_id"`
 
 	// Dynamic parameters from the client
-	Action                 string   `json:"action"`
-	Schema                 string   `json:"expected_schema"`
-	CustomInstructions     string   `json:"custom_instructions"`
-	AllowedClassifications []string `json:"allowed_classifications"`
-	CallbackAddress        string   `json:"callback_address"`
+	Steps []WorkflowStep `json:"steps"`
 
-	Chunks []pdf.Chunk
+	// State for the currently executing step
+	CurrentStepIndex int
 
 	// Thread-safe map to store results from concurrent AI extractions
-	mu           sync.Mutex
-	ChunkResults map[int]string
+	mu          sync.Mutex
+	StepResults map[int]string
+
+	// Result from the previous step (e.g. classification string to be passed to callbacks)
+	PreviousStepResult string `json:"previous_step_result"`
 
 	// Audit trail for visibility
 	ExecutedSteps []string
 	Errors        []error
-}
-
-// Action represents a single discrete node in the DAG/State Machine.
-type Action interface {
-	Name() string
-	Execute(ctx context.Context, state *ProcessingState) error
 }
 
 // TracePublisher allows decoupling the engine from the concrete JetStream publisher.
@@ -57,62 +56,180 @@ type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 }
 
-// Engine manages the registration and execution of Actions.
+// Engine executes generic steps iteratively.
 type Engine struct {
-	registry map[string]Action
-	pub      TracePublisher
+	aiClient  *ai_client.Client
+	pub       TracePublisher
+	cbManager *callback_client.ClientManager
 }
 
-func NewEngine(pub TracePublisher) *Engine {
+func NewEngine(aiClient *ai_client.Client, pub TracePublisher, cbManager *callback_client.ClientManager) *Engine {
 	return &Engine{
-		registry: make(map[string]Action),
-		pub:      pub,
+		aiClient:  aiClient,
+		pub:       pub,
+		cbManager: cbManager,
 	}
 }
 
-// Register adds a new action to the engine's capability list.
-func (e *Engine) Register(action Action) {
-	e.registry[action.Name()] = action
-}
-
-// Run executes a defined sequential workflow.
-// Idempotency: Given the same state, it produces the same results.
-func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingState) error {
+// Run executes the dynamically provided workflow steps.
+func (e *Engine) Run(ctx context.Context, state *ProcessingState) error {
 	log.Printf("INFO: [Engine.Run] Starting workflow for Job: %s", state.JobID)
 
-	for _, step := range workflow {
+	for i, step := range state.Steps {
+		state.CurrentStepIndex = i
+		stepName := step.StepName
+		if stepName == "" {
+			stepName = fmt.Sprintf("Step-%d", i+1)
+		}
+
 		if err := ctx.Err(); err != nil {
-			err = fmt.Errorf("job %s cancelled at step %s: %w", state.JobID, step, err)
+			err = fmt.Errorf("job %s cancelled at step %s: %w", state.JobID, stepName, err)
 			state.Errors = append(state.Errors, err)
 			e.publishJobFailed(ctx, state, err.Error())
 			return err
 		}
 
-		action, exists := e.registry[step]
-		if !exists {
-			err := fmt.Errorf("critical error: unknown action '%s' in workflow", step)
+		log.Printf("INFO: [Engine.Run] Executing Step %d: %s for Job: %s", i+1, stepName, state.JobID)
+
+		e.publishTrace(ctx, state, events.EventJobStepStarted, fmt.Sprintf("Starting %s", stepName))
+
+		err := e.executeGenericStep(ctx, state, step)
+		if err != nil {
+			err = fmt.Errorf("step %s failed: %w", stepName, err)
+			log.Printf("ERROR: [Engine.Run] Job: %s, Step %s Failed: %v", state.JobID, stepName, err)
 			state.Errors = append(state.Errors, err)
+
+			e.publishTrace(ctx, state, events.EventJobStepFailed, fmt.Sprintf("Failed %s: %v", stepName, err))
 			e.publishJobFailed(ctx, state, err.Error())
 			return err
 		}
 
-		log.Printf("INFO: [Engine.Run] Executing Step: %s", step)
-		if err := action.Execute(ctx, state); err != nil {
-			wrappedErr := fmt.Errorf("action '%s' failed: %w", step, err)
-			state.Errors = append(state.Errors, wrappedErr)
-			e.publishJobFailed(ctx, state, wrappedErr.Error())
-			return wrappedErr
-		}
+		state.ExecutedSteps = append(state.ExecutedSteps, stepName)
+		e.publishTrace(ctx, state, events.EventJobStepCompleted, fmt.Sprintf("Completed %s successfully", stepName))
 
-		state.ExecutedSteps = append(state.ExecutedSteps, step)
+		log.Printf("INFO: [Engine.Run] Step %s completed for Job: %s", stepName, state.JobID)
 	}
 
-	log.Printf("INFO: [Engine.Run] Successfully completed workflow for Job: %s", state.JobID)
+	e.publishTrace(ctx, state, events.EventJobCompleted, "Workflow completed successfully")
+	log.Printf("INFO: [Engine.Run] Job %s completed successfully", state.JobID)
+
+	return nil
+}
+
+func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState, step WorkflowStep) error {
+	prompt := step.CustomInstructions
+	schema := step.Schema
+
+	// 1. Resolve Callbacks
+	if step.CallbackAddress != "" && e.cbManager != nil {
+		// Pass PreviousStepResult as the "classification" or context to the callback
+		rulesText, cbSchema, err := e.cbManager.GetRules(ctx, step.CallbackAddress, state.PreviousStepResult)
+		if err != nil {
+			log.Printf("Warning: failed to get rules from callback server at %s: %v", step.CallbackAddress, err)
+			// fallback to the explicitly provided prompt and schema in the step
+		} else {
+			log.Printf("[GenericStep] Successfully fetched rules and schema via callback")
+			prompt = rulesText
+			schema = cbSchema
+		}
+	}
+
+	if prompt == "" {
+		return fmt.Errorf("no prompt provided and no callback rules found")
+	}
+	if schema == "" {
+		return fmt.Errorf("no schema provided and no callback schema found")
+	}
+
+	// 2. Parallel Execution across full documents
+	totalDocs := len(state.RawPDFs) + len(state.RawTextContents)
+	if totalDocs == 0 {
+		return fmt.Errorf("no documents available to process")
+	}
+
+	state.StepResults = make(map[int]string)
+	var wg sync.WaitGroup
+	errChan := make(chan error, totalDocs)
+
+	for i, pdfBytes := range state.RawPDFs {
+		wg.Add(1)
+		go func(index int, data []byte) {
+			defer wg.Done()
+
+			resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
+				return
+			}
+
+			state.mu.Lock()
+			state.StepResults[index] = resp.GetExtractedJson()
+			state.mu.Unlock()
+		}(i, pdfBytes)
+	}
+
+	offset := len(state.RawPDFs)
+	for i, textContent := range state.RawTextContents {
+		wg.Add(1)
+		go func(index int, text string) {
+			defer wg.Done()
+
+			resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
+				return
+			}
+
+			state.mu.Lock()
+			state.StepResults[index] = resp.GetExtractedJson()
+			state.mu.Unlock()
+		}(offset+i, textContent)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	// 3. Update PreviousStepResult for the next step
+	// Combine results. If it's a single document, just save it.
+	if len(state.StepResults) == 1 {
+		state.PreviousStepResult = state.StepResults[0]
+	} else {
+		// Stitch into a JSON array string
+		finalJSON := "["
+		for i := 0; i < totalDocs; i++ {
+			if result, ok := state.StepResults[i]; ok {
+				if finalJSON != "[" {
+					finalJSON += ","
+				}
+				finalJSON += result
+			}
+		}
+		finalJSON += "]"
+		state.PreviousStepResult = finalJSON
+	}
+
+	return nil
+}
+
+func (e *Engine) publishTrace(ctx context.Context, state *ProcessingState, eventType events.EventType, message string) {
+	stepName := "UnknownStep"
+	if state.CurrentStepIndex >= 0 && state.CurrentStepIndex < len(state.Steps) {
+		stepName = state.Steps[state.CurrentStepIndex].StepName
+		if stepName == "" {
+			stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
+		}
+	}
 
 	if e.pub != nil {
 		err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-			EventType:     events.EventJobCompleted,
+			EventType:     eventType,
 			Timestamp:     time.Now(),
 			TenantID:      state.TenantID,
 			UserID:        state.UserID,
@@ -120,22 +237,19 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 			JobID:         state.JobID,
 			DocumentType:  state.DocumentType,
 			CorrelationID: state.CorrelationID,
-			JobAction:     state.Action,
-			Stage:         "JobCompleted",
-			Metadata: map[string]interface{}{
-				"TotalSteps": len(state.ExecutedSteps),
-			},
+			JobAction:     stepName,
+			Stage:         stepName,
+			Message:       message,
 		})
 		if err != nil {
-			log.Printf("ERROR: Failed to publish trace event: %v", err)
+			log.Printf("Warning: failed to publish trace event: %v", err)
 		}
 	}
-	return nil
 }
 
-func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, errorMsg string) {
+func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, errMsg string) {
 	if e.pub != nil {
-		err := e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
 			EventType:     events.EventJobFailed,
 			Timestamp:     time.Now(),
@@ -145,246 +259,9 @@ func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, e
 			JobID:         state.JobID,
 			DocumentType:  state.DocumentType,
 			CorrelationID: state.CorrelationID,
-			JobAction:     state.Action,
+			JobAction:     "DynamicWorkflow",
 			Stage:         "JobFailed",
-			Error:         errorMsg,
-		})
-		if err != nil {
-			log.Printf("ERROR: Failed to publish failure trace event: %v", err)
-		}
-	}
-}
-
-// --- CORE ACTIONS ---
-
-// ChunkAction handles splitting the PDF into physical byte chunks.
-type ChunkAction struct {
-	chunker *pdf.Chunker
-}
-
-func NewChunkAction(chunker *pdf.Chunker) *ChunkAction {
-	return &ChunkAction{chunker: chunker}
-}
-
-func (a *ChunkAction) Name() string { return "ChunkPDF" }
-
-func (a *ChunkAction) Execute(ctx context.Context, state *ProcessingState) error {
-	// If we are classifying, we just need the first page. Otherwise, standard chunking.
-	pagesPerChunk := 20
-	if envPages := os.Getenv("ORCHESTRATOR_PAGES_PER_CHUNK"); envPages != "" {
-		if p, err := strconv.Atoi(envPages); err == nil && p > 0 {
-			pagesPerChunk = p
-		}
-	}
-	if state.Action == "CLASSIFY" {
-		pagesPerChunk = 1
-		if envClassify := os.Getenv("CLASSIFY_PAGES_LIMIT"); envClassify != "" {
-			if p, err := strconv.Atoi(envClassify); err == nil && p > 0 {
-				pagesPerChunk = p
-			}
-		}
-	}
-
-	var allChunks []pdf.Chunk
-	for _, raw := range state.RawPDFs {
-		chunks, err := a.chunker.SplitPDF(ctx, raw, pagesPerChunk)
-		if err != nil {
-			return err // Error is already wrapped cleanly by the chunker
-		}
-		allChunks = append(allChunks, chunks...)
-	}
-
-	for _, text := range state.RawTextContents {
-		allChunks = append(allChunks, pdf.Chunk{
-			StartIndex:  1,
-			EndIndex:    1,
-			IsText:      true,
-			TextContent: text,
+			Message:       errMsg,
 		})
 	}
-
-	// If classifying, we ONLY want the very first chunk (first page)
-	if state.Action == "CLASSIFY" && len(allChunks) > 0 {
-		allChunks = allChunks[:1]
-	}
-
-	state.Chunks = allChunks
-	return nil
-}
-
-// ParallelExtractAction fires the chunks to the AI service concurrently.
-type ParallelExtractAction struct {
-	aiClient *ai_client.Client
-	pub      *events.Publisher
-}
-
-func NewParallelExtractAction(client *ai_client.Client, pub *events.Publisher) *ParallelExtractAction {
-	return &ParallelExtractAction{aiClient: client, pub: pub}
-}
-
-func (a *ParallelExtractAction) Name() string { return "ParallelExtract" }
-
-func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingState) error {
-	if len(state.Chunks) == 0 {
-		return fmt.Errorf("cannot extract: no chunks available in state")
-	}
-
-	state.ChunkResults = make(map[int]string)
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(state.Chunks))
-
-	var prompt string
-	if state.Action == "CLASSIFY" {
-		prompt = state.CustomInstructions
-		if prompt == "" {
-			return fmt.Errorf("no prompt provided for classification and no custom instructions available")
-		}
-
-		// Dynamic Restricted Classification
-		if len(state.AllowedClassifications) > 0 {
-			allowedList := strings.Join(state.AllowedClassifications, ", ")
-			prompt += fmt.Sprintf(" You must strictly choose one of the following classification types: [%s]. If the document cannot be parsed into any of these types, return exactly 'FLAGGED FOR REVIEW'.", allowedList)
-		}
-
-		// Force a strict JSON schema for classification so the client can reliably parse it
-		if state.Schema == "" {
-			// Build the enum list
-			enumValues := ""
-			if len(state.AllowedClassifications) > 0 {
-				for _, allowed := range state.AllowedClassifications {
-					enumValues += fmt.Sprintf(`"%s", `, allowed)
-				}
-			}
-			enumValues += `"FLAGGED FOR REVIEW"`
-
-			state.Schema = fmt.Sprintf(`{
-				"type": "object",
-				"properties": {
-					"classification_type": { 
-						"type": "string",
-						"enum": [%s]
-					}
-				},
-				"required": ["classification_type"]
-			}`, enumValues)
-		}
-	} else {
-		prompt = state.CustomInstructions
-		if prompt == "" {
-			return fmt.Errorf("no prompt provided for extraction and no custom instructions available")
-		}
-	}
-
-	for i, chunk := range state.Chunks {
-		wg.Add(1)
-		go func(idx int, c pdf.Chunk) {
-			defer wg.Done()
-
-			err := a.pub.PublishTrace(ctx, events.TraceabilityEvent{
-				EventID:       fmt.Sprintf("evt_chunk_%s_%d", state.JobID, idx),
-				EventType:     events.EventChunkStarted,
-				Timestamp:     time.Now(),
-				TenantID:      state.TenantID,
-				UserID:        state.UserID,
-				AppID:         state.AppID,
-				JobID:         state.JobID,
-				DocumentType:  state.DocumentType,
-				CorrelationID: state.CorrelationID,
-				JobAction:     state.Action,
-				Stage:         "ChunkExtractionStarted",
-				ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
-				ChunkIndex:    idx,
-				TotalChunks:   len(state.Chunks),
-			})
-			if err != nil {
-				log.Printf("ERROR: Failed to publish trace event: %v", err)
-			}
-
-			resp, err := a.aiClient.ExtractChunk(ctx, c.PDFBytes, c.TextContent, prompt, state.Schema)
-			if err != nil {
-				err := a.pub.PublishTrace(ctx, events.TraceabilityEvent{
-					EventID:       fmt.Sprintf("evt_chunk_fail_%s_%d", state.JobID, idx),
-					EventType:     events.EventChunkFailed,
-					Timestamp:     time.Now(),
-					TenantID:      state.TenantID,
-					UserID:        state.UserID,
-					AppID:         state.AppID,
-					JobID:         state.JobID,
-					DocumentType:  state.DocumentType,
-					CorrelationID: state.CorrelationID,
-					JobAction:     state.Action,
-					Stage:         "ChunkExtractionFailed",
-					ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
-					ChunkIndex:    idx,
-					TotalChunks:   len(state.Chunks),
-					Error:         err.Error(),
-				})
-				if err != nil {
-					log.Printf("ERROR: Failed to publish failure trace event: %v", err)
-				}
-				errChan <- fmt.Errorf("chunk %d extraction failed: %w", idx, err)
-				return
-			}
-
-			err = a.pub.PublishTrace(ctx, events.TraceabilityEvent{
-				EventID:       fmt.Sprintf("evt_chunk_comp_%s_%d", state.JobID, idx),
-				EventType:     events.EventChunkCompleted,
-				Timestamp:     time.Now(),
-				TenantID:      state.TenantID,
-				UserID:        state.UserID,
-				AppID:         state.AppID,
-				JobID:         state.JobID,
-				DocumentType:  state.DocumentType,
-				CorrelationID: state.CorrelationID,
-				JobAction:     state.Action,
-				Stage:         "ChunkExtractionCompleted",
-				ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
-				ChunkIndex:    idx,
-				TotalChunks:   len(state.Chunks),
-				Metadata: map[string]interface{}{
-					"BytesExtracted": len(resp.ExtractedJson),
-				},
-			})
-			if err != nil {
-				log.Printf("ERROR: Failed to publish trace event: %v", err)
-			}
-
-			cleanJson := strings.TrimSpace(resp.ExtractedJson)
-
-			// Extract exactly the JSON part (from first { or [ to last } or ])
-			firstBrace := strings.IndexAny(cleanJson, "{[")
-			lastBrace := strings.LastIndexAny(cleanJson, "}]")
-			if firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace {
-				cleanJson = cleanJson[firstBrace : lastBrace+1]
-			}
-
-			// Strip markdown if it was inside the braces (unlikely, but just in case)
-			if strings.HasPrefix(cleanJson, "```json") {
-				cleanJson = strings.TrimPrefix(cleanJson, "```json")
-			} else if strings.HasPrefix(cleanJson, "```") {
-				cleanJson = strings.TrimPrefix(cleanJson, "```")
-			}
-			if strings.HasSuffix(cleanJson, "```") {
-				cleanJson = strings.TrimSuffix(cleanJson, "```")
-			}
-			cleanJson = strings.TrimSpace(cleanJson)
-
-			log.Printf("DEBUG: ParallelExtract cleanJson for chunk %d: %s", idx, cleanJson)
-
-			state.mu.Lock()
-			state.ChunkResults[idx] = cleanJson
-			state.mu.Unlock()
-
-		}(i, chunk)
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
-		return err
-	}
-
-	return nil
 }

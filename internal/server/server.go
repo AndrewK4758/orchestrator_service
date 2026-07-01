@@ -13,7 +13,6 @@ import (
 	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
-	"orchestrator_service/internal/pdf"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -40,13 +39,7 @@ type OrchestratorServer struct {
 // NewServer creates a new instance of the OrchestratorServer.
 func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *callback_client.ClientManager) *OrchestratorServer {
 	// 1. Initialize the State Machine Engine with Publisher
-	eng := engine.NewEngine(pub)
-
-	// 2. Register Actions (the nodes in our DAG)
-	chunker := pdf.NewChunker()
-	eng.Register(engine.NewChunkAction(chunker))
-	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
-	eng.Register(engine.NewClassifyAction(aiClient, pub, cbManager))
+	eng := engine.NewEngine(aiClient, pub, cbManager)
 
 	srv := &OrchestratorServer{
 		eng:        eng,
@@ -90,20 +83,27 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		correlationID = jobID // Default to job ID to group it by itself
 	}
 
+	var steps []engine.WorkflowStep
+	for _, s := range req.GetSteps() {
+		steps = append(steps, engine.WorkflowStep{
+			StepName:           s.StepName,
+			CustomInstructions: s.CustomInstructions,
+			Schema:             s.ExpectedSchema,
+			CallbackAddress:    s.CallbackAddress,
+		})
+	}
+
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
-			JobID:                  jobID,
-			RawPDFs:                req.GetPdfContents(),
-			RawTextContents:        req.GetRawTextContents(),
-			Action:                 req.GetAction(),
-			Schema:                 req.GetExpectedSchema(),
-			CustomInstructions:     req.GetCustomInstructions(),
-			AllowedClassifications: req.GetAllowedClassifications(),
-			TenantID:               tenantID,
-			UserID:                 userID,
-			AppID:                  appID,
-			DocumentType:           req.GetDocumentType(),
-			CorrelationID:          correlationID,
+			JobID:           jobID,
+			RawPDFs:         req.GetPdfContents(),
+			RawTextContents: req.GetRawTextContents(),
+			Steps:           steps,
+			TenantID:        tenantID,
+			UserID:          userID,
+			AppID:           appID,
+			DocumentType:    req.GetDocumentType(),
+			CorrelationID:   correlationID,
 		},
 		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
 	}
@@ -119,28 +119,14 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		JobID:         jobID,
 		DocumentType:  tracker.State.DocumentType,
 		CorrelationID: tracker.State.CorrelationID,
-		JobAction:     tracker.State.Action,
+		JobAction:     "DynamicWorkflow",
 		Stage:         "JobIntake",
 		Message:       fmt.Sprintf("Received %d documents for processing", fileCount),
 	})
 	if err != nil {
 		log.Printf("ERROR: Failed to publish trace event: %v", err)
 	}
-	state := &engine.ProcessingState{
-		JobID:                  jobID,
-		RawPDFs:                req.GetPdfContents(),
-		RawTextContents:        req.GetRawTextContents(),
-		Action:                 req.GetAction(),
-		Schema:                 req.GetExpectedSchema(),
-		CustomInstructions:     req.GetCustomInstructions(),
-		AllowedClassifications: req.GetAllowedClassifications(),
-		CallbackAddress:        req.GetCallbackAddress(),
-		TenantID:               tenantID,
-		UserID:                 userID,
-		AppID:                  appID,
-		DocumentType:           req.GetDocumentType(),
-		CorrelationID:          correlationID,
-	}
+	state := tracker.State
 
 	// Serialize state and publish to JetStream
 	payload, err := json.Marshal(state)
@@ -199,39 +185,18 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 
 	ctx := context.Background() // A real app might have a global cancellation context here
 
-	// Define the strict sequential workflow array based on Action
-	var workflow []string
-	if tracker.State.Action == "CLASSIFY" {
-		workflow = []string{"Classify", "ChunkPDF", "ParallelExtract"}
-	} else if tracker.State.Action == "CLASSIFY_ONLY" {
-		workflow = []string{"Classify"}
-	} else {
-		workflow = []string{"ChunkPDF", "ParallelExtract"}
-	}
-
-	// Run the engine
-	err := s.eng.Run(ctx, workflow, tracker.State)
+	// Run the engine with the dynamically provided steps
+	err := s.eng.Run(ctx, tracker.State)
 	if err != nil {
 		log.Printf("ERROR: Job %s failed: %v", tracker.State.JobID, err)
 		sendProgress("FAILED", fmt.Sprintf("Workflow failed: %v", err))
 		return
 	}
 
-	// At this point, state.ChunkResults contains the map of extracted JSONs.
-	// We'll stitch them together into a JSON array for the client
-	var finalJSON string
-	if tracker.State.Action == "CLASSIFY_ONLY" {
-		// Just return the classification type in the final JSON
-		finalJSON = fmt.Sprintf(`{"classification_type": "%s"}`, tracker.State.DocumentType)
-	} else if len(tracker.State.ChunkResults) > 0 {
-		finalJSON = "["
-		for _, result := range tracker.State.ChunkResults {
-			if finalJSON != "[" {
-				finalJSON += ","
-			}
-			finalJSON += result
-		}
-		finalJSON += "]"
+	// At this point, state.PreviousStepResult contains the output of the final step
+	finalJSON := tracker.State.PreviousStepResult
+	if finalJSON == "" {
+		finalJSON = "{}"
 	}
 
 	log.Printf("DEBUG: FinalResultsJson being sent to client: %s", finalJSON)

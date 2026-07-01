@@ -88,15 +88,19 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 
 	correlationID := fmt.Sprintf("corr_%d", time.Now().UnixNano())
 	req := &pb.SubmitDocumentRequest{
-		PdfContents:        [][]byte{pdfBytes},
-		Action:             "EXTRACT",
-		ExpectedSchema:     mockJSONSchema,
-		CustomInstructions: "Extract data from this document according to the requested schema.",
-		TenantId:           "LawFirm_StaticTest",
-		UserId:             "static.user@test.com",
-		AppId:              "StaticTestClient_Go",
-		CorrelationId:      correlationID,
-		DocumentType:       "Unknown",
+		PdfContents: [][]byte{pdfBytes},
+		Steps: []*pb.WorkflowStep{
+			{
+				StepName:           "Extract Action",
+				ExpectedSchema:     mockJSONSchema,
+				CustomInstructions: "Extract data from this document according to the requested schema.",
+			},
+		},
+		TenantId:      "LawFirm_StaticTest",
+		UserId:        "static.user@test.com",
+		AppId:         "StaticTestClient_Go",
+		CorrelationId: correlationID,
+		DocumentType:  "Unknown",
 	}
 
 	res, err := client.SubmitDocument(context.Background(), req)
