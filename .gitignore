@@ -16,3 +16,4 @@ orchestrator_bin
 
 *_bin
 *_bin.exe
+/bin/orchestrator

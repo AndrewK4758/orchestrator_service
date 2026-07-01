@@ -8,21 +8,21 @@ import (
 	"strings"
 
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/events"
-	"orchestrator_service/internal/registry_client"
 )
 
 type ClassifyAction struct {
-	aiClient       *ai_client.Client
-	registryClient *registry_client.Client
-	pub            *events.Publisher
+	aiClient  *ai_client.Client
+	pub       *events.Publisher
+	cbManager *callback_client.ClientManager
 }
 
-func NewClassifyAction(aiClient *ai_client.Client, regClient *registry_client.Client, pub *events.Publisher) *ClassifyAction {
+func NewClassifyAction(aiClient *ai_client.Client, pub *events.Publisher, cbManager *callback_client.ClientManager) *ClassifyAction {
 	return &ClassifyAction{
-		aiClient:       aiClient,
-		registryClient: regClient,
-		pub:            pub,
+		aiClient:  aiClient,
+		pub:       pub,
+		cbManager: cbManager,
 	}
 }
 
@@ -97,25 +97,27 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 		return nil
 	}
 
-	// 2. Fetch Rules and Schema from Artemis Registry
-	rulesText, schema, err := a.registryClient.GetRules(ctx, classification)
-	if err != nil {
-		log.Printf("Warning: failed to get rules from Artemis for %s: %v", classification, err)
-		if state.Schema != "" {
-			log.Printf("Falling back to provided schema and instructions for %s", classification)
-			rulesText = state.CustomInstructions
-			schema = state.Schema
+	// 2. Fetch Rules and Schema from generic Callback Server if enabled
+	if state.CallbackAddress != "" || a.cbManager != nil {
+		rulesText, schema, err := a.cbManager.GetRules(ctx, state.CallbackAddress, classification)
+		if err != nil {
+			log.Printf("Warning: failed to get rules from callback server for %s: %v", classification, err)
+			if state.Schema != "" {
+				log.Printf("Falling back to provided schema and instructions for %s", classification)
+			} else {
+				return fmt.Errorf("failed to get rules from callback server and no fallback schema provided: %w", err)
+			}
 		} else {
-			return fmt.Errorf("failed to get rules from Artemis and no fallback schema provided: %w", err)
+			log.Printf("[ClassifyAction] Successfully fetched rules and schema for %s via callback", classification)
+			state.CustomInstructions = rulesText
+			state.Schema = schema
 		}
-	} else {
-		log.Printf("[ClassifyAction] Successfully fetched rules and schema for %s", classification)
+	} else if state.Schema == "" {
+		return fmt.Errorf("no schema provided to parse classification %s and no callback server available", classification)
 	}
 
 	// 3. Update State
 	state.DocumentType = classification
-	state.CustomInstructions = rulesText
-	state.Schema = schema
 
 	// Change action to EXTRACT so it can proceed to ParallelExtract if desired by the workflow
 	state.Action = "EXTRACT"

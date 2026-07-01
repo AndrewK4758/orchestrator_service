@@ -10,10 +10,10 @@ import (
 
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/pdf"
-	"orchestrator_service/internal/registry_client"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -31,14 +31,14 @@ type OrchestratorServer struct {
 	eng       *engine.Engine
 	aiClient  *ai_client.Client
 	pub       *events.Publisher
-	regClient *registry_client.Client
+	cbManager *callback_client.ClientManager
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
 }
 
 // NewServer creates a new instance of the OrchestratorServer.
-func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *registry_client.Client) *OrchestratorServer {
+func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *callback_client.ClientManager) *OrchestratorServer {
 	// 1. Initialize the State Machine Engine with Publisher
 	eng := engine.NewEngine(pub)
 
@@ -46,13 +46,13 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, regClient *reg
 	chunker := pdf.NewChunker()
 	eng.Register(engine.NewChunkAction(chunker))
 	eng.Register(engine.NewParallelExtractAction(aiClient, pub))
-	eng.Register(engine.NewClassifyAction(aiClient, regClient, pub))
+	eng.Register(engine.NewClassifyAction(aiClient, pub, cbManager))
 
 	srv := &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
 		pub:        pub,
-		regClient:  regClient,
+		cbManager:  cbManager,
 		activeJobs: make(map[string]*JobTracker),
 	}
 
@@ -132,6 +132,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		Schema:                 req.GetExpectedSchema(),
 		CustomInstructions:     req.GetCustomInstructions(),
 		AllowedClassifications: req.GetAllowedClassifications(),
+		CallbackAddress:        req.GetCallbackAddress(),
 		TenantID:               tenantID,
 		UserID:                 userID,
 		AppID:                  appID,

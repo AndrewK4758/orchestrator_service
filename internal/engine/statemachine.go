@@ -33,6 +33,7 @@ type ProcessingState struct {
 	Schema                 string   `json:"expected_schema"`
 	CustomInstructions     string   `json:"custom_instructions"`
 	AllowedClassifications []string `json:"allowed_classifications"`
+	CallbackAddress        string   `json:"callback_address"`
 
 	Chunks []pdf.Chunk
 

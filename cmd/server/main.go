@@ -11,8 +11,8 @@ import (
 
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/events"
-	"orchestrator_service/internal/registry_client"
 	"orchestrator_service/internal/server"
 )
 
@@ -53,21 +53,14 @@ func main() {
 	}
 	defer pub.Close()
 
-	// Connect to the Artemis Schema Registry
-	registryHost := os.Getenv("REGISTRY_SERVICE_ADDRESS")
-	if registryHost == "" {
-		registryHost = "localhost:5133"
-	}
-	regClient, err := registry_client.NewClient(registryHost)
-	if err != nil {
-		log.Fatalf("Failed to create registry client: %v", err)
-	}
-	defer regClient.Close()
+	// Initialize the callback client manager for dynamic app-agnostic routing
+	cbManager := callback_client.NewClientManager()
+	defer cbManager.Close()
 
 	grpcServer := grpc.NewServer()
 
 	// Register the Orchestrator service and inject dependencies
-	orchestratorServer := server.NewServer(aiClient, pub, regClient)
+	orchestratorServer := server.NewServer(aiClient, pub, cbManager)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it
