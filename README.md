@@ -15,6 +15,20 @@ Processing a 100-page scanned PDF in a single LLM call is prone to timeouts and 
 
 ---
 
+## 🔗 App-Agnostic Webhooks (Callback Client)
+
+The Orchestrator acts strictly as a "brawn" execution engine and defers business logic back to the client apps. It is **100% application-agnostic** and can serve multiple different tenant apps simultaneously.
+
+When submitting a document with `Action = "CLASSIFY"`, clients can optionally pass a `callback_address` (or rely on the `DEFAULT_CALLBACK_ADDRESS` environment variable). 
+If provided, the Orchestrator will:
+1. Dynamically connect back to the specified client's `SchemaRegistryService` via gRPC.
+2. Fetch the specific parsing schema and rules for the classified document type.
+3. Automatically execute the heavy `PARSE` stage using those dynamic rules without requiring the client to send the PDF again.
+
+This allows massive PDFs to be processed in a single multi-step workflow without bouncing the heavy payload back and forth across the network.
+
+---
+
 ## 🚀 Running the Orchestrator
 
 Because this service depends on the `ai_service` protobufs, it must be run within the context of the parent `doc_processor_Service` directory.
@@ -37,6 +51,7 @@ Ensure the `ai_service` is already running on port 50051. Then run:
 ```bash
 cd /home/ak/projects/doc_processor_Service/orchestrator_service
 export AI_SERVICE_ADDRESS=localhost:50051
+export DEFAULT_CALLBACK_ADDRESS=localhost:5133
 go run cmd/server/main.go
 ```
 
