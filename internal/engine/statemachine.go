@@ -120,6 +120,11 @@ func (e *Engine) Run(ctx context.Context, workflow []string, state *ProcessingSt
 			JobID:         state.JobID,
 			DocumentType:  state.DocumentType,
 			CorrelationID: state.CorrelationID,
+			JobAction:     state.Action,
+			Stage:         "JobCompleted",
+			Metadata: map[string]interface{}{
+				"TotalSteps": len(state.ExecutedSteps),
+			},
 		})
 		if err != nil {
 			log.Printf("ERROR: Failed to publish trace event: %v", err)
@@ -140,6 +145,8 @@ func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, e
 			JobID:         state.JobID,
 			DocumentType:  state.DocumentType,
 			CorrelationID: state.CorrelationID,
+			JobAction:     state.Action,
+			Stage:         "JobFailed",
 			Error:         errorMsg,
 		})
 		if err != nil {
@@ -290,6 +297,9 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				JobID:         state.JobID,
 				DocumentType:  state.DocumentType,
 				CorrelationID: state.CorrelationID,
+				JobAction:     state.Action,
+				Stage:         "ChunkExtractionStarted",
+				ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
 				ChunkIndex:    idx,
 				TotalChunks:   len(state.Chunks),
 			})
@@ -309,6 +319,9 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 					JobID:         state.JobID,
 					DocumentType:  state.DocumentType,
 					CorrelationID: state.CorrelationID,
+					JobAction:     state.Action,
+					Stage:         "ChunkExtractionFailed",
+					ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
 					ChunkIndex:    idx,
 					TotalChunks:   len(state.Chunks),
 					Error:         err.Error(),
@@ -330,8 +343,14 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				JobID:         state.JobID,
 				DocumentType:  state.DocumentType,
 				CorrelationID: state.CorrelationID,
+				JobAction:     state.Action,
+				Stage:         "ChunkExtractionCompleted",
+				ChunkID:       fmt.Sprintf("chk_%s_%d", state.JobID, idx),
 				ChunkIndex:    idx,
 				TotalChunks:   len(state.Chunks),
+				Metadata: map[string]interface{}{
+					"BytesExtracted": len(resp.ExtractedJson),
+				},
 			})
 			if err != nil {
 				log.Printf("ERROR: Failed to publish trace event: %v", err)

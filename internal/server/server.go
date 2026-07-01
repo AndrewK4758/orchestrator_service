@@ -119,6 +119,8 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		JobID:         jobID,
 		DocumentType:  tracker.State.DocumentType,
 		CorrelationID: tracker.State.CorrelationID,
+		JobAction:     tracker.State.Action,
+		Stage:         "JobIntake",
 		Message:       fmt.Sprintf("Received %d documents for processing", fileCount),
 	})
 	if err != nil {
