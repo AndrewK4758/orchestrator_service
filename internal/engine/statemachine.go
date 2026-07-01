@@ -238,10 +238,7 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 	if state.Action == "CLASSIFY" {
 		prompt = state.CustomInstructions
 		if prompt == "" {
-			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_CLASSIFY_PROMPT")
-			if prompt == "" {
-				prompt = "Analyze this page and determine the classification type of this document."
-			}
+			return fmt.Errorf("no prompt provided for classification and no custom instructions available")
 		}
 
 		// Dynamic Restricted Classification
@@ -275,10 +272,7 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 	} else {
 		prompt = state.CustomInstructions
 		if prompt == "" {
-			prompt = os.Getenv("ORCHESTRATOR_DEFAULT_PARSE_PROMPT")
-			if prompt == "" {
-				prompt = "Extract data from this document according to the requested schema."
-			}
+			return fmt.Errorf("no prompt provided for extraction and no custom instructions available")
 		}
 	}
 

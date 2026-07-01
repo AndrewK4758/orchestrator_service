@@ -84,19 +84,19 @@ func processFile(client pb.OrchestratorServiceClient, inputPath string) {
 		"required": ["BorrowerName", "DocumentState"]
 	}`
 
-	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for FULL PIPELINE (Classify -> Parse)...\n", fileName)
+	fmt.Printf("\n[STEP 1] 🧠 Sending '%s' for EXTRACTION...\n", fileName)
 
 	correlationID := fmt.Sprintf("corr_%d", time.Now().UnixNano())
 	req := &pb.SubmitDocumentRequest{
-		PdfContents:    [][]byte{pdfBytes},
-		Action:         "CLASSIFY", // Tells Orchestrator to run classification, then automatically parse
-		ExpectedSchema: mockJSONSchema, // Provide fallback schema in case Artemis is unreachable
-		CustomInstructions: "Extract the fields accurately.",
-		TenantId:      "LawFirm_StaticTest",
-		UserId:        "static.user@test.com",
-		AppId:         "StaticTestClient_Go",
-		CorrelationId: correlationID,
-		DocumentType:  "Unknown",
+		PdfContents:        [][]byte{pdfBytes},
+		Action:             "EXTRACT",
+		ExpectedSchema:     mockJSONSchema,
+		CustomInstructions: "Extract data from this document according to the requested schema.",
+		TenantId:           "LawFirm_StaticTest",
+		UserId:             "static.user@test.com",
+		AppId:              "StaticTestClient_Go",
+		CorrelationId:      correlationID,
+		DocumentType:       "Unknown",
 	}
 
 	res, err := client.SubmitDocument(context.Background(), req)

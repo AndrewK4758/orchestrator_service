@@ -31,28 +31,32 @@ This allows massive PDFs to be processed in a single multi-step workflow without
 
 ## 🚀 Running the Orchestrator
 
-Because this service depends on the `ai_service` protobufs, it must be run within the context of the parent `doc_processor_Service` directory.
+Because this service depends on the `ai_service` protobufs, it must be run within the context of the parent `doc_processor_service` directory.
 
-### Option 1: Full Docker Cluster (Recommended)
-
+### Docker (All Platforms - Recommended)
 To run the Orchestrator, the AI Service, and NATS JetStream together seamlessly:
-
 ```bash
-cd /home/ak/projects/doc_processor_Service
+cd /home/ak/projects/doc_processor_service
 docker-compose up -d --build
 ```
-
 The Orchestrator will be available to clients on **port 50052**.
 
-### Option 2: Running Locally (Development)
-
+### Local Development (Linux / macOS)
 Ensure the `ai_service` is already running on port 50051. Then run:
-
 ```bash
-cd /home/ak/projects/doc_processor_Service/orchestrator_service
+cd /home/ak/projects/doc_processor_service/orchestrator_service
 export AI_SERVICE_ADDRESS=localhost:50051
 export DEFAULT_CALLBACK_ADDRESS=localhost:5133
 go run cmd/server/main.go
+```
+
+### Local Development (Windows PowerShell)
+Ensure the `ai_service` is already running on port 50051. Then run:
+```powershell
+cd \home\ak\projects\doc_processor_service\orchestrator_service
+$env:AI_SERVICE_ADDRESS="localhost:50051"
+$env:DEFAULT_CALLBACK_ADDRESS="localhost:5133"
+go run cmd\server\main.go
 ```
 
 ---

@@ -48,9 +48,9 @@ func (a *ClassifyAction) Execute(ctx context.Context, state *ProcessingState) er
 	}
 
 	// 1. Call AI to Classify
-	prompt := "You are a classification AI. Look at this document and classify it."
-	if state.CustomInstructions != "" {
-		prompt += "\n" + state.CustomInstructions
+	prompt := state.CustomInstructions
+	if prompt == "" {
+		return fmt.Errorf("no prompt provided for classification and no custom instructions available")
 	}
 	if len(state.AllowedClassifications) > 0 {
 		prompt += fmt.Sprintf("\nYou MUST classify it as exactly one of these: %s. If it doesn't match, return 'UNKNOWN'.", strings.Join(state.AllowedClassifications, ", "))
