@@ -338,6 +338,15 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 			}
 
 			cleanJson := strings.TrimSpace(resp.ExtractedJson)
+
+			// Extract exactly the JSON part (from first { or [ to last } or ])
+			firstBrace := strings.IndexAny(cleanJson, "{[")
+			lastBrace := strings.LastIndexAny(cleanJson, "}]")
+			if firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace {
+				cleanJson = cleanJson[firstBrace : lastBrace+1]
+			}
+
+			// Strip markdown if it was inside the braces (unlikely, but just in case)
 			if strings.HasPrefix(cleanJson, "```json") {
 				cleanJson = strings.TrimPrefix(cleanJson, "```json")
 			} else if strings.HasPrefix(cleanJson, "```") {
@@ -347,6 +356,8 @@ func (a *ParallelExtractAction) Execute(ctx context.Context, state *ProcessingSt
 				cleanJson = strings.TrimSuffix(cleanJson, "```")
 			}
 			cleanJson = strings.TrimSpace(cleanJson)
+
+			log.Printf("DEBUG: ParallelExtract cleanJson for chunk %d: %s", idx, cleanJson)
 
 			state.mu.Lock()
 			state.ChunkResults[idx] = cleanJson

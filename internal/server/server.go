@@ -232,6 +232,8 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 		finalJSON += "]"
 	}
 
+	log.Printf("DEBUG: FinalResultsJson being sent to client: %s", finalJSON)
+
 	tracker.Updates <- &pb.ProgressUpdate{
 		JobId:            tracker.State.JobID,
 		Status:           "COMPLETE",
@@ -247,7 +249,7 @@ func (s *OrchestratorServer) ListenForProgress(req *pb.ListenRequest, stream pb.
 
 	var tracker *JobTracker
 	var exists bool
-	
+
 	// Wait up to 30 seconds for the JetStream consumer to pick up the job and populate activeJobs
 	for i := 0; i < 30; i++ {
 		s.mu.RLock()
