@@ -50,9 +50,7 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *cal
 	}
 
 	// Start consuming incoming jobs from NATS JetStream
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	err := srv.pub.ConsumeJobs(ctx, srv.handleJobMessage)
+	err := srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
 	if err != nil {
 		log.Printf("ERROR: Failed to start job consumer: %v", err)
 	}
