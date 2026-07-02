@@ -84,7 +84,7 @@ func (p *Publisher) Close() {
 }
 
 // PublishJob publishes a new job request to JetStream.
-func (p *Publisher) PublishJob(ctx context.Context, jobID string, payload []byte) error {
+func (p *Publisher) PublishJob(ctx context.Context, payload []byte) error {
 	subject := "jobs.incoming"
 	_, err := p.js.Publish(ctx, subject, payload)
 	if err != nil {
@@ -94,7 +94,7 @@ func (p *Publisher) PublishJob(ctx context.Context, jobID string, payload []byte
 }
 
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
-	maxAckPending := 5
+	maxAckPending := 50
 	if envMax := os.Getenv("MAX_ACK_PENDING"); envMax != "" {
 		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
 			maxAckPending = m
@@ -116,9 +116,15 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		err := handler(ctx, msg)
 		if err != nil {
 			log.Printf("ERROR: Failed to process job msg: %v", err)
-			msg.Nak()
+			err := msg.Nak()
+			if err != nil {
+				return
+			}
 		} else {
-			msg.Ack()
+			err := msg.Ack()
+			if err != nil {
+				return
+			}
 		}
 	})
 	if err != nil {

@@ -50,7 +50,8 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *cal
 	}
 
 	// Start consuming incoming jobs from NATS JetStream
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 	err := srv.pub.ConsumeJobs(ctx, srv.handleJobMessage)
 	if err != nil {
 		log.Printf("ERROR: Failed to start job consumer: %v", err)
@@ -135,7 +136,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		return nil, fmt.Errorf("failed to process job request")
 	}
 
-	err = s.pub.PublishJob(ctx, jobID, payload)
+	err = s.pub.PublishJob(ctx, payload)
 	if err != nil {
 		log.Printf("ERROR: Failed to publish job to queue: %v", err)
 		return nil, fmt.Errorf("failed to queue job")
@@ -183,7 +184,8 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 
 	sendProgress("STARTING", "Initializing workflow")
 
-	ctx := context.Background() // A real app might have a global cancellation context here
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel() // A real app might have a global cancellation context here
 
 	// Run the engine with the dynamically provided steps
 	err := s.eng.Run(ctx, tracker.State)
@@ -240,6 +242,11 @@ func (s *OrchestratorServer) ListenForProgress(req *pb.ListenRequest, stream pb.
 			return err
 		}
 	}
+
+	// Clean up completed job to prevent memory leak
+	s.mu.Lock()
+	delete(s.activeJobs, jobID)
+	s.mu.Unlock()
 
 	return nil
 }
