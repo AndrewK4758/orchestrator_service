@@ -110,7 +110,7 @@ func (e *Engine) Run(ctx context.Context, state *ProcessingState) error {
 		log.Printf("INFO: [Engine.Run] Step %s completed for Job: %s", stepName, state.JobID)
 	}
 
-	e.publishTrace(ctx, state, events.EventJobCompleted, "Workflow completed successfully")
+	e.publishTrace(ctx, state, events.EventJobCompleted, "Workflow completed successfully", state.PreviousStepResult)
 	log.Printf("INFO: [Engine.Run] Job %s completed successfully", state.JobID)
 
 	return nil
@@ -156,11 +156,16 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 		go func(index int, data []byte) {
 			defer wg.Done()
 
+			e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting PDF chunk %d", index), index, totalDocs, "")
+
 			resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
 			if err != nil {
+				e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed PDF chunk %d", index), index, totalDocs, err.Error())
 				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
 				return
 			}
+
+			e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed PDF chunk %d", index), index, totalDocs, "")
 
 			state.mu.Lock()
 			state.StepResults[index] = resp.GetExtractedJson()
@@ -174,11 +179,16 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 		go func(index int, text string) {
 			defer wg.Done()
 
+			e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting Text chunk %d", index), index, totalDocs, "")
+
 			resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
 			if err != nil {
+				e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed Text chunk %d", index), index, totalDocs, err.Error())
 				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
 				return
 			}
+
+			e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed Text chunk %d", index), index, totalDocs, "")
 
 			state.mu.Lock()
 			state.StepResults[index] = resp.GetExtractedJson()
@@ -217,13 +227,18 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 	return nil
 }
 
-func (e *Engine) publishTrace(ctx context.Context, state *ProcessingState, eventType events.EventType, message string) {
+func (e *Engine) publishTrace(ctx context.Context, state *ProcessingState, eventType events.EventType, message string, extractedData ...string) {
 	stepName := "UnknownStep"
 	if state.CurrentStepIndex >= 0 && state.CurrentStepIndex < len(state.Steps) {
 		stepName = state.Steps[state.CurrentStepIndex].StepName
 		if stepName == "" {
 			stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
 		}
+	}
+
+	var data string
+	if len(extractedData) > 0 {
+		data = extractedData[0]
 	}
 
 	if e.pub != nil {
@@ -240,10 +255,42 @@ func (e *Engine) publishTrace(ctx context.Context, state *ProcessingState, event
 			JobAction:     stepName,
 			Stage:         stepName,
 			Message:       message,
+			ExtractedData: data,
 		})
 		if err != nil {
 			log.Printf("Warning: failed to publish trace event: %v", err)
 		}
+	}
+}
+
+func (e *Engine) publishChunkTrace(ctx context.Context, state *ProcessingState, eventType events.EventType, message string, chunkIndex int, totalChunks int, errorMsg string) {
+	stepName := "UnknownStep"
+	if state.CurrentStepIndex >= 0 && state.CurrentStepIndex < len(state.Steps) {
+		stepName = state.Steps[state.CurrentStepIndex].StepName
+		if stepName == "" {
+			stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
+		}
+	}
+
+	if e.pub != nil {
+		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+			EventType:     eventType,
+			Timestamp:     time.Now(),
+			TenantID:      state.TenantID,
+			UserID:        state.UserID,
+			AppID:         state.AppID,
+			JobID:         state.JobID,
+			DocumentType:  state.DocumentType,
+			CorrelationID: state.CorrelationID,
+			JobAction:     stepName,
+			Stage:         "ChunkProcessing",
+			Message:       message,
+			Error:         errorMsg,
+			ChunkIndex:    chunkIndex + 1,
+			TotalChunks:   totalChunks,
+			ChunkID:       fmt.Sprintf("chunk_%d", chunkIndex+1),
+		})
 	}
 }
 
@@ -261,7 +308,8 @@ func (e *Engine) publishJobFailed(ctx context.Context, state *ProcessingState, e
 			CorrelationID: state.CorrelationID,
 			JobAction:     "DynamicWorkflow",
 			Stage:         "JobFailed",
-			Message:       errMsg,
+			Error:         errMsg,
+			Message:       "Workflow failed",
 		})
 	}
 }
