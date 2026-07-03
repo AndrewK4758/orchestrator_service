@@ -102,6 +102,8 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			RawPDFs:         req.GetPdfContents(),
 			RawTextContents: req.GetRawTextContents(),
 			Steps:           steps,
+			OverarchingGoal: req.GetOverarchingGoal(),
+			EnabledTools:    req.GetEnabledTools(),
 			TenantID:        tenantID,
 			UserID:          userID,
 			AppID:           appID,
@@ -283,21 +285,29 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	// Update the processing state with the human-corrected JSON
 	state.Lock()
-	if state.StepResults == nil {
-		state.StepResults = make(map[int]string)
-	}
-	state.StepResults[state.CurrentStepIndex] = correctedJSON
-	state.PreviousStepResult = correctedJSON
+	var stepName string
+	if state.OverarchingGoal != "" {
+		// Goal-oriented ReAct Agent mode: append human correction to history
+		state.PreviousStepResult += fmt.Sprintf("Observation: Manual human correction submitted: %s\n", correctedJSON)
+		stepName = "AgenticHumanReviewResolved"
+	} else {
+		// Traditional Step-based mode
+		if state.StepResults == nil {
+			state.StepResults = make(map[int]string)
+		}
+		state.StepResults[state.CurrentStepIndex] = correctedJSON
+		state.PreviousStepResult = correctedJSON
 
-	// Mark current step as completed in executed list
-	stepName := state.Steps[state.CurrentStepIndex].StepName
-	if stepName == "" {
-		stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
-	}
-	state.ExecutedSteps = append(state.ExecutedSteps, stepName)
+		// Mark current step as completed in executed list
+		stepName = state.Steps[state.CurrentStepIndex].StepName
+		if stepName == "" {
+			stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
+		}
+		state.ExecutedSteps = append(state.ExecutedSteps, stepName)
 
-	// Increment CurrentStepIndex so the engine resumes at the next step!
-	state.CurrentStepIndex++
+		// Increment CurrentStepIndex so the engine resumes at the next step!
+		state.CurrentStepIndex++
+	}
 	state.Unlock()
 
 	// Serialize state and publish back to NATS JetStream to trigger execution resume

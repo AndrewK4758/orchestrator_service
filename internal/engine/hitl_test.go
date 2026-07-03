@@ -284,3 +284,121 @@ func TestEngine_ExecuteExternalAction(t *testing.T) {
 		t.Errorf("Expected state.PreviousStepResult to be updated with %s, got %s", mockServer.resultJson, state.PreviousStepResult)
 	}
 }
+
+type multiStageMockAIServer struct {
+	pb.UnimplementedDocumentProcessorServer
+	callCount  int
+	actionAddr string
+}
+
+func (m *multiStageMockAIServer) ExtractDocumentData(ctx context.Context, req *pb.ExtractRequest) (*pb.ExtractResponse, error) {
+	m.callCount++
+	var response string
+
+	switch m.callCount {
+	case 1:
+		// First planning step: run DocumentExtractor
+		response = `{
+			"thought": "I need to extract the invoice details first.",
+			"tool_name": "DocumentExtractor",
+			"tool_input": "{\"pdf_index\": 0, \"prompt\": \"Extract invoice total\", \"schema\": \"{}\"}"
+		}`
+	case 2:
+		// Tool execution of DocumentExtractor
+		response = `{"total_amount": 150.0}`
+	case 3:
+		// Second planning step: execute external generic action with extracted info
+		response = `{
+			"thought": "Now I must save the invoice details to the external system.",
+			"tool_name": "GenericAction",
+			"tool_input": "{\"address\": \"` + m.actionAddr + `\", \"payload\": \"{\\\"invoice_total\\\": 150.0}\"}"
+		}`
+	case 4:
+		// Third planning step: FINISH
+		response = `{
+			"thought": "Extraction and action complete. I am finished.",
+			"tool_name": "FINISH",
+			"tool_input": "{\"final_status\": \"completed\", \"amount\": 150.0}"
+		}`
+	}
+
+	return &pb.ExtractResponse{
+		Success:       true,
+		ExtractedJson: response,
+	}, nil
+}
+
+func TestEngine_ReActAgentWorkflow(t *testing.T) {
+	// 1. Start local mock generic action server
+	actionListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for action: %v", err)
+	}
+	defer actionListener.Close()
+
+	actionServer := grpc.NewServer()
+	mockAction := &mockGenericActionServer{
+		success:    true,
+		message:    "Action executed successfully",
+		resultJson: `{"db_id": "inserted_abc"}`,
+	}
+	pb.RegisterGenericActionServiceServer(actionServer, mockAction)
+	go func() {
+		_ = actionServer.Serve(actionListener)
+	}()
+	defer actionServer.Stop()
+
+	// 2. Start local mock AI planner/extractor server
+	aiListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for AI: %v", err)
+	}
+	defer aiListener.Close()
+
+	aiServer := grpc.NewServer()
+	mockAI := &multiStageMockAIServer{
+		actionAddr: actionListener.Addr().String(),
+	}
+	pb.RegisterDocumentProcessorServer(aiServer, mockAI)
+	go func() {
+		_ = aiServer.Serve(aiListener)
+	}()
+	defer aiServer.Stop()
+
+	// 3. Connect the real AI client to the mock AI server
+	aiClient, err := ai_client.NewClient(aiListener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to create AI client: %v", err)
+	}
+	defer aiClient.Close()
+
+	e := NewEngine(aiClient, nil, nil)
+
+	// Create goal-oriented state
+	state := &ProcessingState{
+		JobID:           "react_agent_job",
+		RawTextContents: []string{"Sample raw invoice content: $150"},
+	}
+
+	// 4. Run the Agent loop
+	goal := "Extract total invoice amount and write it to database"
+	err = e.RunReAct(context.Background(), state, goal, []string{"DocumentExtractor", "GenericAction"})
+	if err != nil {
+		t.Fatalf("Agent workflow failed: %v", err)
+	}
+
+	// 5. Assertions
+	if mockAI.callCount != 4 {
+		t.Errorf("Expected exactly 4 AI calls, got %d", mockAI.callCount)
+	}
+
+	expectedFinalResult := `{"final_status": "completed", "amount": 150.0}`
+	if state.PreviousStepResult != expectedFinalResult {
+		t.Errorf("Expected final result %s, got %s", expectedFinalResult, state.PreviousStepResult)
+	}
+
+	expectedActionPayload := `{"invoice_total": 150.0}`
+	if mockAction.lastPayload != expectedActionPayload {
+		t.Errorf("Expected generic action payload %s, got %s", expectedActionPayload, mockAction.lastPayload)
+	}
+}

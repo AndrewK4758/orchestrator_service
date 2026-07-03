@@ -129,6 +129,9 @@ type SubmitDocumentRequest struct {
 	UserId   string `protobuf:"bytes,12,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
 	// Raw text or HTML contents (e.g., email bodies) that bypass PDF chunking
 	RawTextContents []string `protobuf:"bytes,14,rep,name=raw_text_contents,json=rawTextContents,proto3" json:"raw_text_contents,omitempty"`
+	// New Goal-Oriented ReAct Agent fields
+	OverarchingGoal string   `protobuf:"bytes,15,opt,name=overarching_goal,json=overarchingGoal,proto3" json:"overarching_goal,omitempty"` // Goal for the agent, e.g. "Extract total invoice amount and verify"
+	EnabledTools    []string `protobuf:"bytes,16,rep,name=enabled_tools,json=enabledTools,proto3" json:"enabled_tools,omitempty"`          // List of tools the agent can use
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -229,6 +232,20 @@ func (x *SubmitDocumentRequest) GetUserId() string {
 func (x *SubmitDocumentRequest) GetRawTextContents() []string {
 	if x != nil {
 		return x.RawTextContents
+	}
+	return nil
+}
+
+func (x *SubmitDocumentRequest) GetOverarchingGoal() string {
+	if x != nil {
+		return x.OverarchingGoal
+	}
+	return ""
+}
+
+func (x *SubmitDocumentRequest) GetEnabledTools() []string {
+	if x != nil {
+		return x.EnabledTools
 	}
 	return nil
 }
@@ -634,7 +651,7 @@ const file_orchestrator_proto_rawDesc = "" +
 	"\x10callback_address\x18\x04 \x01(\tR\x0fcallbackAddress\x120\n" +
 	"\x14require_human_review\x18\x05 \x01(\bR\x12requireHumanReview\x122\n" +
 	"\x15bypass_human_fallback\x18\x06 \x01(\bR\x13bypassHumanFallback\x122\n" +
-	"\x15target_action_address\x18\a \x01(\tR\x13targetActionAddress\"\xa9\x03\n" +
+	"\x15target_action_address\x18\a \x01(\tR\x13targetActionAddress\"\xf9\x03\n" +
 	"\x15SubmitDocumentRequest\x12!\n" +
 	"\fpdf_contents\x18\x01 \x03(\fR\vpdfContents\x12<\n" +
 	"\x05steps\x18\x02 \x03(\v2&.document.orchestrator.v1.WorkflowStepR\x05steps\x12E\n" +
@@ -646,7 +663,9 @@ const file_orchestrator_proto_rawDesc = "" +
 	" \x01(\tR\rcorrelationId\x12\x1b\n" +
 	"\ttenant_id\x18\v \x01(\tR\btenantId\x12\x17\n" +
 	"\auser_id\x18\f \x01(\tR\x06userId\x12*\n" +
-	"\x11raw_text_contents\x18\x0e \x03(\tR\x0frawTextContents\"G\n" +
+	"\x11raw_text_contents\x18\x0e \x03(\tR\x0frawTextContents\x12)\n" +
+	"\x10overarching_goal\x18\x0f \x01(\tR\x0foverarchingGoal\x12#\n" +
+	"\renabled_tools\x18\x10 \x03(\tR\fenabledTools\"G\n" +
 	"\x16SubmitDocumentResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\"&\n" +
