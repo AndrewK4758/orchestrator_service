@@ -24,10 +24,13 @@ var ErrPendingHumanValidation = errors.New("pending human validation")
 
 // WorkflowStep represents a single action step and its associated instructions.
 type WorkflowStep struct {
-	StepName           string `json:"step_name"`
-	CustomInstructions string `json:"custom_instructions"`
-	Schema             string `json:"expected_schema"`
-	CallbackAddress    string `json:"callback_address"`
+	StepName            string `json:"step_name"`
+	CustomInstructions  string `json:"custom_instructions"`
+	Schema              string `json:"expected_schema"`
+	CallbackAddress     string `json:"callback_address"`
+	RequireHumanReview  bool   `json:"require_human_review"`
+	BypassHumanFallback bool   `json:"bypass_human_fallback"`
+	TargetActionAddress string `json:"target_action_address"`
 }
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
@@ -255,7 +258,23 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 	state.PreviousStepResult = finalJSON
 
 	// 4. Validate output
+	if step.RequireHumanReview {
+		log.Printf("INFO: [Engine] Explicit human review requested for Step: %s. Triggering Human Validation.", step.StepName)
+		taskID, err := e.triggerHumanValidation(ctx, state, step, finalJSON, "Explicit human review requested by workflow policy")
+		if err != nil {
+			log.Printf("ERROR: [Engine] Failed to trigger Human Validation: %v", err)
+			return fmt.Errorf("failed to create explicit human validation task: %w", err)
+		}
+		log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
+		return ErrPendingHumanValidation
+	}
+
 	if valErr := e.validateAIOutput(finalJSON, schema); valErr != nil {
+		if step.BypassHumanFallback {
+			log.Printf("WARNING: [Engine] AI output invalid for Step: %s, but bypass_human_fallback is TRUE. Failing step instantly without fallback. Error: %v", step.StepName, valErr)
+			return fmt.Errorf("ai output did not match requirements: %w", valErr)
+		}
+
 		log.Printf("WARNING: [Engine] AI output did not fit rules/requirements: %v. Triggering Human Validation.", valErr)
 
 		// Create validation task
@@ -267,6 +286,14 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 
 		log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
 		return ErrPendingHumanValidation
+	}
+
+	// 5. Execute external generic action if target_action_address is specified
+	if step.TargetActionAddress != "" {
+		if err := e.executeExternalGenericAction(ctx, state, step, finalJSON); err != nil {
+			log.Printf("ERROR: [Engine] Failed to execute external action at %s: %v", step.TargetActionAddress, err)
+			return fmt.Errorf("external action failed: %w", err)
+		}
 	}
 
 	return nil
@@ -456,4 +483,44 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingSt
 	}
 
 	return resp.GetTaskId(), nil
+}
+
+func (e *Engine) executeExternalGenericAction(ctx context.Context, state *ProcessingState, step WorkflowStep, payload string) error {
+	log.Printf("INFO: [Engine] Dispatching generic action for Step: %s to Address: %s", step.StepName, step.TargetActionAddress)
+
+	conn, err := grpc.Dial(step.TargetActionAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to dial target action server at %s: %w", step.TargetActionAddress, err)
+	}
+	defer conn.Close()
+
+	client := pb.NewGenericActionServiceClient(conn)
+	req := &pb.GenericActionRequest{
+		JobId:       state.JobID,
+		StepName:    step.StepName,
+		PayloadJson: payload,
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	resp, err := client.ExecuteAction(ctx, req)
+	if err != nil {
+		return fmt.Errorf("generic action call failed: %w", err)
+	}
+
+	if !resp.GetSuccess() {
+		return fmt.Errorf("generic action returned execution failure: %s", resp.GetMessage())
+	}
+
+	log.Printf("INFO: [Engine] Successfully executed generic action. Response Message: %s, Result: %s", resp.GetMessage(), resp.GetResultJson())
+
+	// If the external action returns a modified JSON, we save it as the step result
+	if resp.GetResultJson() != "" {
+		state.Lock()
+		state.PreviousStepResult = resp.GetResultJson()
+		state.Unlock()
+	}
+
+	return nil
 }

@@ -86,10 +86,13 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	var steps []engine.WorkflowStep
 	for _, s := range req.GetSteps() {
 		steps = append(steps, engine.WorkflowStep{
-			StepName:           s.StepName,
-			CustomInstructions: s.CustomInstructions,
-			Schema:             s.ExpectedSchema,
-			CallbackAddress:    s.CallbackAddress,
+			StepName:            s.StepName,
+			CustomInstructions:  s.CustomInstructions,
+			Schema:              s.ExpectedSchema,
+			CallbackAddress:     s.CallbackAddress,
+			RequireHumanReview:  s.RequireHumanReview,
+			BypassHumanFallback: s.BypassHumanFallback,
+			TargetActionAddress: s.TargetActionAddress,
 		})
 	}
 

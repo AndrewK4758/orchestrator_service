@@ -205,3 +205,111 @@ var OrchestratorService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "orchestrator.proto",
 }
+
+const (
+	GenericActionService_ExecuteAction_FullMethodName = "/document.orchestrator.v1.GenericActionService/ExecuteAction"
+)
+
+// GenericActionServiceClient is the client API for GenericActionService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// A completely generic gRPC service that any external application can implement
+// to execute deterministic end-actions on validated JSON payloads.
+type GenericActionServiceClient interface {
+	ExecuteAction(ctx context.Context, in *GenericActionRequest, opts ...grpc.CallOption) (*GenericActionResponse, error)
+}
+
+type genericActionServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewGenericActionServiceClient(cc grpc.ClientConnInterface) GenericActionServiceClient {
+	return &genericActionServiceClient{cc}
+}
+
+func (c *genericActionServiceClient) ExecuteAction(ctx context.Context, in *GenericActionRequest, opts ...grpc.CallOption) (*GenericActionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GenericActionResponse)
+	err := c.cc.Invoke(ctx, GenericActionService_ExecuteAction_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GenericActionServiceServer is the server API for GenericActionService service.
+// All implementations must embed UnimplementedGenericActionServiceServer
+// for forward compatibility.
+//
+// A completely generic gRPC service that any external application can implement
+// to execute deterministic end-actions on validated JSON payloads.
+type GenericActionServiceServer interface {
+	ExecuteAction(context.Context, *GenericActionRequest) (*GenericActionResponse, error)
+	mustEmbedUnimplementedGenericActionServiceServer()
+}
+
+// UnimplementedGenericActionServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedGenericActionServiceServer struct{}
+
+func (UnimplementedGenericActionServiceServer) ExecuteAction(context.Context, *GenericActionRequest) (*GenericActionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecuteAction not implemented")
+}
+func (UnimplementedGenericActionServiceServer) mustEmbedUnimplementedGenericActionServiceServer() {}
+func (UnimplementedGenericActionServiceServer) testEmbeddedByValue()                              {}
+
+// UnsafeGenericActionServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GenericActionServiceServer will
+// result in compilation errors.
+type UnsafeGenericActionServiceServer interface {
+	mustEmbedUnimplementedGenericActionServiceServer()
+}
+
+func RegisterGenericActionServiceServer(s grpc.ServiceRegistrar, srv GenericActionServiceServer) {
+	// If the following call panics, it indicates UnimplementedGenericActionServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&GenericActionService_ServiceDesc, srv)
+}
+
+func _GenericActionService_ExecuteAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GenericActionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GenericActionServiceServer).ExecuteAction(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GenericActionService_ExecuteAction_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GenericActionServiceServer).ExecuteAction(ctx, req.(*GenericActionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// GenericActionService_ServiceDesc is the grpc.ServiceDesc for GenericActionService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var GenericActionService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "document.orchestrator.v1.GenericActionService",
+	HandlerType: (*GenericActionServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ExecuteAction",
+			Handler:    _GenericActionService_ExecuteAction_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "orchestrator.proto",
+}

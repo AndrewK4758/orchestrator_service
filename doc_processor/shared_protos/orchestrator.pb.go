@@ -22,13 +22,16 @@ const (
 )
 
 type WorkflowStep struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	StepName           string                 `protobuf:"bytes,1,opt,name=step_name,json=stepName,proto3" json:"step_name,omitempty"`                               // User-defined name for logging/tracing
-	CustomInstructions string                 `protobuf:"bytes,2,opt,name=custom_instructions,json=customInstructions,proto3" json:"custom_instructions,omitempty"` // Prompt for the AI
-	ExpectedSchema     string                 `protobuf:"bytes,3,opt,name=expected_schema,json=expectedSchema,proto3" json:"expected_schema,omitempty"`             // Expected JSON schema
-	CallbackAddress    string                 `protobuf:"bytes,4,opt,name=callback_address,json=callbackAddress,proto3" json:"callback_address,omitempty"`          // Address to fetch dynamic instructions from
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	StepName            string                 `protobuf:"bytes,1,opt,name=step_name,json=stepName,proto3" json:"step_name,omitempty"`                                     // User-defined name for logging/tracing
+	CustomInstructions  string                 `protobuf:"bytes,2,opt,name=custom_instructions,json=customInstructions,proto3" json:"custom_instructions,omitempty"`       // Prompt for the AI
+	ExpectedSchema      string                 `protobuf:"bytes,3,opt,name=expected_schema,json=expectedSchema,proto3" json:"expected_schema,omitempty"`                   // Expected JSON schema
+	CallbackAddress     string                 `protobuf:"bytes,4,opt,name=callback_address,json=callbackAddress,proto3" json:"callback_address,omitempty"`                // Address to fetch dynamic instructions from
+	RequireHumanReview  bool                   `protobuf:"varint,5,opt,name=require_human_review,json=requireHumanReview,proto3" json:"require_human_review,omitempty"`    // Force manual human review even if AI matches schema
+	BypassHumanFallback bool                   `protobuf:"varint,6,opt,name=bypass_human_fallback,json=bypassHumanFallback,proto3" json:"bypass_human_fallback,omitempty"` // Bypass human-in-the-loop validation completely on failure
+	TargetActionAddress string                 `protobuf:"bytes,7,opt,name=target_action_address,json=targetActionAddress,proto3" json:"target_action_address,omitempty"`  // Generic gRPC/HTTP address to send final validated JSON to
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *WorkflowStep) Reset() {
@@ -85,6 +88,27 @@ func (x *WorkflowStep) GetExpectedSchema() string {
 func (x *WorkflowStep) GetCallbackAddress() string {
 	if x != nil {
 		return x.CallbackAddress
+	}
+	return ""
+}
+
+func (x *WorkflowStep) GetRequireHumanReview() bool {
+	if x != nil {
+		return x.RequireHumanReview
+	}
+	return false
+}
+
+func (x *WorkflowStep) GetBypassHumanFallback() bool {
+	if x != nil {
+		return x.BypassHumanFallback
+	}
+	return false
+}
+
+func (x *WorkflowStep) GetTargetActionAddress() string {
+	if x != nil {
+		return x.TargetActionAddress
 	}
 	return ""
 }
@@ -478,16 +502,139 @@ func (x *ResumeJobResponse) GetMessage() string {
 	return ""
 }
 
+type GenericActionRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	StepName      string                 `protobuf:"bytes,2,opt,name=step_name,json=stepName,proto3" json:"step_name,omitempty"`
+	PayloadJson   string                 `protobuf:"bytes,3,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GenericActionRequest) Reset() {
+	*x = GenericActionRequest{}
+	mi := &file_orchestrator_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenericActionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenericActionRequest) ProtoMessage() {}
+
+func (x *GenericActionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_orchestrator_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenericActionRequest.ProtoReflect.Descriptor instead.
+func (*GenericActionRequest) Descriptor() ([]byte, []int) {
+	return file_orchestrator_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GenericActionRequest) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *GenericActionRequest) GetStepName() string {
+	if x != nil {
+		return x.StepName
+	}
+	return ""
+}
+
+func (x *GenericActionRequest) GetPayloadJson() string {
+	if x != nil {
+		return x.PayloadJson
+	}
+	return ""
+}
+
+type GenericActionResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	ResultJson    string                 `protobuf:"bytes,3,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GenericActionResponse) Reset() {
+	*x = GenericActionResponse{}
+	mi := &file_orchestrator_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenericActionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenericActionResponse) ProtoMessage() {}
+
+func (x *GenericActionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_orchestrator_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenericActionResponse.ProtoReflect.Descriptor instead.
+func (*GenericActionResponse) Descriptor() ([]byte, []int) {
+	return file_orchestrator_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GenericActionResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *GenericActionResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *GenericActionResponse) GetResultJson() string {
+	if x != nil {
+		return x.ResultJson
+	}
+	return ""
+}
+
 var File_orchestrator_proto protoreflect.FileDescriptor
 
 const file_orchestrator_proto_rawDesc = "" +
 	"\n" +
-	"\x12orchestrator.proto\x12\x18document.orchestrator.v1\x1a\x0fprocessor.proto\"\xb0\x01\n" +
+	"\x12orchestrator.proto\x12\x18document.orchestrator.v1\x1a\x0fprocessor.proto\"\xca\x02\n" +
 	"\fWorkflowStep\x12\x1b\n" +
 	"\tstep_name\x18\x01 \x01(\tR\bstepName\x12/\n" +
 	"\x13custom_instructions\x18\x02 \x01(\tR\x12customInstructions\x12'\n" +
 	"\x0fexpected_schema\x18\x03 \x01(\tR\x0eexpectedSchema\x12)\n" +
-	"\x10callback_address\x18\x04 \x01(\tR\x0fcallbackAddress\"\xa9\x03\n" +
+	"\x10callback_address\x18\x04 \x01(\tR\x0fcallbackAddress\x120\n" +
+	"\x14require_human_review\x18\x05 \x01(\bR\x12requireHumanReview\x122\n" +
+	"\x15bypass_human_fallback\x18\x06 \x01(\bR\x13bypassHumanFallback\x122\n" +
+	"\x15target_action_address\x18\a \x01(\tR\x13targetActionAddress\"\xa9\x03\n" +
 	"\x15SubmitDocumentRequest\x12!\n" +
 	"\fpdf_contents\x18\x01 \x03(\fR\vpdfContents\x12<\n" +
 	"\x05steps\x18\x02 \x03(\v2&.document.orchestrator.v1.WorkflowStepR\x05steps\x12E\n" +
@@ -515,11 +662,22 @@ const file_orchestrator_proto_rawDesc = "" +
 	"\x0ecorrected_json\x18\x02 \x01(\tR\rcorrectedJson\"G\n" +
 	"\x11ResumeJobResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\xda\x02\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"m\n" +
+	"\x14GenericActionRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1b\n" +
+	"\tstep_name\x18\x02 \x01(\tR\bstepName\x12!\n" +
+	"\fpayload_json\x18\x03 \x01(\tR\vpayloadJson\"l\n" +
+	"\x15GenericActionResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x1f\n" +
+	"\vresult_json\x18\x03 \x01(\tR\n" +
+	"resultJson2\xda\x02\n" +
 	"\x13OrchestratorService\x12s\n" +
 	"\x0eSubmitDocument\x12/.document.orchestrator.v1.SubmitDocumentRequest\x1a0.document.orchestrator.v1.SubmitDocumentResponse\x12h\n" +
 	"\x11ListenForProgress\x12'.document.orchestrator.v1.ListenRequest\x1a(.document.orchestrator.v1.ProgressUpdate0\x01\x12d\n" +
-	"\tResumeJob\x12*.document.orchestrator.v1.ResumeJobRequest\x1a+.document.orchestrator.v1.ResumeJobResponseB\x1dZ\x1bdoc_processor/shared_protosb\x06proto3"
+	"\tResumeJob\x12*.document.orchestrator.v1.ResumeJobRequest\x1a+.document.orchestrator.v1.ResumeJobResponse2\x88\x01\n" +
+	"\x14GenericActionService\x12p\n" +
+	"\rExecuteAction\x12..document.orchestrator.v1.GenericActionRequest\x1a/.document.orchestrator.v1.GenericActionResponseB\x1dZ\x1bdoc_processor/shared_protosb\x06proto3"
 
 var (
 	file_orchestrator_proto_rawDescOnce sync.Once
@@ -533,7 +691,7 @@ func file_orchestrator_proto_rawDescGZIP() []byte {
 	return file_orchestrator_proto_rawDescData
 }
 
-var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_orchestrator_proto_goTypes = []any{
 	(*WorkflowStep)(nil),           // 0: document.orchestrator.v1.WorkflowStep
 	(*SubmitDocumentRequest)(nil),  // 1: document.orchestrator.v1.SubmitDocumentRequest
@@ -542,19 +700,23 @@ var file_orchestrator_proto_goTypes = []any{
 	(*ProgressUpdate)(nil),         // 4: document.orchestrator.v1.ProgressUpdate
 	(*ResumeJobRequest)(nil),       // 5: document.orchestrator.v1.ResumeJobRequest
 	(*ResumeJobResponse)(nil),      // 6: document.orchestrator.v1.ResumeJobResponse
-	(ModelChoice)(0),               // 7: document.processor.v1.ModelChoice
+	(*GenericActionRequest)(nil),   // 7: document.orchestrator.v1.GenericActionRequest
+	(*GenericActionResponse)(nil),  // 8: document.orchestrator.v1.GenericActionResponse
+	(ModelChoice)(0),               // 9: document.processor.v1.ModelChoice
 }
 var file_orchestrator_proto_depIdxs = []int32{
 	0, // 0: document.orchestrator.v1.SubmitDocumentRequest.steps:type_name -> document.orchestrator.v1.WorkflowStep
-	7, // 1: document.orchestrator.v1.SubmitDocumentRequest.model_choice:type_name -> document.processor.v1.ModelChoice
+	9, // 1: document.orchestrator.v1.SubmitDocumentRequest.model_choice:type_name -> document.processor.v1.ModelChoice
 	1, // 2: document.orchestrator.v1.OrchestratorService.SubmitDocument:input_type -> document.orchestrator.v1.SubmitDocumentRequest
 	3, // 3: document.orchestrator.v1.OrchestratorService.ListenForProgress:input_type -> document.orchestrator.v1.ListenRequest
 	5, // 4: document.orchestrator.v1.OrchestratorService.ResumeJob:input_type -> document.orchestrator.v1.ResumeJobRequest
-	2, // 5: document.orchestrator.v1.OrchestratorService.SubmitDocument:output_type -> document.orchestrator.v1.SubmitDocumentResponse
-	4, // 6: document.orchestrator.v1.OrchestratorService.ListenForProgress:output_type -> document.orchestrator.v1.ProgressUpdate
-	6, // 7: document.orchestrator.v1.OrchestratorService.ResumeJob:output_type -> document.orchestrator.v1.ResumeJobResponse
-	5, // [5:8] is the sub-list for method output_type
-	2, // [2:5] is the sub-list for method input_type
+	7, // 5: document.orchestrator.v1.GenericActionService.ExecuteAction:input_type -> document.orchestrator.v1.GenericActionRequest
+	2, // 6: document.orchestrator.v1.OrchestratorService.SubmitDocument:output_type -> document.orchestrator.v1.SubmitDocumentResponse
+	4, // 7: document.orchestrator.v1.OrchestratorService.ListenForProgress:output_type -> document.orchestrator.v1.ProgressUpdate
+	6, // 8: document.orchestrator.v1.OrchestratorService.ResumeJob:output_type -> document.orchestrator.v1.ResumeJobResponse
+	8, // 9: document.orchestrator.v1.GenericActionService.ExecuteAction:output_type -> document.orchestrator.v1.GenericActionResponse
+	6, // [6:10] is the sub-list for method output_type
+	2, // [2:6] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name
 	2, // [2:2] is the sub-list for extension extendee
 	0, // [0:2] is the sub-list for field type_name
@@ -572,9 +734,9 @@ func file_orchestrator_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_orchestrator_proto_rawDesc), len(file_orchestrator_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_orchestrator_proto_goTypes,
 		DependencyIndexes: file_orchestrator_proto_depIdxs,
