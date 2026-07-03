@@ -250,8 +250,10 @@ type ExtractRequest struct {
 	// The Orchestrator passes the exact prompt (e.g., "Find the document boundaries in this chunk")
 	Prompt string `protobuf:"bytes,2,opt,name=prompt,proto3" json:"prompt,omitempty"`
 	// Strict JSON Schema to enforce the model's output format
-	JsonSchema    string      `protobuf:"bytes,3,opt,name=json_schema,json=jsonSchema,proto3" json:"json_schema,omitempty"`
-	ModelChoice   ModelChoice `protobuf:"varint,4,opt,name=model_choice,json=modelChoice,proto3,enum=document.processor.v1.ModelChoice" json:"model_choice,omitempty"`
+	JsonSchema  string      `protobuf:"bytes,3,opt,name=json_schema,json=jsonSchema,proto3" json:"json_schema,omitempty"`
+	ModelChoice ModelChoice `protobuf:"varint,4,opt,name=model_choice,json=modelChoice,proto3,enum=document.processor.v1.ModelChoice" json:"model_choice,omitempty"`
+	// The Orchestrator sends raw text (if processing raw text instead of a PDF chunk)
+	ChunkText     string `protobuf:"bytes,5,opt,name=chunk_text,json=chunkText,proto3" json:"chunk_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -312,6 +314,13 @@ func (x *ExtractRequest) GetModelChoice() ModelChoice {
 		return x.ModelChoice
 	}
 	return ModelChoice_MODEL_CHOICE_UNSPECIFIED
+}
+
+func (x *ExtractRequest) GetChunkText() string {
+	if x != nil {
+		return x.ChunkText
+	}
+	return ""
 }
 
 type ExtractResponse struct {
@@ -395,13 +404,15 @@ const file_processor_proto_rawDesc = "" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12%\n" +
 	"\x0ecorrelation_id\x18\x03 \x01(\tR\rcorrelationId\x12\x16\n" +
-	"\x06status\x18\x04 \x01(\tR\x06status\"\xad\x01\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\"\xcc\x01\n" +
 	"\x0eExtractRequest\x12\x1b\n" +
 	"\tchunk_pdf\x18\x01 \x01(\fR\bchunkPdf\x12\x16\n" +
 	"\x06prompt\x18\x02 \x01(\tR\x06prompt\x12\x1f\n" +
 	"\vjson_schema\x18\x03 \x01(\tR\n" +
 	"jsonSchema\x12E\n" +
-	"\fmodel_choice\x18\x04 \x01(\x0e2\".document.processor.v1.ModelChoiceR\vmodelChoice\"w\n" +
+	"\fmodel_choice\x18\x04 \x01(\x0e2\".document.processor.v1.ModelChoiceR\vmodelChoice\x12\x1d\n" +
+	"\n" +
+	"chunk_text\x18\x05 \x01(\tR\tchunkText\"w\n" +
 	"\x0fExtractResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12%\n" +

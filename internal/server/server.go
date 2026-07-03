@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -188,6 +189,11 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 	// Run the engine with the dynamically provided steps
 	err := s.eng.Run(ctx, tracker.State)
 	if err != nil {
+		if errors.Is(err, engine.ErrPendingHumanValidation) {
+			log.Printf("INFO: Job %s paused for human validation: %v", tracker.State.JobID, err)
+			sendProgress("PENDING_HUMAN_VALIDATION", "AI output did not fit requirements; pending human review.")
+			return
+		}
 		log.Printf("ERROR: Job %s failed: %v", tracker.State.JobID, err)
 		sendProgress("FAILED", fmt.Sprintf("Workflow failed: %v", err))
 		return
@@ -247,4 +253,84 @@ func (s *OrchestratorServer) ListenForProgress(req *pb.ListenRequest, stream pb.
 	s.mu.Unlock()
 
 	return nil
+}
+
+// ResumeJob handles the gRPC request from HumanValidationService to resume a suspended job.
+func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
+	jobID := req.GetJobId()
+	correctedJSON := req.GetCorrectedJson()
+	log.Printf("INFO: [Server.ResumeJob] Resuming JobID: %s with human-corrected JSON", jobID)
+
+	s.mu.RLock()
+	tracker, exists := s.activeJobs[jobID]
+	s.mu.RUnlock()
+
+	var state *engine.ProcessingState
+
+	if exists && tracker != nil {
+		state = tracker.State
+	} else {
+		// If tracker is not found in memory (e.g. server restart), we cannot resume directly
+		// in this prototype. However, we log and return failure clearly.
+		return &pb.ResumeJobResponse{
+			Success: false,
+			Message: fmt.Sprintf("Job %s not found in orchestrator memory", jobID),
+		}, nil
+	}
+
+	// Update the processing state with the human-corrected JSON
+	state.Lock()
+	if state.StepResults == nil {
+		state.StepResults = make(map[int]string)
+	}
+	state.StepResults[state.CurrentStepIndex] = correctedJSON
+	state.PreviousStepResult = correctedJSON
+
+	// Mark current step as completed in executed list
+	stepName := state.Steps[state.CurrentStepIndex].StepName
+	if stepName == "" {
+		stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
+	}
+	state.ExecutedSteps = append(state.ExecutedSteps, stepName)
+
+	// Increment CurrentStepIndex so the engine resumes at the next step!
+	state.CurrentStepIndex++
+	state.Unlock()
+
+	// Serialize state and publish back to NATS JetStream to trigger execution resume
+	payload, err := json.Marshal(state)
+	if err != nil {
+		log.Printf("ERROR: [Server.ResumeJob] Failed to marshal updated job state: %v", err)
+		return nil, fmt.Errorf("failed to serialize job state for resumption")
+	}
+
+	err = s.pub.PublishJob(ctx, payload)
+	if err != nil {
+		log.Printf("ERROR: [Server.ResumeJob] Failed to publish job to queue: %v", err)
+		return nil, fmt.Errorf("failed to queue job resumption")
+	}
+
+	// Publish dynamic trace event for traceability
+	err = s.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:     events.EventJobStepCompleted,
+		Timestamp:     time.Now(),
+		TenantID:      state.TenantID,
+		UserID:        state.UserID,
+		AppID:         state.AppID,
+		JobID:         jobID,
+		DocumentType:  state.DocumentType,
+		CorrelationID: state.CorrelationID,
+		JobAction:     stepName,
+		Stage:         "HumanValidationResolved",
+		Message:       fmt.Sprintf("Step completed via human correction: %s", stepName),
+	})
+	if err != nil {
+		log.Printf("ERROR: [Server.ResumeJob] Failed to publish trace event: %v", err)
+	}
+
+	return &pb.ResumeJobResponse{
+		Success: true,
+		Message: "Job resumed successfully",
+	}, nil
 }

@@ -236,6 +236,8 @@ type TraceEvent struct {
 	Message       string                 `protobuf:"bytes,10,opt,name=message,proto3" json:"message,omitempty"`
 	Metadata      string                 `protobuf:"bytes,11,opt,name=metadata,proto3" json:"metadata,omitempty"`   // JSON string
 	Timestamp     string                 `protobuf:"bytes,12,opt,name=timestamp,proto3" json:"timestamp,omitempty"` // ISO 8601
+	DocumentType  string                 `protobuf:"bytes,13,opt,name=document_type,json=documentType,proto3" json:"document_type,omitempty"`
+	TotalChunks   int32                  `protobuf:"varint,14,opt,name=total_chunks,json=totalChunks,proto3" json:"total_chunks,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -354,6 +356,20 @@ func (x *TraceEvent) GetTimestamp() string {
 	return ""
 }
 
+func (x *TraceEvent) GetDocumentType() string {
+	if x != nil {
+		return x.DocumentType
+	}
+	return ""
+}
+
+func (x *TraceEvent) GetTotalChunks() int32 {
+	if x != nil {
+		return x.TotalChunks
+	}
+	return 0
+}
+
 var File_traceability_proto protoreflect.FileDescriptor
 
 const file_traceability_proto_rawDesc = "" +
@@ -369,7 +385,7 @@ const file_traceability_proto_rawDesc = "" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\"v\n" +
 	"\x1bGetCorrelationTraceResponse\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x120\n" +
-	"\x06events\x18\x02 \x03(\v2\x18.traceability.TraceEventR\x06events\"\xd1\x02\n" +
+	"\x06events\x18\x02 \x03(\v2\x18.traceability.TraceEventR\x06events\"\x99\x03\n" +
 	"\n" +
 	"TraceEvent\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x15\n" +
@@ -384,7 +400,9 @@ const file_traceability_proto_rawDesc = "" +
 	"\amessage\x18\n" +
 	" \x01(\tR\amessage\x12\x1a\n" +
 	"\bmetadata\x18\v \x01(\tR\bmetadata\x12\x1c\n" +
-	"\ttimestamp\x18\f \x01(\tR\ttimestamp2\xd3\x01\n" +
+	"\ttimestamp\x18\f \x01(\tR\ttimestamp\x12#\n" +
+	"\rdocument_type\x18\r \x01(\tR\fdocumentType\x12!\n" +
+	"\ftotal_chunks\x18\x0e \x01(\x05R\vtotalChunks2\xd3\x01\n" +
 	"\x11TraceabilityQuery\x12R\n" +
 	"\vGetJobTrace\x12 .traceability.GetJobTraceRequest\x1a!.traceability.GetJobTraceResponse\x12j\n" +
 	"\x13GetCorrelationTrace\x12(.traceability.GetCorrelationTraceRequest\x1a).traceability.GetCorrelationTraceResponseBHZ)doc_processor/shared_protos;shared_protos\xaa\x02\x1aTraceabilityService.Protosb\x06proto3"

@@ -17,6 +17,7 @@ const (
 	EventJobStepStarted   EventType = "step.started"
 	EventJobStepCompleted EventType = "step.completed"
 	EventJobStepFailed    EventType = "step.failed"
+	EventJobStepPendingHuman EventType = "step.pending_human"
 )
 
 // TraceabilityEvent is the core wrapper for all compliance and tracing data.

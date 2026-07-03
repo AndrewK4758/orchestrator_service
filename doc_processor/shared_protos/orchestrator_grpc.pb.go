@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	OrchestratorService_SubmitDocument_FullMethodName    = "/document.orchestrator.v1.OrchestratorService/SubmitDocument"
 	OrchestratorService_ListenForProgress_FullMethodName = "/document.orchestrator.v1.OrchestratorService/ListenForProgress"
+	OrchestratorService_ResumeJob_FullMethodName         = "/document.orchestrator.v1.OrchestratorService/ResumeJob"
 )
 
 // OrchestratorServiceClient is the client API for OrchestratorService service.
@@ -31,6 +32,8 @@ type OrchestratorServiceClient interface {
 	SubmitDocument(ctx context.Context, in *SubmitDocumentRequest, opts ...grpc.CallOption) (*SubmitDocumentResponse, error)
 	// Client listens to this Server Stream to get real-time progress of their JobID
 	ListenForProgress(ctx context.Context, in *ListenRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ProgressUpdate], error)
+	// Resume a job after human validation has corrected the AI output
+	ResumeJob(ctx context.Context, in *ResumeJobRequest, opts ...grpc.CallOption) (*ResumeJobResponse, error)
 }
 
 type orchestratorServiceClient struct {
@@ -70,6 +73,16 @@ func (c *orchestratorServiceClient) ListenForProgress(ctx context.Context, in *L
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OrchestratorService_ListenForProgressClient = grpc.ServerStreamingClient[ProgressUpdate]
 
+func (c *orchestratorServiceClient) ResumeJob(ctx context.Context, in *ResumeJobRequest, opts ...grpc.CallOption) (*ResumeJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeJobResponse)
+	err := c.cc.Invoke(ctx, OrchestratorService_ResumeJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // OrchestratorServiceServer is the server API for OrchestratorService service.
 // All implementations must embed UnimplementedOrchestratorServiceServer
 // for forward compatibility.
@@ -78,6 +91,8 @@ type OrchestratorServiceServer interface {
 	SubmitDocument(context.Context, *SubmitDocumentRequest) (*SubmitDocumentResponse, error)
 	// Client listens to this Server Stream to get real-time progress of their JobID
 	ListenForProgress(*ListenRequest, grpc.ServerStreamingServer[ProgressUpdate]) error
+	// Resume a job after human validation has corrected the AI output
+	ResumeJob(context.Context, *ResumeJobRequest) (*ResumeJobResponse, error)
 	mustEmbedUnimplementedOrchestratorServiceServer()
 }
 
@@ -93,6 +108,9 @@ func (UnimplementedOrchestratorServiceServer) SubmitDocument(context.Context, *S
 }
 func (UnimplementedOrchestratorServiceServer) ListenForProgress(*ListenRequest, grpc.ServerStreamingServer[ProgressUpdate]) error {
 	return status.Error(codes.Unimplemented, "method ListenForProgress not implemented")
+}
+func (UnimplementedOrchestratorServiceServer) ResumeJob(context.Context, *ResumeJobRequest) (*ResumeJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeJob not implemented")
 }
 func (UnimplementedOrchestratorServiceServer) mustEmbedUnimplementedOrchestratorServiceServer() {}
 func (UnimplementedOrchestratorServiceServer) testEmbeddedByValue()                             {}
@@ -144,6 +162,24 @@ func _OrchestratorService_ListenForProgress_Handler(srv interface{}, stream grpc
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OrchestratorService_ListenForProgressServer = grpc.ServerStreamingServer[ProgressUpdate]
 
+func _OrchestratorService_ResumeJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrchestratorServiceServer).ResumeJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrchestratorService_ResumeJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrchestratorServiceServer).ResumeJob(ctx, req.(*ResumeJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // OrchestratorService_ServiceDesc is the grpc.ServiceDesc for OrchestratorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -154,6 +190,10 @@ var OrchestratorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SubmitDocument",
 			Handler:    _OrchestratorService_SubmitDocument_Handler,
+		},
+		{
+			MethodName: "ResumeJob",
+			Handler:    _OrchestratorService_ResumeJob_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
