@@ -93,7 +93,14 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			RequireHumanReview:  s.RequireHumanReview,
 			BypassHumanFallback: s.BypassHumanFallback,
 			TargetActionAddress: s.TargetActionAddress,
+			WritesToStateKey:    s.WritesToStateKey,
+			ReadsFromStateKey:   s.ReadsFromStateKey,
 		})
+	}
+
+	var globalState map[string]interface{}
+	if req.GetInitialStateJson() != "" {
+		_ = json.Unmarshal([]byte(req.GetInitialStateJson()), &globalState)
 	}
 
 	tracker := &JobTracker{
@@ -109,6 +116,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			AppID:           appID,
 			DocumentType:    req.GetDocumentType(),
 			CorrelationID:   correlationID,
+			GlobalState:     globalState,
 		},
 		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
 	}
@@ -206,7 +214,10 @@ func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
 
 	// At this point, state.PreviousStepResult contains the output of the final step
 	finalJSON := tracker.State.PreviousStepResult
-	if finalJSON == "" {
+	if tracker.State.GlobalState != nil {
+		b, _ := json.Marshal(tracker.State.GlobalState)
+		finalJSON = string(b)
+	} else if finalJSON == "" {
 		finalJSON = "{}"
 	}
 

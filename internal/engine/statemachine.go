@@ -22,7 +22,6 @@ import (
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
 
-// WorkflowStep represents a single action step and its associated instructions.
 type WorkflowStep struct {
 	StepName            string `json:"step_name"`
 	CustomInstructions  string `json:"custom_instructions"`
@@ -31,6 +30,8 @@ type WorkflowStep struct {
 	RequireHumanReview  bool   `json:"require_human_review"`
 	BypassHumanFallback bool   `json:"bypass_human_fallback"`
 	TargetActionAddress string `json:"target_action_address"`
+	WritesToStateKey    string `json:"writes_to_state_key"`
+	ReadsFromStateKey   string `json:"reads_from_state_key"`
 }
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
@@ -60,8 +61,11 @@ type ProcessingState struct {
 	mu          sync.Mutex
 	StepResults map[int]string
 
-	// Result from the previous step (e.g. classification string to be passed to callbacks)
+	// Result from the previous step (e.g., classification string to be passed to callbacks)
 	PreviousStepResult string `json:"previous_step_result"`
+
+	// GlobalState for LangGraph architecture
+	GlobalState map[string]interface{} `json:"global_state"`
 
 	// Audit trail for visibility
 	ExecutedSteps []string
@@ -187,103 +191,131 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 		return fmt.Errorf("no documents available to process")
 	}
 
-	state.StepResults = make(map[int]string)
-	var wg sync.WaitGroup
-	errChan := make(chan error, totalDocs)
-
-	for i, pdfBytes := range state.RawPDFs {
-		wg.Add(1)
-		go func(index int, data []byte) {
-			defer wg.Done()
-
-			e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting PDF chunk %d", index), index, totalDocs, "")
-
-			resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
-			if err != nil {
-				e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed PDF chunk %d", index), index, totalDocs, err.Error())
-				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
-				return
-			}
-
-			e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed PDF chunk %d", index), index, totalDocs, "")
-
-			state.mu.Lock()
-			state.StepResults[index] = resp.GetExtractedJson()
-			state.mu.Unlock()
-		}(i, pdfBytes)
-	}
-
-	offset := len(state.RawPDFs)
-	for i, textContent := range state.RawTextContents {
-		wg.Add(1)
-		go func(index int, text string) {
-			defer wg.Done()
-
-			e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting Text chunk %d", index), index, totalDocs, "")
-
-			resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
-			if err != nil {
-				e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed Text chunk %d", index), index, totalDocs, err.Error())
-				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
-				return
-			}
-
-			e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed Text chunk %d", index), index, totalDocs, "")
-
-			state.mu.Lock()
-			state.StepResults[index] = resp.GetExtractedJson()
-			state.mu.Unlock()
-		}(offset+i, textContent)
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
-		if err != nil {
-			return err
-		}
-	}
-
-	// 3. Update PreviousStepResult for the next step
-	// Combine results. If it's a single document, just save it.
+	maxRetries := 3
+	var valErr error
 	var finalJSON string
-	if len(state.StepResults) == 1 {
-		finalJSON = state.StepResults[0]
-	} else {
-		// Stitch into a JSON array string
-		finalJSON = "["
-		for i := 0; i < totalDocs; i++ {
-			if result, ok := state.StepResults[i]; ok {
-				if finalJSON != "[" {
-					finalJSON += ","
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		state.StepResults = make(map[int]string)
+		var wg sync.WaitGroup
+		errChan := make(chan error, totalDocs)
+
+		for i, pdfBytes := range state.RawPDFs {
+			wg.Add(1)
+			go func(index int, data []byte) {
+				defer wg.Done()
+
+				e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting PDF chunk %d (Attempt %d)", index, attempt), index, totalDocs, "")
+
+				resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
+				if err != nil {
+					e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed PDF chunk %d", index), index, totalDocs, err.Error())
+					errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
+					return
 				}
-				finalJSON += result
+
+				e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed PDF chunk %d", index), index, totalDocs, "")
+
+				state.mu.Lock()
+				state.StepResults[index] = resp.GetExtractedJson()
+				state.mu.Unlock()
+			}(i, pdfBytes)
+		}
+
+		offset := len(state.RawPDFs)
+		for i, textContent := range state.RawTextContents {
+			wg.Add(1)
+			go func(index int, text string) {
+				defer wg.Done()
+
+				e.publishChunkTrace(ctx, state, events.EventChunkStarted, fmt.Sprintf("Starting Text chunk %d (Attempt %d)", index, attempt), index, totalDocs, "")
+
+				resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
+				if err != nil {
+					e.publishChunkTrace(ctx, state, events.EventChunkFailed, fmt.Sprintf("Failed Text chunk %d", index), index, totalDocs, err.Error())
+					errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
+					return
+				}
+
+				e.publishChunkTrace(ctx, state, events.EventChunkCompleted, fmt.Sprintf("Completed Text chunk %d", index), index, totalDocs, "")
+
+				state.mu.Lock()
+				state.StepResults[index] = resp.GetExtractedJson()
+				state.mu.Unlock()
+			}(offset+i, textContent)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		var chunkErr error
+		for err := range errChan {
+			if err != nil {
+				chunkErr = err
+				break
 			}
 		}
-		finalJSON += "]"
-	}
-	state.PreviousStepResult = finalJSON
-
-	// 4. Validate output
-	if step.RequireHumanReview {
-		log.Printf("INFO: [Engine] Explicit human review requested for Step: %s. Triggering Human Validation.", step.StepName)
-		taskID, err := e.triggerHumanValidation(ctx, state, step, finalJSON, "Explicit human review requested by workflow policy")
-		if err != nil {
-			log.Printf("ERROR: [Engine] Failed to trigger Human Validation: %v", err)
-			return fmt.Errorf("failed to create explicit human validation task: %w", err)
+		if chunkErr != nil {
+			return chunkErr
 		}
-		log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
-		return ErrPendingHumanValidation
+
+		// 3. Update PreviousStepResult for the next step
+		if len(state.StepResults) == 1 {
+			finalJSON = state.StepResults[0]
+		} else {
+			finalJSON = "["
+			for i := 0; i < totalDocs; i++ {
+				if result, ok := state.StepResults[i]; ok {
+					if finalJSON != "[" {
+						finalJSON += ","
+					}
+					finalJSON += result
+				}
+			}
+			finalJSON += "]"
+		}
+		state.PreviousStepResult = finalJSON
+
+		// 4. Validate output
+		if step.RequireHumanReview {
+			log.Printf("INFO: [Engine] Explicit human review requested for Step: %s. Triggering Human Validation.", step.StepName)
+			taskID, err := e.triggerHumanValidation(ctx, state, step, finalJSON, "Explicit human review requested by workflow policy")
+			if err != nil {
+				log.Printf("ERROR: [Engine] Failed to trigger Human Validation: %v", err)
+				return fmt.Errorf("failed to create explicit human validation task: %w", err)
+			}
+			log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
+			return ErrPendingHumanValidation
+		}
+
+		valErr = e.validateAIOutput(finalJSON, schema)
+		if valErr == nil {
+			break // Success!
+		}
+
+		if strings.Contains(valErr.Error(), "explicitly flagged for review") {
+			break // Don't retry if the AI intentionally flagged it
+		}
+
+		if step.BypassHumanFallback {
+			break // Fail instantly without retries if configured
+		}
+
+		log.Printf("WARNING: [Engine] AI output invalid for Step: %s. Attempt %d of %d. Error: %v", step.StepName, attempt, maxRetries, valErr)
+
+		if attempt < maxRetries {
+			prompt = fmt.Sprintf("%s\n\n[SYSTEM FEEDBACK FROM PREVIOUS ATTEMPT]: %v. Please carefully review the document and ensure this strictly required data is extracted exactly as specified in the schema.", prompt, valErr)
+			log.Printf("INFO: [Engine] Retrying step %s due to validation failure.", step.StepName)
+		}
 	}
 
-	if valErr := e.validateAIOutput(finalJSON, schema); valErr != nil {
+	if valErr != nil {
 		if step.BypassHumanFallback {
 			log.Printf("WARNING: [Engine] AI output invalid for Step: %s, but bypass_human_fallback is TRUE. Failing step instantly without fallback. Error: %v", step.StepName, valErr)
 			return fmt.Errorf("ai output did not match requirements: %w", valErr)
 		}
 
-		log.Printf("WARNING: [Engine] AI output did not fit rules/requirements: %v. Triggering Human Validation.", valErr)
+		log.Printf("WARNING: [Engine] AI output did not fit rules/requirements after %d attempts: %v. Triggering Human Validation.", maxRetries, valErr)
 
 		// Create validation task
 		taskID, err := e.triggerHumanValidation(ctx, state, step, finalJSON, valErr.Error())
@@ -296,7 +328,7 @@ func (e *Engine) executeGenericStep(ctx context.Context, state *ProcessingState,
 		return ErrPendingHumanValidation
 	}
 
-	// 5. Execute external generic action if target_action_address is specified
+	// 5. Execute an external generic action if target_action_address is specified
 	if step.TargetActionAddress != "" {
 		if err := e.executeExternalGenericAction(ctx, state, step, finalJSON); err != nil {
 			log.Printf("ERROR: [Engine] Failed to execute external action at %s: %v", step.TargetActionAddress, err)
@@ -406,24 +438,30 @@ func (e *Engine) validateAIOutput(jsonStr string, schema string) error {
 		return fmt.Errorf("AI output is not valid JSON: %w", err)
 	}
 
-	// 2. Check if the schema specifies required properties, and if they are empty
+	// 2. Check if the schema specifies required properties and if they are empty
 	var schemaMap map[string]interface{}
 	if err := json.Unmarshal([]byte(schema), &schemaMap); err == nil {
-		if props, exists := schemaMap["properties"]; exists {
-			if propsMap, ok := props.(map[string]interface{}); ok {
-				// Let's check each property
+		if requiredObj, exists := schemaMap["required"]; exists {
+			if requiredList, ok := requiredObj.([]interface{}); ok {
+				var requiredProps []string
+				for _, r := range requiredList {
+					if rStr, ok := r.(string); ok {
+						requiredProps = append(requiredProps, rStr)
+					}
+				}
+
 				switch v := raw.(type) {
 				case map[string]interface{}:
-					for propName := range propsMap {
+					for _, propName := range requiredProps {
 						val, exists := v[propName]
 						if !exists {
-							return fmt.Errorf("missing expected field from schema: %s", propName)
+							return fmt.Errorf("missing strictly required field from schema: %s", propName)
 						}
 						if val == nil {
-							return fmt.Errorf("expected field is null: %s", propName)
+							return fmt.Errorf("strictly required field is null: %s", propName)
 						}
 						if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
-							return fmt.Errorf("expected field is empty: %s", propName)
+							return fmt.Errorf("strictly required field is empty: %s", propName)
 						}
 					}
 				case []interface{}:
@@ -432,16 +470,16 @@ func (e *Engine) validateAIOutput(jsonStr string, schema string) error {
 						if !ok {
 							continue
 						}
-						for propName := range propsMap {
+						for _, propName := range requiredProps {
 							val, exists := itemMap[propName]
 							if !exists {
-								return fmt.Errorf("item %d missing expected field from schema: %s", i, propName)
+								return fmt.Errorf("item %d missing strictly required field from schema: %s", i, propName)
 							}
 							if val == nil {
-								return fmt.Errorf("item %d expected field is null: %s", i, propName)
+								return fmt.Errorf("item %d strictly required field is null: %s", i, propName)
 							}
 							if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
-								return fmt.Errorf("item %d expected field is empty: %s", i, propName)
+								return fmt.Errorf("item %d strictly required field is empty: %s", i, propName)
 							}
 						}
 					}
@@ -465,11 +503,16 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingSt
 		addr = "localhost:50054"
 	}
 
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return "", fmt.Errorf("failed to dial human validation service: %w", err)
 	}
-	defer conn.Close()
+	defer func(conn *grpc.ClientConn) {
+		err := conn.Close()
+		if err != nil {
+			return
+		}
+	}(conn)
 
 	client := pb.NewHumanValidationServiceClient(conn)
 
@@ -496,11 +539,16 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingSt
 func (e *Engine) executeExternalGenericAction(ctx context.Context, state *ProcessingState, step WorkflowStep, payload string) error {
 	log.Printf("INFO: [Engine] Dispatching generic action for Step: %s to Address: %s", step.StepName, step.TargetActionAddress)
 
-	conn, err := grpc.Dial(step.TargetActionAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(step.TargetActionAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to dial target action server at %s: %w", step.TargetActionAddress, err)
 	}
-	defer conn.Close()
+	defer func(conn *grpc.ClientConn) {
+		err := conn.Close()
+		if err != nil {
+			return
+		}
+	}(conn)
 
 	client := pb.NewGenericActionServiceClient(conn)
 	req := &pb.GenericActionRequest{
@@ -533,7 +581,7 @@ func (e *Engine) executeExternalGenericAction(ctx context.Context, state *Proces
 	return nil
 }
 
-// RunReAct executes a goal-oriented workflow using the ReAct (Reason + Act) loop
+// RunReAct executes a goal-oriented workflow using the ReAct (Reason -> Act) loop
 func (e *Engine) RunReAct(ctx context.Context, state *ProcessingState, goal string, enabledTools []string) error {
 	log.Printf("INFO: [ReAct] Starting agentic loop for Job: %s with Goal: '%s'", state.JobID, goal)
 
