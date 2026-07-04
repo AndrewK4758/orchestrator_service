@@ -2,15 +2,21 @@ package engine
 
 import (
 	"context"
+	pb "doc_processor/shared_protos"
 	"testing"
 )
 
-func TestEngine_Run_NoSteps(t *testing.T) {
+func TestEngine_UnsupportedAction(t *testing.T) {
 	eng := NewEngine(nil, nil, nil)
 	state := &ProcessingState{JobID: "job_123"}
+	req := &pb.SubmitStepRequest{
+		Steps: []*pb.WorkflowStep{
+			{ActionType: "UNKNOWN_ACTION"},
+		},
+	}
 
-	err := eng.Run(context.Background(), state)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
+	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, req)
+	if err == nil {
+		t.Fatalf("Expected error for unsupported action type, got nil")
 	}
 }
