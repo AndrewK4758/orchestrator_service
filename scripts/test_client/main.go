@@ -129,12 +129,16 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	}`
 
 	_, err = client.SubmitStep(context.Background(), &pb.SubmitStepRequest{
-		JobId:              jobID,
-		ActionType:         "AI_EXTRACTION",
-		StepName:           "Classify Document",
-		CustomInstructions: "Classify this document and provide a brief summary.",
-		ExpectedSchema:     schema,
-		CallbackAddress:    "localhost:50055",
+		JobId:           jobID,
+		CallbackAddress: "localhost:50055",
+		Steps: []*pb.WorkflowStep{
+			{
+				ActionType:         "AI_EXTRACTION",
+				StepName:           "Classify Document",
+				CustomInstructions: "Classify this document and provide a brief summary.",
+				ExpectedSchema:     schema,
+			},
+		},
 	})
 	if err != nil {
 		log.Printf("Failed to submit step: %v", err)

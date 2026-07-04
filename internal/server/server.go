@@ -72,6 +72,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			JobID:           jobID,
 			RawPDFs:         req.GetPdfContents(),
 			RawTextContents: req.GetRawTextContents(),
+			GlobalState:     make(map[string]interface{}),
 			TenantID:        tenantID,
 			UserID:          req.GetUserId(),
 			AppID:           req.GetAppId(),
@@ -126,6 +127,7 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 }
 
 // handleJobMessage is invoked by the JetStream consumer for each step queued
+// handleJobMessage is invoked by the JetStream consumer for each step queued
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
 	var state engine.ProcessingState
 	if err := json.Unmarshal(msg.Data(), &state); err != nil {
@@ -138,36 +140,59 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		return nil
 	}
 
-	log.Printf("Executing step %s (%s) for job %s", req.StepName, req.ActionType, state.JobID)
+	if req.InitialStateJson != "" {
+		var initial map[string]interface{}
+		if err := json.Unmarshal([]byte(req.InitialStateJson), &initial); err == nil {
+			if state.GlobalState == nil {
+				state.GlobalState = make(map[string]interface{})
+			}
+			for k, v := range initial {
+				state.GlobalState[k] = v
+			}
+		}
+	}
 
-	resultJSON, err := s.eng.ExecuteSingleStep(ctx, &state, req)
+	log.Printf("Executing workflow of %d steps for job %s", len(req.Steps), state.JobID)
+
+	resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, &state, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
 			log.Printf("INFO: Job %s paused for human validation", state.JobID)
-			// Don't fire callback yet. The HumanValidation service will call ResumeJob later.
 			return nil
 		}
-		log.Printf("ERROR: Step execution failed: %v", err)
-		s.fireCallback(&state, req, "", err.Error())
+		log.Printf("ERROR: Workflow execution failed: %v", err)
+		s.fireCallback(&state, req, "", err.Error(), lastStepId, lastActionType, lastStepName)
 		return nil
 	}
 
-	log.Printf("Step completed successfully. Firing callback to %s", req.CallbackAddress)
-	s.fireCallback(&state, req, resultJSON, "")
+	log.Printf("Workflow completed successfully for job %s. Firing callback to %s", state.JobID, req.CallbackAddress)
+	s.fireCallback(&state, req, resultJSON, "", lastStepId, lastActionType, lastStepName)
 
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(state *engine.ProcessingState, req *pb.SubmitStepRequest, resultJSON string, errMsg string) {
+func (s *OrchestratorServer) fireCallback(state *engine.ProcessingState, req *pb.SubmitStepRequest, resultJSON string, errMsg string, lastStepId string, lastActionType string, lastStepName string) {
 	if req.CallbackAddress == "" {
-		log.Printf("No callback address provided for step %s", req.StepName)
+		log.Printf("No callback address provided, skipping callback")
+		if req.CompleteJob {
+			s.mu.Lock()
+			delete(s.activeJobs, state.JobID)
+			s.mu.Unlock()
+			log.Printf("INFO: Job %s complete. Teared down cache.", state.JobID)
+		}
 		return
 	}
 
 	conn, err := grpc.NewClient(req.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("ERROR: Failed to dial callback address %s: %v", req.CallbackAddress, err)
+		if req.CompleteJob {
+			s.mu.Lock()
+			delete(s.activeJobs, state.JobID)
+			s.mu.Unlock()
+			log.Printf("INFO: Job %s complete. Teared down cache.", state.JobID)
+		}
 		return
 	}
 	defer conn.Close()
@@ -179,14 +204,22 @@ func (s *OrchestratorServer) fireCallback(state *engine.ProcessingState, req *pb
 
 	_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
 		JobId:        state.JobID,
-		StepId:       state.CurrentStepID,
-		ActionType:   req.ActionType,
+		StepId:       lastStepId,
+		ActionType:   lastActionType,
 		ResultJson:   resultJSON,
 		ErrorMessage: errMsg,
+		StepName:     lastStepName,
 	})
 
 	if err != nil {
 		log.Printf("ERROR: Callback failed: %v", err)
+	}
+
+	if req.CompleteJob {
+		s.mu.Lock()
+		delete(s.activeJobs, state.JobID)
+		s.mu.Unlock()
+		log.Printf("INFO: Job %s complete. Teared down cache.", state.JobID)
 	}
 }
 
@@ -208,7 +241,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	// Since the human corrected the JSON, we consider the step complete
 	// and fire the callback to the client with the corrected JSON.
-	s.fireCallback(tracker.State, stepReq, req.GetCorrectedJson(), "")
+	s.fireCallback(tracker.State, stepReq, req.GetCorrectedJson(), "", "", "HUMAN_VALIDATION", "")
 
 	return &pb.ResumeJobResponse{
 		Success: true,

@@ -24,9 +24,10 @@ var ErrPendingHumanValidation = errors.New("pending human validation")
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
-	JobID           string   `json:"job_id"`
-	RawPDFs         [][]byte `json:"pdf_contents"`
-	RawTextContents []string `json:"raw_text_contents"`
+	JobID           string                 `json:"job_id"`
+	RawPDFs         [][]byte               `json:"pdf_contents"`
+	RawTextContents []string               `json:"raw_text_contents"`
+	GlobalState     map[string]interface{} `json:"global_state"`
 
 	// Compliance & Traceability Metadata
 	TenantID      string `json:"tenant_id"`
@@ -68,23 +69,46 @@ func NewEngine(aiClient *ai_client.Client, pub TracePublisher, cbManager *callba
 	}
 }
 
-func (e *Engine) ExecuteSingleStep(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, error) {
-	if req.ActionType == "AI_EXTRACTION" {
-		return e.executeAIExtraction(ctx, state, req)
-	} else if req.ActionType == "HUMAN_VALIDATION" {
-		// Used when the client explicitly routes a failed step back for human review
-		taskID, err := e.triggerHumanValidation(ctx, state, req, req.ContextInput, "Client triggered manual validation")
-		if err != nil {
-			return "", fmt.Errorf("failed to create human validation task: %w", err)
+func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, string, string, string, error) {
+	var lastActionType string
+	var lastStepName string
+	lastStepId := state.CurrentStepID
+
+	for _, step := range req.Steps {
+		lastActionType = step.ActionType
+		lastStepName = step.StepName
+
+		if step.ActionType == "AI_EXTRACTION" {
+			resJson, err := e.executeAIExtraction(ctx, state, step)
+			if err != nil {
+				return "", lastActionType, lastStepName, lastStepId, err
+			}
+
+			if step.WritesToStateKey != "" {
+				var parsed interface{}
+				if err := json.Unmarshal([]byte(resJson), &parsed); err == nil {
+					state.GlobalState[step.WritesToStateKey] = parsed
+				}
+			}
+
+		} else if step.ActionType == "HUMAN_VALIDATION" {
+			taskID, err := e.triggerHumanValidation(ctx, state, step, step.ContextInput, "Client triggered manual validation")
+			if err != nil {
+				return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("failed to create human validation task: %w", err)
+			}
+			log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
+			return "", lastActionType, lastStepName, lastStepId, ErrPendingHumanValidation
+		} else {
+			return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("unsupported action type: %s", step.ActionType)
 		}
-		log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
-		return "", ErrPendingHumanValidation
 	}
 
-	return "", fmt.Errorf("unsupported action type: %s", req.ActionType)
+	// Final state json
+	finalJSON, _ := json.Marshal(state.GlobalState)
+	return string(finalJSON), lastActionType, lastStepName, lastStepId, nil
 }
 
-func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, error) {
+func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep) (string, error) {
 	prompt := req.CustomInstructions
 	schema := req.ExpectedSchema
 
@@ -94,6 +118,14 @@ func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState
 
 	if req.ContextInput != "" {
 		prompt = fmt.Sprintf("%s\n\n[CONTEXT PROVIDED BY CLIENT]:\n%s\n", prompt, req.ContextInput)
+	}
+
+	if req.ReadsFromStateKey != "" {
+		val, ok := state.GlobalState[req.ReadsFromStateKey]
+		if ok {
+			stateBytes, _ := json.MarshalIndent(val, "", "  ")
+			prompt = fmt.Sprintf("%s\n\n[CURRENT GLOBAL STATE]:\n%s\n", prompt, string(stateBytes))
+		}
 	}
 
 	totalDocs := len(state.RawPDFs) + len(state.RawTextContents)
@@ -115,14 +147,14 @@ func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState
 			wg.Add(1)
 			go func(index int, data []byte) {
 				defer wg.Done()
-				e.publishChunkTrace(ctx, state, req, events.EventChunkStarted, fmt.Sprintf("Starting PDF chunk %d (Attempt %d)", index, attempt), index, totalDocs, "")
+				e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
 				resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
 				if err != nil {
-					e.publishChunkTrace(ctx, state, req, events.EventChunkFailed, fmt.Sprintf("Failed PDF chunk %d", index), index, totalDocs, err.Error())
+					e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
 					errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
 					return
 				}
-				e.publishChunkTrace(ctx, state, req, events.EventChunkCompleted, fmt.Sprintf("Completed PDF chunk %d", index), index, totalDocs, "")
+				e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetExtractedJson(), "")
 
 				resultMu.Lock()
 				stepResults[index] = resp.GetExtractedJson()
@@ -135,14 +167,14 @@ func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState
 			wg.Add(1)
 			go func(index int, text string) {
 				defer wg.Done()
-				e.publishChunkTrace(ctx, state, req, events.EventChunkStarted, fmt.Sprintf("Starting Text chunk %d (Attempt %d)", index, attempt), index, totalDocs, "")
+				e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
 				resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
 				if err != nil {
-					e.publishChunkTrace(ctx, state, req, events.EventChunkFailed, fmt.Sprintf("Failed Text chunk %d", index), index, totalDocs, err.Error())
+					e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
 					errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
 					return
 				}
-				e.publishChunkTrace(ctx, state, req, events.EventChunkCompleted, fmt.Sprintf("Completed Text chunk %d", index), index, totalDocs, "")
+				e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetExtractedJson(), "")
 
 				resultMu.Lock()
 				stepResults[index] = resp.GetExtractedJson()
@@ -271,7 +303,7 @@ func (e *Engine) validateAIOutput(jsonStr string, schema string) error {
 	return nil
 }
 
-func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest, failedOutput string, errMsg string) (string, error) {
+func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep, failedOutput string, errMsg string) (string, error) {
 	addr := os.Getenv("HUMAN_VALIDATION_SERVICE_ADDRESS")
 	if addr == "" {
 		addr = "localhost:50054"
@@ -305,11 +337,20 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingSt
 	return resp.GetTaskId(), nil
 }
 
-func (e *Engine) publishChunkTrace(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest, eventType events.EventType, message string, chunkIndex int, totalChunks int, errorMsg string) {
+func (e *Engine) publishChunkTrace(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep, chunkIndex int, chunkText string, status string, extractedJson string, valErr string) {
 	if e.pub != nil {
+		var evType events.EventType
+		if status == "STARTED" {
+			evType = events.EventChunkStarted
+		} else if status == "FAILED" {
+			evType = events.EventChunkFailed
+		} else {
+			evType = events.EventChunkCompleted
+		}
+
 		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-			EventType:     eventType,
+			EventType:     evType,
 			Timestamp:     time.Now(),
 			TenantID:      state.TenantID,
 			UserID:        state.UserID,
@@ -319,10 +360,9 @@ func (e *Engine) publishChunkTrace(ctx context.Context, state *ProcessingState, 
 			CorrelationID: state.CorrelationID,
 			JobAction:     req.StepName,
 			Stage:         "ChunkProcessing",
-			Message:       message,
-			Error:         errorMsg,
+			Message:       status,
+			Error:         valErr,
 			ChunkIndex:    chunkIndex + 1,
-			TotalChunks:   totalChunks,
 			ChunkID:       fmt.Sprintf("chunk_%d", chunkIndex+1),
 		})
 	}

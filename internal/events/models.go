@@ -14,9 +14,9 @@ const (
 	EventChunkCompleted EventType = "chunk.completed"
 	EventChunkFailed    EventType = "chunk.failed"
 
-	EventJobStepStarted   EventType = "step.started"
-	EventJobStepCompleted EventType = "step.completed"
-	EventJobStepFailed    EventType = "step.failed"
+	EventJobStepStarted      EventType = "step.started"
+	EventJobStepCompleted    EventType = "step.completed"
+	EventJobStepFailed       EventType = "step.failed"
 	EventJobStepPendingHuman EventType = "step.pending_human"
 )
 
