@@ -16,12 +16,13 @@ import (
 	"orchestrator_service/internal/events"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-// JobTracker holds the state and update channel for a single job
+// JobTracker holds the state for a single job
 type JobTracker struct {
-	State   *engine.ProcessingState
-	Updates chan *pb.ProgressUpdate
+	State *engine.ProcessingState
 }
 
 // OrchestratorServer implements the OrchestratorService gRPC interface.
@@ -37,9 +38,7 @@ type OrchestratorServer struct {
 	activeJobs map[string]*JobTracker
 }
 
-// NewServer creates a new instance of the OrchestratorServer.
 func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *callback_client.ClientManager) *OrchestratorServer {
-	// 1. Initialize the State Machine Engine with Publisher
 	eng := engine.NewEngine(aiClient, pub, cbManager)
 
 	srv := &OrchestratorServer{
@@ -50,7 +49,6 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *cal
 		activeJobs: make(map[string]*JobTracker),
 	}
 
-	// Start consuming incoming jobs from NATS JetStream
 	err := srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
 	if err != nil {
 		log.Printf("ERROR: Failed to start job consumer: %v", err)
@@ -59,8 +57,6 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *cal
 	return srv
 }
 
-// SubmitDocument handles the initial client request to process a PDF.
-// It returns a job_id instantly while starting the async workflow.
 func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitDocumentRequest) (*pb.SubmitDocumentResponse, error) {
 	jobID := "job_" + fmt.Sprintf("%d", time.Now().UnixNano())
 	fileCount := len(req.GetPdfContents()) + len(req.GetRawTextContents())
@@ -70,288 +66,149 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	if tenantID == "" {
 		tenantID = "SYSTEM_DEFAULT_TENANT"
 	}
-	userID := req.GetUserId()
-	if userID == "" {
-		userID = "SYSTEM_USER"
-	}
-	appID := req.GetAppId()
-	if appID == "" {
-		appID = "DocProcessorSystem"
-	}
-	correlationID := req.GetCorrelationId()
-	if correlationID == "" {
-		correlationID = jobID // Default to job ID to group it by itself
-	}
-
-	var steps []engine.WorkflowStep
-	for _, s := range req.GetSteps() {
-		steps = append(steps, engine.WorkflowStep{
-			StepName:            s.StepName,
-			CustomInstructions:  s.CustomInstructions,
-			Schema:              s.ExpectedSchema,
-			CallbackAddress:     s.CallbackAddress,
-			RequireHumanReview:  s.RequireHumanReview,
-			BypassHumanFallback: s.BypassHumanFallback,
-			TargetActionAddress: s.TargetActionAddress,
-			WritesToStateKey:    s.WritesToStateKey,
-			ReadsFromStateKey:   s.ReadsFromStateKey,
-		})
-	}
-
-	var globalState map[string]interface{}
-	if req.GetInitialStateJson() != "" {
-		_ = json.Unmarshal([]byte(req.GetInitialStateJson()), &globalState)
-	}
 
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
 			JobID:           jobID,
 			RawPDFs:         req.GetPdfContents(),
 			RawTextContents: req.GetRawTextContents(),
-			Steps:           steps,
-			OverarchingGoal: req.GetOverarchingGoal(),
-			EnabledTools:    req.GetEnabledTools(),
 			TenantID:        tenantID,
-			UserID:          userID,
-			AppID:           appID,
+			UserID:          req.GetUserId(),
+			AppID:           req.GetAppId(),
 			DocumentType:    req.GetDocumentType(),
-			CorrelationID:   correlationID,
-			GlobalState:     globalState,
+			CorrelationID:   req.GetCorrelationId(),
 		},
-		Updates: make(chan *pb.ProgressUpdate, 100), // Buffer so we don't block the engine
 	}
 
-	// Publish Job Started Trace Event
-	err := s.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType:     events.EventJobStarted,
-		Timestamp:     time.Now(),
-		TenantID:      tracker.State.TenantID,
-		UserID:        tracker.State.UserID,
-		AppID:         tracker.State.AppID,
-		JobID:         jobID,
-		DocumentType:  tracker.State.DocumentType,
-		CorrelationID: tracker.State.CorrelationID,
-		JobAction:     "DynamicWorkflow",
-		Stage:         "JobIntake",
-		Message:       fmt.Sprintf("Received %d documents for processing", fileCount),
-	})
-	if err != nil {
-		log.Printf("ERROR: Failed to publish trace event: %v", err)
-	}
-	state := tracker.State
+	s.mu.Lock()
+	s.activeJobs[jobID] = tracker
+	s.mu.Unlock()
 
-	// Serialize state and publish to JetStream
-	payload, err := json.Marshal(state)
+	return &pb.SubmitDocumentResponse{
+		JobId:  jobID,
+		Status: "CACHED",
+	}, nil
+}
+
+func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepRequest) (*pb.SubmitStepResponse, error) {
+	jobID := req.GetJobId()
+	s.mu.RLock()
+	tracker, exists := s.activeJobs[jobID]
+	s.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("job %s not found in cache", jobID)
+	}
+
+	stepID := "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// Create a Job Payload to queue for processing
+	tracker.State.Lock()
+	tracker.State.CurrentStepReq = req // We store the current step request in the state
+	tracker.State.CurrentStepID = stepID
+	tracker.State.Unlock()
+
+	payload, err := json.Marshal(tracker.State)
 	if err != nil {
-		log.Printf("ERROR: Failed to marshal job state: %v", err)
-		return nil, fmt.Errorf("failed to process job request")
+		return nil, fmt.Errorf("failed to serialize state")
 	}
 
 	err = s.pub.PublishJob(ctx, payload)
 	if err != nil {
-		log.Printf("ERROR: Failed to publish job to queue: %v", err)
-		return nil, fmt.Errorf("failed to queue job")
+		return nil, fmt.Errorf("failed to queue step")
 	}
 
-	return &pb.SubmitDocumentResponse{
-		JobId:  jobID,
-		Status: "QUEUED",
+	return &pb.SubmitStepResponse{
+		Success: true,
+		Message: "Step queued for execution",
+		StepId:  stepID,
 	}, nil
 }
 
-// handleJobMessage is invoked by the JetStream consumer for each new job
+// handleJobMessage is invoked by the JetStream consumer for each step queued
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
 	var state engine.ProcessingState
 	if err := json.Unmarshal(msg.Data(), &state); err != nil {
 		return fmt.Errorf("failed to unmarshal job state: %w", err)
 	}
 
-	tracker := &JobTracker{
-		State:   &state,
-		Updates: make(chan *pb.ProgressUpdate, 100),
+	req := state.CurrentStepReq
+	if req == nil {
+		log.Printf("ERROR: Job state contains no step request")
+		return nil
 	}
 
-	s.mu.Lock()
-	s.activeJobs[state.JobID] = tracker
-	s.mu.Unlock()
+	log.Printf("Executing step %s (%s) for job %s", req.StepName, req.ActionType, state.JobID)
 
-	s.runWorkflowSync(tracker)
+	resultJSON, err := s.eng.ExecuteSingleStep(ctx, &state, req)
+
+	if err != nil {
+		if errors.Is(err, engine.ErrPendingHumanValidation) {
+			log.Printf("INFO: Job %s paused for human validation", state.JobID)
+			// Don't fire callback yet. The HumanValidation service will call ResumeJob later.
+			return nil
+		}
+		log.Printf("ERROR: Step execution failed: %v", err)
+		s.fireCallback(&state, req, "", err.Error())
+		return nil
+	}
+
+	log.Printf("Step completed successfully. Firing callback to %s", req.CallbackAddress)
+	s.fireCallback(&state, req, resultJSON, "")
 
 	return nil
 }
 
-// runWorkflowSync executes the orchestrator workflow for a specific job inline.
-func (s *OrchestratorServer) runWorkflowSync(tracker *JobTracker) {
-	defer close(tracker.Updates)
-
-	// Helper to push progress to the gRPC stream channel
-	sendProgress := func(status, msg string) {
-		tracker.Updates <- &pb.ProgressUpdate{
-			JobId:   tracker.State.JobID,
-			Status:  status,
-			Message: msg,
-		}
-	}
-
-	sendProgress("STARTING", "Initializing workflow")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel() // A real app might have a global cancellation context here
-
-	// Run the engine with the dynamically provided steps
-	err := s.eng.Run(ctx, tracker.State)
-	if err != nil {
-		if errors.Is(err, engine.ErrPendingHumanValidation) {
-			log.Printf("INFO: Job %s paused for human validation: %v", tracker.State.JobID, err)
-			sendProgress("PENDING_HUMAN_VALIDATION", "AI output did not fit requirements; pending human review.")
-			return
-		}
-		log.Printf("ERROR: Job %s failed: %v", tracker.State.JobID, err)
-		sendProgress("FAILED", fmt.Sprintf("Workflow failed: %v", err))
+func (s *OrchestratorServer) fireCallback(state *engine.ProcessingState, req *pb.SubmitStepRequest, resultJSON string, errMsg string) {
+	if req.CallbackAddress == "" {
+		log.Printf("No callback address provided for step %s", req.StepName)
 		return
 	}
 
-	// At this point, state.PreviousStepResult contains the output of the final step
-	finalJSON := tracker.State.PreviousStepResult
-	if tracker.State.GlobalState != nil {
-		b, _ := json.Marshal(tracker.State.GlobalState)
-		finalJSON = string(b)
-	} else if finalJSON == "" {
-		finalJSON = "{}"
+	conn, err := grpc.NewClient(req.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("ERROR: Failed to dial callback address %s: %v", req.CallbackAddress, err)
+		return
 	}
+	defer conn.Close()
 
-	log.Printf("DEBUG: FinalResultsJson being sent to client: %s", finalJSON)
+	client := pb.NewStepCallbackServiceClient(conn)
 
-	tracker.Updates <- &pb.ProgressUpdate{
-		JobId:            tracker.State.JobID,
-		Status:           "COMPLETE",
-		Message:          "Workflow finished successfully",
-		FinalResultsJson: finalJSON,
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
+		JobId:        state.JobID,
+		StepId:       state.CurrentStepID,
+		ActionType:   req.ActionType,
+		ResultJson:   resultJSON,
+		ErrorMessage: errMsg,
+	})
+
+	if err != nil {
+		log.Printf("ERROR: Callback failed: %v", err)
 	}
 }
 
-// ListenForProgress streams real-time updates back to the client via gRPC Server Streaming.
-func (s *OrchestratorServer) ListenForProgress(req *pb.ListenRequest, stream pb.OrchestratorService_ListenForProgressServer) error {
-	jobID := req.GetJobId()
-	log.Printf("Client listening for progress on job: %s", jobID)
-
-	var tracker *JobTracker
-	var exists bool
-
-	// Wait up to 30 seconds for the JetStream consumer to pick up the job and populate activeJobs
-	for i := 0; i < 30; i++ {
-		s.mu.RLock()
-		tracker, exists = s.activeJobs[jobID]
-		s.mu.RUnlock()
-
-		if exists {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-
-	if !exists {
-		return fmt.Errorf("job %s not found or already expired after waiting", jobID)
-	}
-
-	// Read from the Go channel and push over the gRPC network stream
-	for update := range tracker.Updates {
-		if err := stream.Send(update); err != nil {
-			log.Printf("ERROR: Stream broken to client for job %s: %v", jobID, err)
-			return err
-		}
-	}
-
-	// Clean up completed job to prevent memory leak
-	s.mu.Lock()
-	delete(s.activeJobs, jobID)
-	s.mu.Unlock()
-
-	return nil
-}
-
-// ResumeJob handles the gRPC request from HumanValidationService to resume a suspended job.
 func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
 	jobID := req.GetJobId()
-	correctedJSON := req.GetCorrectedJson()
-	log.Printf("INFO: [Server.ResumeJob] Resuming JobID: %s with human-corrected JSON", jobID)
-
 	s.mu.RLock()
 	tracker, exists := s.activeJobs[jobID]
 	s.mu.RUnlock()
 
-	var state *engine.ProcessingState
-
-	if exists && tracker != nil {
-		state = tracker.State
-	} else {
-		// If tracker is not found in memory (e.g. server restart), we cannot resume directly
-		// in this prototype. However, we log and return failure clearly.
-		return &pb.ResumeJobResponse{
-			Success: false,
-			Message: fmt.Sprintf("Job %s not found in orchestrator memory", jobID),
-		}, nil
+	if !exists {
+		return &pb.ResumeJobResponse{Success: false, Message: "Job not found"}, nil
 	}
 
-	// Update the processing state with the human-corrected JSON
-	state.Lock()
-	var stepName string
-	if state.OverarchingGoal != "" {
-		// Goal-oriented ReAct Agent mode: append human correction to history
-		state.PreviousStepResult += fmt.Sprintf("Observation: Manual human correction submitted: %s\n", correctedJSON)
-		stepName = "AgenticHumanReviewResolved"
-	} else {
-		// Traditional Step-based mode
-		if state.StepResults == nil {
-			state.StepResults = make(map[int]string)
-		}
-		state.StepResults[state.CurrentStepIndex] = correctedJSON
-		state.PreviousStepResult = correctedJSON
+	tracker.State.Lock()
+	stepReq := tracker.State.CurrentStepReq
+	tracker.State.Unlock()
 
-		// Mark current step as completed in executed list
-		stepName = state.Steps[state.CurrentStepIndex].StepName
-		if stepName == "" {
-			stepName = fmt.Sprintf("Step-%d", state.CurrentStepIndex+1)
-		}
-		state.ExecutedSteps = append(state.ExecutedSteps, stepName)
+	log.Printf("INFO: Resuming job %s after human correction", jobID)
 
-		// Increment CurrentStepIndex so the engine resumes at the next step!
-		state.CurrentStepIndex++
-	}
-	state.Unlock()
-
-	// Serialize state and publish back to NATS JetStream to trigger execution resume
-	payload, err := json.Marshal(state)
-	if err != nil {
-		log.Printf("ERROR: [Server.ResumeJob] Failed to marshal updated job state: %v", err)
-		return nil, fmt.Errorf("failed to serialize job state for resumption")
-	}
-
-	err = s.pub.PublishJob(ctx, payload)
-	if err != nil {
-		log.Printf("ERROR: [Server.ResumeJob] Failed to publish job to queue: %v", err)
-		return nil, fmt.Errorf("failed to queue job resumption")
-	}
-
-	// Publish dynamic trace event for traceability
-	err = s.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType:     events.EventJobStepCompleted,
-		Timestamp:     time.Now(),
-		TenantID:      state.TenantID,
-		UserID:        state.UserID,
-		AppID:         state.AppID,
-		JobID:         jobID,
-		DocumentType:  state.DocumentType,
-		CorrelationID: state.CorrelationID,
-		JobAction:     stepName,
-		Stage:         "HumanValidationResolved",
-		Message:       fmt.Sprintf("Step completed via human correction: %s", stepName),
-	})
-	if err != nil {
-		log.Printf("ERROR: [Server.ResumeJob] Failed to publish trace event: %v", err)
-	}
+	// Since the human corrected the JSON, we consider the step complete
+	// and fire the callback to the client with the corrected JSON.
+	s.fireCallback(tracker.State, stepReq, req.GetCorrectedJson(), "")
 
 	return &pb.ResumeJobResponse{
 		Success: true,
