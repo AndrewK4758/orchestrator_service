@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pb "doc_processor/shared_protos"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -42,7 +43,7 @@ func (m *ClientManager) getConn(addr string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial callback server at %s: %v", addr, err)
 	}

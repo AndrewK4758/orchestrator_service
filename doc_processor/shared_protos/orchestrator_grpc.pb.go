@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	OrchestratorService_SubmitDocument_FullMethodName    = "/document.orchestrator.v1.OrchestratorService/SubmitDocument"
+	OrchestratorService_SubmitStep_FullMethodName        = "/document.orchestrator.v1.OrchestratorService/SubmitStep"
 	OrchestratorService_ListenForProgress_FullMethodName = "/document.orchestrator.v1.OrchestratorService/ListenForProgress"
 	OrchestratorService_ResumeJob_FullMethodName         = "/document.orchestrator.v1.OrchestratorService/ResumeJob"
 )
@@ -28,8 +29,10 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type OrchestratorServiceClient interface {
-	// Client submits a large PDF and immediately receives a JobID
+	// Client submits a large PDF and immediately receives a JobID. Heavy payload is cached.
 	SubmitDocument(ctx context.Context, in *SubmitDocumentRequest, opts ...grpc.CallOption) (*SubmitDocumentResponse, error)
+	// Client submits a single, generic step to be executed for a specific JobID.
+	SubmitStep(ctx context.Context, in *SubmitStepRequest, opts ...grpc.CallOption) (*SubmitStepResponse, error)
 	// Client listens to this Server Stream to get real-time progress of their JobID
 	ListenForProgress(ctx context.Context, in *ListenRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ProgressUpdate], error)
 	// Resume a job after human validation has corrected the AI output
@@ -48,6 +51,16 @@ func (c *orchestratorServiceClient) SubmitDocument(ctx context.Context, in *Subm
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SubmitDocumentResponse)
 	err := c.cc.Invoke(ctx, OrchestratorService_SubmitDocument_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orchestratorServiceClient) SubmitStep(ctx context.Context, in *SubmitStepRequest, opts ...grpc.CallOption) (*SubmitStepResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubmitStepResponse)
+	err := c.cc.Invoke(ctx, OrchestratorService_SubmitStep_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -87,8 +100,10 @@ func (c *orchestratorServiceClient) ResumeJob(ctx context.Context, in *ResumeJob
 // All implementations must embed UnimplementedOrchestratorServiceServer
 // for forward compatibility.
 type OrchestratorServiceServer interface {
-	// Client submits a large PDF and immediately receives a JobID
+	// Client submits a large PDF and immediately receives a JobID. Heavy payload is cached.
 	SubmitDocument(context.Context, *SubmitDocumentRequest) (*SubmitDocumentResponse, error)
+	// Client submits a single, generic step to be executed for a specific JobID.
+	SubmitStep(context.Context, *SubmitStepRequest) (*SubmitStepResponse, error)
 	// Client listens to this Server Stream to get real-time progress of their JobID
 	ListenForProgress(*ListenRequest, grpc.ServerStreamingServer[ProgressUpdate]) error
 	// Resume a job after human validation has corrected the AI output
@@ -105,6 +120,9 @@ type UnimplementedOrchestratorServiceServer struct{}
 
 func (UnimplementedOrchestratorServiceServer) SubmitDocument(context.Context, *SubmitDocumentRequest) (*SubmitDocumentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitDocument not implemented")
+}
+func (UnimplementedOrchestratorServiceServer) SubmitStep(context.Context, *SubmitStepRequest) (*SubmitStepResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitStep not implemented")
 }
 func (UnimplementedOrchestratorServiceServer) ListenForProgress(*ListenRequest, grpc.ServerStreamingServer[ProgressUpdate]) error {
 	return status.Error(codes.Unimplemented, "method ListenForProgress not implemented")
@@ -151,6 +169,24 @@ func _OrchestratorService_SubmitDocument_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OrchestratorService_SubmitStep_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrchestratorServiceServer).SubmitStep(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrchestratorService_SubmitStep_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrchestratorServiceServer).SubmitStep(ctx, req.(*SubmitStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OrchestratorService_ListenForProgress_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(ListenRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -192,6 +228,10 @@ var OrchestratorService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OrchestratorService_SubmitDocument_Handler,
 		},
 		{
+			MethodName: "SubmitStep",
+			Handler:    _OrchestratorService_SubmitStep_Handler,
+		},
+		{
 			MethodName: "ResumeJob",
 			Handler:    _OrchestratorService_ResumeJob_Handler,
 		},
@@ -207,107 +247,107 @@ var OrchestratorService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	GenericActionService_ExecuteAction_FullMethodName = "/document.orchestrator.v1.GenericActionService/ExecuteAction"
+	StepCallbackService_OnStepComplete_FullMethodName = "/document.orchestrator.v1.StepCallbackService/OnStepComplete"
 )
 
-// GenericActionServiceClient is the client API for GenericActionService service.
+// StepCallbackServiceClient is the client API for StepCallbackService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // A completely generic gRPC service that any external application can implement
-// to execute deterministic end-actions on validated JSON payloads.
-type GenericActionServiceClient interface {
-	ExecuteAction(ctx context.Context, in *GenericActionRequest, opts ...grpc.CallOption) (*GenericActionResponse, error)
+// to receive the lightweight callback containing the step result.
+type StepCallbackServiceClient interface {
+	OnStepComplete(ctx context.Context, in *StepCompleteRequest, opts ...grpc.CallOption) (*StepCompleteResponse, error)
 }
 
-type genericActionServiceClient struct {
+type stepCallbackServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewGenericActionServiceClient(cc grpc.ClientConnInterface) GenericActionServiceClient {
-	return &genericActionServiceClient{cc}
+func NewStepCallbackServiceClient(cc grpc.ClientConnInterface) StepCallbackServiceClient {
+	return &stepCallbackServiceClient{cc}
 }
 
-func (c *genericActionServiceClient) ExecuteAction(ctx context.Context, in *GenericActionRequest, opts ...grpc.CallOption) (*GenericActionResponse, error) {
+func (c *stepCallbackServiceClient) OnStepComplete(ctx context.Context, in *StepCompleteRequest, opts ...grpc.CallOption) (*StepCompleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GenericActionResponse)
-	err := c.cc.Invoke(ctx, GenericActionService_ExecuteAction_FullMethodName, in, out, cOpts...)
+	out := new(StepCompleteResponse)
+	err := c.cc.Invoke(ctx, StepCallbackService_OnStepComplete_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// GenericActionServiceServer is the server API for GenericActionService service.
-// All implementations must embed UnimplementedGenericActionServiceServer
+// StepCallbackServiceServer is the server API for StepCallbackService service.
+// All implementations must embed UnimplementedStepCallbackServiceServer
 // for forward compatibility.
 //
 // A completely generic gRPC service that any external application can implement
-// to execute deterministic end-actions on validated JSON payloads.
-type GenericActionServiceServer interface {
-	ExecuteAction(context.Context, *GenericActionRequest) (*GenericActionResponse, error)
-	mustEmbedUnimplementedGenericActionServiceServer()
+// to receive the lightweight callback containing the step result.
+type StepCallbackServiceServer interface {
+	OnStepComplete(context.Context, *StepCompleteRequest) (*StepCompleteResponse, error)
+	mustEmbedUnimplementedStepCallbackServiceServer()
 }
 
-// UnimplementedGenericActionServiceServer must be embedded to have
+// UnimplementedStepCallbackServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedGenericActionServiceServer struct{}
+type UnimplementedStepCallbackServiceServer struct{}
 
-func (UnimplementedGenericActionServiceServer) ExecuteAction(context.Context, *GenericActionRequest) (*GenericActionResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExecuteAction not implemented")
+func (UnimplementedStepCallbackServiceServer) OnStepComplete(context.Context, *StepCompleteRequest) (*StepCompleteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method OnStepComplete not implemented")
 }
-func (UnimplementedGenericActionServiceServer) mustEmbedUnimplementedGenericActionServiceServer() {}
-func (UnimplementedGenericActionServiceServer) testEmbeddedByValue()                              {}
+func (UnimplementedStepCallbackServiceServer) mustEmbedUnimplementedStepCallbackServiceServer() {}
+func (UnimplementedStepCallbackServiceServer) testEmbeddedByValue()                             {}
 
-// UnsafeGenericActionServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to GenericActionServiceServer will
+// UnsafeStepCallbackServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to StepCallbackServiceServer will
 // result in compilation errors.
-type UnsafeGenericActionServiceServer interface {
-	mustEmbedUnimplementedGenericActionServiceServer()
+type UnsafeStepCallbackServiceServer interface {
+	mustEmbedUnimplementedStepCallbackServiceServer()
 }
 
-func RegisterGenericActionServiceServer(s grpc.ServiceRegistrar, srv GenericActionServiceServer) {
-	// If the following call panics, it indicates UnimplementedGenericActionServiceServer was
+func RegisterStepCallbackServiceServer(s grpc.ServiceRegistrar, srv StepCallbackServiceServer) {
+	// If the following call panics, it indicates UnimplementedStepCallbackServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&GenericActionService_ServiceDesc, srv)
+	s.RegisterService(&StepCallbackService_ServiceDesc, srv)
 }
 
-func _GenericActionService_ExecuteAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GenericActionRequest)
+func _StepCallbackService_OnStepComplete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StepCompleteRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(GenericActionServiceServer).ExecuteAction(ctx, in)
+		return srv.(StepCallbackServiceServer).OnStepComplete(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: GenericActionService_ExecuteAction_FullMethodName,
+		FullMethod: StepCallbackService_OnStepComplete_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(GenericActionServiceServer).ExecuteAction(ctx, req.(*GenericActionRequest))
+		return srv.(StepCallbackServiceServer).OnStepComplete(ctx, req.(*StepCompleteRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// GenericActionService_ServiceDesc is the grpc.ServiceDesc for GenericActionService service.
+// StepCallbackService_ServiceDesc is the grpc.ServiceDesc for StepCallbackService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var GenericActionService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "document.orchestrator.v1.GenericActionService",
-	HandlerType: (*GenericActionServiceServer)(nil),
+var StepCallbackService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "document.orchestrator.v1.StepCallbackService",
+	HandlerType: (*StepCallbackServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "ExecuteAction",
-			Handler:    _GenericActionService_ExecuteAction_Handler,
+			MethodName: "OnStepComplete",
+			Handler:    _StepCallbackService_OnStepComplete_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

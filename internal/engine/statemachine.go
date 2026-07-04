@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +20,35 @@ import (
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
+
+const PlannerSchema = `{
+  "type": "object",
+  "properties": {
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP"] },
+          "prompt": { "type": "string" },
+          "schema": { "type": "string" }
+        },
+        "required": ["action_type", "prompt", "schema"]
+      }
+    }
+  },
+  "required": ["actions"]
+}`
+
+type ActionItem struct {
+	ActionType string `json:"action_type"`
+	Prompt     string `json:"prompt"`
+	Schema     string `json:"schema"`
+}
+
+type ActionPlan struct {
+	Actions []ActionItem `json:"actions"`
+}
 
 // ProcessingState represents the global state of a single PDF job as it moves through the pipeline.
 type ProcessingState struct {
@@ -37,8 +65,11 @@ type ProcessingState struct {
 	CorrelationID string `json:"correlation_id"`
 
 	// Current step execution tracking
-	CurrentStepReq *pb.SubmitStepRequest `json:"current_step_req"`
-	CurrentStepID  string                `json:"current_step_id"`
+	CurrentStepReq     *pb.SubmitStepRequest `json:"current_step_req"`
+	CurrentStepID      string                `json:"current_step_id"`
+	CurrentStepIndex   int                   `json:"current_step_index"`
+	PendingActions     []ActionItem          `json:"pending_actions"`
+	CurrentActionIndex int                   `json:"current_action_index"`
 
 	mu sync.Mutex
 }
@@ -51,67 +82,256 @@ func (ps *ProcessingState) Unlock() {
 	ps.mu.Unlock()
 }
 
+// SyncMetadata updates the state's compliance metadata fields from the GlobalState if they exist.
+func (ps *ProcessingState) SyncMetadata() {
+	if ps.GlobalState == nil {
+		return
+	}
+
+	// Helper to extract nested or flat string values
+	getString := func(key string) (string, bool) {
+		val, exists := ps.GlobalState[key]
+		if !exists {
+			return "", false
+		}
+		if s, ok := val.(string); ok {
+			return s, true
+		}
+		// If it's a map (e.g. classification JSON is parsed as a nested object)
+		if m, ok := val.(map[string]interface{}); ok {
+			for _, k := range []string{"classification", "Classification", "document_type", "DocumentType", "type", "Type"} {
+				if v, ok := m[k]; ok {
+					if s, ok := v.(string); ok {
+						return s, true
+					}
+				}
+			}
+		}
+		return "", false
+	}
+
+	if s, ok := getString("document_type"); ok {
+		ps.DocumentType = s
+	} else if s, ok := getString("DocumentType"); ok {
+		ps.DocumentType = s
+	} else if s, ok := getString("ClassificationInfo"); ok {
+		ps.DocumentType = s
+	} else if s, ok := getString("classification_info"); ok {
+		ps.DocumentType = s
+	}
+
+	if s, ok := getString("tenant_id"); ok {
+		ps.TenantID = s
+	} else if s, ok := getString("TenantID"); ok {
+		ps.TenantID = s
+	}
+
+	if s, ok := getString("user_id"); ok {
+		ps.UserID = s
+	} else if s, ok := getString("UserID"); ok {
+		ps.UserID = s
+	}
+
+	if s, ok := getString("app_id"); ok {
+		ps.AppID = s
+	} else if s, ok := getString("AppID"); ok {
+		ps.AppID = s
+	}
+
+	if s, ok := getString("correlation_id"); ok {
+		ps.CorrelationID = s
+	} else if s, ok := getString("CorrelationID"); ok {
+		ps.CorrelationID = s
+	}
+}
+
 type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 }
 
+type ActionFunc func(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep) (string, error)
+
 type Engine struct {
-	aiClient  *ai_client.Client
-	pub       TracePublisher
-	cbManager *callback_client.ClientManager
+	aiClient          *ai_client.Client
+	pub               TracePublisher
+	cbManager         *callback_client.ClientManager
+	primitiveHandlers map[string]ActionFunc
 }
 
 func NewEngine(aiClient *ai_client.Client, pub TracePublisher, cbManager *callback_client.ClientManager) *Engine {
-	return &Engine{
+	e := &Engine{
 		aiClient:  aiClient,
 		pub:       pub,
 		cbManager: cbManager,
 	}
+	e.primitiveHandlers = map[string]ActionFunc{
+		"PRIMITIVE_AI_STEP":    e.executeAIStep,
+		"PRIMITIVE_HUMAN_STEP": e.executeHumanValidationStep,
+	}
+	return e
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, string, string, string, error) {
+// BuildRuntimeHandlers maps the client's custom action names to the orchestrator's primitive handlers.
+func (e *Engine) BuildRuntimeHandlers(definitions []*pb.ActionDefinition) (map[string]ActionFunc, error) {
+	runtimeHandlers := make(map[string]ActionFunc)
+
+	if len(definitions) == 0 {
+		return nil, fmt.Errorf("no action definitions provided")
+	}
+
+	for _, def := range definitions {
+		prim, exists := e.primitiveHandlers[def.OrchestratorPrimitive]
+		if !exists {
+			return nil, fmt.Errorf("unsupported orchestrator primitive: %s", def.OrchestratorPrimitive)
+		}
+		runtimeHandlers[def.ClientActionName] = prim
+	}
+	return runtimeHandlers, nil
+}
+
+func (e *Engine) fetchRulesForStep(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep, callbackAddress string) error {
+	if callbackAddress == "" {
+		return fmt.Errorf("callback address is required to fetch rules for step %s", step.StepName)
+	}
+	var ruleKey string
+	if step.ReadsFromStateKey != "" {
+		if val, ok := state.GlobalState[step.ReadsFromStateKey]; ok {
+			if s, ok := val.(string); ok {
+				ruleKey = s
+			} else if m, ok := val.(map[string]interface{}); ok {
+				if typeStr, ok := m["classification"].(string); ok {
+					ruleKey = typeStr
+				} else if typeStr, ok := m["DocumentType"].(string); ok {
+					ruleKey = typeStr
+				}
+			}
+		}
+	}
+
+	if ruleKey == "" {
+		if state.DocumentType != "" {
+			ruleKey = state.DocumentType
+		} else {
+			ruleKey = step.StepName
+		}
+	}
+
+	if ruleKey == "" {
+		return fmt.Errorf("could not determine a rule key (e.g. classification or step name) to fetch rules for step %s", step.StepName)
+	}
+	if e.cbManager == nil {
+		return fmt.Errorf("callback manager is not initialized, cannot fetch rules")
+	}
+
+	rulesText, jsonSchema, err := e.cbManager.GetRules(ctx, callbackAddress, ruleKey)
+	if err != nil {
+		return fmt.Errorf("failed to fetch rules from client schema registry: %w", err)
+	}
+
+	step.CustomInstructions = rulesText
+	step.ExpectedSchema = jsonSchema
+	return nil
+}
+
+func (e *Engine) executeHumanValidationStep(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep) (string, error) {
+	taskID, err := e.triggerHumanValidation(ctx, state, step, step.ContextInput, "Client triggered manual validation")
+	if err != nil {
+		return "", fmt.Errorf("failed to create human validation task: %w", err)
+	}
+	log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
+	return "", ErrPendingHumanValidation
+}
+
+func (e *Engine) generatePlan(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep) (*ActionPlan, error) {
+	stateJson, _ := json.MarshalIndent(state.GlobalState, "", "  ")
+	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nInstructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nReturn the actions array.", step.CustomInstructions, step.ExpectedSchema, string(stateJson))
+
+	resp, err := e.aiClient.ExtractChunk(ctx, nil, "", plannerPrompt, PlannerSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate plan: %w", err)
+	}
+
+	var plan ActionPlan
+	if err := json.Unmarshal([]byte(resp.GetExtractedJson()), &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse action plan: %w", err)
+	}
+
+	return &plan, nil
+}
+
+func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest, handlers map[string]ActionFunc) (string, string, string, string, error) {
+	if state.CurrentStepReq == nil || state.CurrentStepReq != req {
+		state.CurrentStepReq = req
+		state.CurrentStepIndex = 0
+		state.PendingActions = nil
+		state.CurrentActionIndex = 0
+	}
+
 	var lastActionType string
 	var lastStepName string
 	lastStepId := state.CurrentStepID
 
-	for _, step := range req.Steps {
+	for state.CurrentStepIndex < len(req.Steps) {
+		step := req.Steps[state.CurrentStepIndex]
 		lastActionType = step.ActionType
 		lastStepName = step.StepName
 
-		if step.ActionType == "AI_EXTRACTION" {
-			resJson, err := e.executeAIExtraction(ctx, state, step)
+		if step.CustomInstructions == "" || step.ExpectedSchema == "" {
+			if err := e.fetchRulesForStep(ctx, state, step, req.CallbackAddress); err != nil {
+				return "", lastActionType, lastStepName, lastStepId, err
+			}
+		}
+
+		if len(state.PendingActions) == 0 {
+			plan, err := e.generatePlan(ctx, state, step)
 			if err != nil {
 				return "", lastActionType, lastStepName, lastStepId, err
 			}
+			state.PendingActions = plan.Actions
+			state.CurrentActionIndex = 0
+		}
 
-			if step.WritesToStateKey != "" {
+		for state.CurrentActionIndex < len(state.PendingActions) {
+			action := state.PendingActions[state.CurrentActionIndex]
+
+			handler, exists := e.primitiveHandlers[action.ActionType]
+			if !exists {
+				return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("unknown action type from planner: %s", action.ActionType)
+			}
+
+			actionStep := &pb.WorkflowStep{
+				StepName:           fmt.Sprintf("%s - %s", step.StepName, action.ActionType),
+				ActionType:         action.ActionType,
+				CustomInstructions: action.Prompt,
+				ExpectedSchema:     action.Schema,
+				ContextInput:       step.ContextInput,
+			}
+
+			resJson, err := handler(ctx, state, actionStep)
+			if err != nil {
+				if errors.Is(err, ErrPendingHumanValidation) {
+					return "", lastActionType, lastStepName, lastStepId, err
+				}
+				return "", lastActionType, lastStepName, lastStepId, err
+			}
+
+			if step.WritesToStateKey != "" && resJson != "" {
 				var parsed interface{}
 				if err := json.Unmarshal([]byte(resJson), &parsed); err == nil {
-					state.GlobalState[step.WritesToStateKey] = parsed
-
-					// Add the classification result to the document type
-					if step.WritesToStateKey == "ClassificationInfo" {
-						if m, ok := parsed.(map[string]interface{}); ok {
-							if classVal, exists := m["Classification"]; exists {
-								if classStr, isStr := classVal.(string); isStr {
-									state.DocumentType = classStr
-								}
-							}
-						}
+					if state.GlobalState == nil {
+						state.GlobalState = make(map[string]interface{})
 					}
+					state.GlobalState[step.WritesToStateKey] = parsed
+					state.SyncMetadata()
 				}
 			}
 
-		} else if step.ActionType == "HUMAN_VALIDATION" {
-			taskID, err := e.triggerHumanValidation(ctx, state, step, step.ContextInput, "Client triggered manual validation")
-			if err != nil {
-				return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("failed to create human validation task: %w", err)
-			}
-			log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobID)
-			return "", lastActionType, lastStepName, lastStepId, ErrPendingHumanValidation
-		} else {
-			return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("unsupported action type: %s", step.ActionType)
+			state.CurrentActionIndex++
 		}
+
+		state.PendingActions = nil
+		state.CurrentActionIndex = 0
+		state.CurrentStepIndex++
 	}
 
 	// Final state json
@@ -119,12 +339,12 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 	return string(finalJSON), lastActionType, lastStepName, lastStepId, nil
 }
 
-func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep) (string, error) {
+func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep) (string, error) {
 	prompt := req.CustomInstructions
 	schema := req.ExpectedSchema
 
 	if prompt == "" || schema == "" {
-		return "", fmt.Errorf("prompt and schema must be provided for AI_EXTRACTION")
+		return "", fmt.Errorf("prompt and schema must be provided for AI step")
 	}
 
 	if req.ContextInput != "" {
@@ -144,174 +364,81 @@ func (e *Engine) executeAIExtraction(ctx context.Context, state *ProcessingState
 		return "", fmt.Errorf("no documents available to process")
 	}
 
-	maxRetries := 3
-	var valErr error
-	var finalJSON string
+	stepResults := make(map[int]string)
+	var wg sync.WaitGroup
+	errChan := make(chan error, totalDocs)
+	var resultMu sync.Mutex
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		stepResults := make(map[int]string)
-		var wg sync.WaitGroup
-		errChan := make(chan error, totalDocs)
-		var resultMu sync.Mutex
-
-		for i, pdfBytes := range state.RawPDFs {
-			wg.Add(1)
-			go func(index int, data []byte) {
-				defer wg.Done()
-				e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
-				resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
-				if err != nil {
-					e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
-					errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
-					return
-				}
-				e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetExtractedJson(), "")
-
-				resultMu.Lock()
-				stepResults[index] = resp.GetExtractedJson()
-				resultMu.Unlock()
-			}(i, pdfBytes)
-		}
-
-		offset := len(state.RawPDFs)
-		for i, textContent := range state.RawTextContents {
-			wg.Add(1)
-			go func(index int, text string) {
-				defer wg.Done()
-				e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
-				resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
-				if err != nil {
-					e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
-					errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
-					return
-				}
-				e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetExtractedJson(), "")
-
-				resultMu.Lock()
-				stepResults[index] = resp.GetExtractedJson()
-				resultMu.Unlock()
-			}(offset+i, textContent)
-		}
-
-		wg.Wait()
-		close(errChan)
-
-		var chunkErr error
-		for err := range errChan {
+	for i, pdfBytes := range state.RawPDFs {
+		wg.Add(1)
+		go func(index int, data []byte) {
+			defer wg.Done()
+			e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
+			resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
 			if err != nil {
-				chunkErr = err
-				break
+				e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
+				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
+				return
 			}
-		}
-		if chunkErr != nil {
-			return "", chunkErr
-		}
+			e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetExtractedJson(), "")
 
-		if len(stepResults) == 1 {
-			finalJSON = stepResults[0]
-		} else {
-			finalJSON = "["
-			for i := 0; i < totalDocs; i++ {
-				if result, ok := stepResults[i]; ok {
-					if finalJSON != "[" {
-						finalJSON += ","
-					}
-					finalJSON += result
-				}
-			}
-			finalJSON += "]"
-		}
+			resultMu.Lock()
+			stepResults[index] = resp.GetExtractedJson()
+			resultMu.Unlock()
+		}(i, pdfBytes)
+	}
 
-		if req.RequireHumanReview {
-			log.Printf("INFO: [Engine] Explicit human review requested for Step: %s. Triggering Human Validation.", req.StepName)
-			taskID, err := e.triggerHumanValidation(ctx, state, req, finalJSON, "Explicit human review requested by workflow policy")
+	offset := len(state.RawPDFs)
+	for i, textContent := range state.RawTextContents {
+		wg.Add(1)
+		go func(index int, text string) {
+			defer wg.Done()
+			e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
+			resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
 			if err != nil {
-				return "", fmt.Errorf("failed to create explicit human validation task: %w", err)
+				e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
+				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
+				return
 			}
-			log.Printf("INFO: [Engine] Successfully registered human validation task: %s", taskID)
-			return "", ErrPendingHumanValidation
-		}
+			e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetExtractedJson(), "")
 
-		valErr = e.validateAIOutput(finalJSON, schema)
-		if valErr == nil {
-			return finalJSON, nil // Success!
-		}
+			resultMu.Lock()
+			stepResults[index] = resp.GetExtractedJson()
+			resultMu.Unlock()
+		}(offset+i, textContent)
+	}
 
-		if strings.Contains(valErr.Error(), "explicitly flagged for review") || req.BypassHumanFallback {
+	wg.Wait()
+	close(errChan)
+
+	var chunkErr error
+	for err := range errChan {
+		if err != nil {
+			chunkErr = err
 			break
 		}
-
-		log.Printf("WARNING: [Engine] AI output invalid for Step: %s. Attempt %d of %d. Error: %v", req.StepName, attempt, maxRetries, valErr)
-		if attempt < maxRetries {
-			prompt = fmt.Sprintf("%s\n\n[SYSTEM FEEDBACK FROM PREVIOUS ATTEMPT]: %v. Please carefully review the document and ensure this strictly required data is extracted exactly as specified.", prompt, valErr)
-		}
+	}
+	if chunkErr != nil {
+		return "", chunkErr
 	}
 
-	if valErr != nil {
-		if req.BypassHumanFallback {
-			return "", fmt.Errorf("ai output did not match requirements: %w", valErr)
-		}
-
-		log.Printf("WARNING: [Engine] AI output invalid after %d attempts: %v. Triggering Human Validation.", maxRetries, valErr)
-		taskID, err := e.triggerHumanValidation(ctx, state, req, finalJSON, valErr.Error())
-		if err != nil {
-			return "", fmt.Errorf("ai output invalid: %v, and failed to create human validation task: %w", valErr, err)
-		}
-
-		log.Printf("INFO: [Engine] Successfully registered human validation task: %s", taskID)
-		return "", ErrPendingHumanValidation
-	}
-
-	return "", fmt.Errorf("unexpected execution path")
-}
-
-func (e *Engine) validateAIOutput(jsonStr string, schema string) error {
-	trimmed := strings.TrimSpace(jsonStr)
-	if trimmed == "" {
-		return fmt.Errorf("AI output is empty")
-	}
-
-	var raw interface{}
-	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		return fmt.Errorf("AI output is not valid JSON: %w", err)
-	}
-
-	var schemaMap map[string]interface{}
-	if err := json.Unmarshal([]byte(schema), &schemaMap); err == nil {
-		if requiredObj, exists := schemaMap["required"]; exists {
-			if requiredList, ok := requiredObj.([]interface{}); ok {
-				var requiredProps []string
-				for _, r := range requiredList {
-					if rStr, ok := r.(string); ok {
-						requiredProps = append(requiredProps, rStr)
-					}
+	var finalJSON string
+	if len(stepResults) == 1 {
+		finalJSON = stepResults[0]
+	} else {
+		finalJSON = "["
+		for i := 0; i < totalDocs; i++ {
+			if result, ok := stepResults[i]; ok {
+				if finalJSON != "[" {
+					finalJSON += ","
 				}
-
-				switch v := raw.(type) {
-				case map[string]interface{}:
-					for _, propName := range requiredProps {
-						val, exists := v[propName]
-						if !exists {
-							return fmt.Errorf("missing strictly required field from schema: %s", propName)
-						}
-						if val == nil {
-							return fmt.Errorf("strictly required field is null: %s", propName)
-						}
-						if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
-							return fmt.Errorf("strictly required field is empty: %s", propName)
-						}
-					}
-				}
+				finalJSON += result
 			}
 		}
+		finalJSON += "]"
 	}
 
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, `"flagged for review"`) || strings.Contains(lower, `"flagged_for_review"`) {
-		return fmt.Errorf("AI output explicitly flagged for review")
-	}
-
-	return nil
+	return finalJSON, nil
 }
 
 func (e *Engine) triggerHumanValidation(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep, failedOutput string, errMsg string) (string, error) {

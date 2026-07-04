@@ -22,7 +22,8 @@ import (
 
 // JobTracker holds the state for a single job
 type JobTracker struct {
-	State *engine.ProcessingState
+	State          *engine.ProcessingState
+	ActionHandlers map[string]engine.ActionFunc
 }
 
 // OrchestratorServer implements the OrchestratorService gRPC interface.
@@ -67,6 +68,11 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		tenantID = "SYSTEM_DEFAULT_TENANT"
 	}
 
+	handlers, err := s.eng.BuildRuntimeHandlers(req.GetActionDefinitions())
+	if err != nil {
+		return nil, fmt.Errorf("failed to build action handlers for job: %w", err)
+	}
+
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
 			JobID:           jobID,
@@ -79,6 +85,7 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			DocumentType:    req.GetDocumentType(),
 			CorrelationID:   req.GetCorrelationId(),
 		},
+		ActionHandlers: handlers,
 	}
 
 	s.mu.Lock()
@@ -149,12 +156,25 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			for k, v := range initial {
 				state.GlobalState[k] = v
 			}
+			state.SyncMetadata()
 		}
 	}
 
 	log.Printf("Executing workflow of %d steps for job %s", len(req.Steps), state.JobID)
 
-	resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, &state, req)
+	s.mu.RLock()
+	tracker, exists := s.activeJobs[state.JobID]
+	s.mu.RUnlock()
+
+	var handlers map[string]engine.ActionFunc
+	if exists && tracker != nil && tracker.ActionHandlers != nil {
+		handlers = tracker.ActionHandlers
+	} else {
+		log.Printf("ERROR: No action handlers mapped for job %s. Client must provide action_definitions on SubmitDocument.", state.JobID)
+		return nil
+	}
+
+	resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, &state, req, handlers)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
@@ -235,13 +255,43 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	tracker.State.Lock()
 	stepReq := tracker.State.CurrentStepReq
+	if stepReq == nil || tracker.State.CurrentStepIndex >= len(stepReq.Steps) {
+		tracker.State.Unlock()
+		return &pb.ResumeJobResponse{Success: false, Message: "No active step to resume"}, nil
+	}
+
+	currentStep := stepReq.Steps[tracker.State.CurrentStepIndex]
+
+	if currentStep.WritesToStateKey != "" && req.GetCorrectedJson() != "" {
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(req.GetCorrectedJson()), &parsed); err == nil {
+			if tracker.State.GlobalState == nil {
+				tracker.State.GlobalState = make(map[string]interface{})
+			}
+			tracker.State.GlobalState[currentStep.WritesToStateKey] = parsed
+			tracker.State.SyncMetadata()
+		}
+	}
+
+	tracker.State.CurrentActionIndex++
 	tracker.State.Unlock()
 
 	log.Printf("INFO: Resuming job %s after human correction", jobID)
 
-	// Since the human corrected the JSON, we consider the step complete
-	// and fire the callback to the client with the corrected JSON.
-	s.fireCallback(tracker.State, stepReq, req.GetCorrectedJson(), "", "", "HUMAN_VALIDATION", "")
+	go func() {
+		resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), tracker.State, stepReq, tracker.ActionHandlers)
+		if err != nil {
+			if errors.Is(err, engine.ErrPendingHumanValidation) {
+				log.Printf("INFO: Job %s paused again for human validation", tracker.State.JobID)
+				return
+			}
+			log.Printf("ERROR: Workflow execution failed after resume: %v", err)
+			s.fireCallback(tracker.State, stepReq, "", err.Error(), lastStepId, lastActionType, lastStepName)
+			return
+		}
+		log.Printf("Workflow completed successfully for job %s after resume. Firing callback.", tracker.State.JobID)
+		s.fireCallback(tracker.State, stepReq, resultJSON, "", lastStepId, lastActionType, lastStepName)
+	}()
 
 	return &pb.ResumeJobResponse{
 		Success: true,
