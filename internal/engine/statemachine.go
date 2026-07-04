@@ -88,6 +88,17 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 				var parsed interface{}
 				if err := json.Unmarshal([]byte(resJson), &parsed); err == nil {
 					state.GlobalState[step.WritesToStateKey] = parsed
+
+					// Add the classification result to the document type
+					if step.WritesToStateKey == "ClassificationInfo" {
+						if m, ok := parsed.(map[string]interface{}); ok {
+							if classVal, exists := m["Classification"]; exists {
+								if classStr, isStr := classVal.(string); isStr {
+									state.DocumentType = classStr
+								}
+							}
+						}
+					}
 				}
 			}
 

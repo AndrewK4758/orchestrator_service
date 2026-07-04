@@ -43,7 +43,6 @@ type TraceabilityEvent struct {
 	// Specific Payload Details (Optional based on EventType)
 	ChunkID       string                 `json:"chunk_id,omitempty"`
 	ChunkIndex    int                    `json:"chunk_index,omitempty"`
-	TotalChunks   int                    `json:"total_chunks,omitempty"`
 	Message       string                 `json:"message,omitempty"`
 	Error         string                 `json:"error,omitempty"`
 	Metadata      map[string]interface{} `json:"metadata,omitempty"`
