@@ -281,11 +281,20 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 				return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("unknown action type from planner: %s", action.ActionType)
 			}
 
+			prompt := action.Prompt
+			if prompt == "" {
+				prompt = step.CustomInstructions
+			}
+			schema := action.Schema
+			if schema == "" {
+				schema = step.ExpectedSchema
+			}
+
 			actionStep := &pb.WorkflowStep{
 				StepName:           fmt.Sprintf("%s - %s", step.StepName, action.ActionType),
 				ActionType:         action.ActionType,
-				CustomInstructions: action.Prompt,
-				ExpectedSchema:     action.Schema,
+				CustomInstructions: prompt,
+				ExpectedSchema:     schema,
 				ContextInput:       step.ContextInput,
 			}
 
