@@ -40,20 +40,24 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// ExtractChunk synchronously calls the AI Service to process a chunk of PDF pages or raw text.
-func (c *Client) ExtractChunk(ctx context.Context, chunkPdf []byte, chunkText string, prompt string, jsonSchema string) (*aipb.ExtractResponse, error) {
-	req := &aipb.ExtractRequest{
-		ChunkPdf:    chunkPdf,
-		ChunkText:   chunkText,
+// PerformAction synchronously calls the AI Service to execute a planned action.
+func (c *Client) PerformAction(ctx context.Context, inputBytes []byte, inputText string, prompt string, jsonSchema string) (*aipb.PerformActionResponse, error) {
+	req := &aipb.PerformActionRequest{
+		InputBytes:  inputBytes,
+		InputText:   inputText,
 		Prompt:      prompt,
 		JsonSchema:  jsonSchema,
 		ModelChoice: aipb.ModelChoice_MODEL_CHOICE_LOCAL,
 	}
 
 	// This is a blocking, synchronous gRPC call
-	resp, err := c.apiClient.ExtractDocumentData(ctx, req)
+	resp, err := c.apiClient.PerformAction(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("ai_service ExtractDocumentData call failed: %w", err)
+		return nil, fmt.Errorf("ai_service PerformAction call failed: %w", err)
+	}
+
+	if !resp.GetSuccess() {
+		return nil, fmt.Errorf("ai_service returned failure: %s", resp.GetErrorMessage())
 	}
 
 	return resp, nil

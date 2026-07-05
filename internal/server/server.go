@@ -22,8 +22,7 @@ import (
 
 // JobTracker holds the state for a single job
 type JobTracker struct {
-	State          *engine.ProcessingState
-	ActionHandlers map[string]engine.ActionFunc
+	State *engine.ProcessingState
 }
 
 // OrchestratorServer implements the OrchestratorService gRPC interface.
@@ -68,11 +67,6 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 		tenantID = "SYSTEM_DEFAULT_TENANT"
 	}
 
-	handlers, err := s.eng.BuildRuntimeHandlers(req.GetActionDefinitions())
-	if err != nil {
-		return nil, fmt.Errorf("failed to build action handlers for job: %w", err)
-	}
-
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
 			JobID:           jobID,
@@ -85,7 +79,6 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 			DocumentType:    req.GetDocumentType(),
 			CorrelationID:   req.GetCorrelationId(),
 		},
-		ActionHandlers: handlers,
 	}
 
 	s.mu.Lock()
@@ -162,19 +155,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 	log.Printf("Executing workflow of %d steps for job %s", len(req.Steps), state.JobID)
 
-	s.mu.RLock()
-	tracker, exists := s.activeJobs[state.JobID]
-	s.mu.RUnlock()
-
-	var handlers map[string]engine.ActionFunc
-	if exists && tracker != nil && tracker.ActionHandlers != nil {
-		handlers = tracker.ActionHandlers
-	} else {
-		log.Printf("ERROR: No action handlers mapped for job %s. Client must provide action_definitions on SubmitDocument.", state.JobID)
-		return nil
-	}
-
-	resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, &state, req, handlers)
+	resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, &state, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
@@ -279,7 +260,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	log.Printf("INFO: Resuming job %s after human correction", jobID)
 
 	go func() {
-		resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), tracker.State, stepReq, tracker.ActionHandlers)
+		resultJSON, lastActionType, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), tracker.State, stepReq)
 		if err != nil {
 			if errors.Is(err, engine.ErrPendingHumanValidation) {
 				log.Printf("INFO: Job %s paused again for human validation", tracker.State.JobID)

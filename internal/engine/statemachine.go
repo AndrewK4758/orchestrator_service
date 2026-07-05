@@ -171,24 +171,6 @@ func NewEngine(aiClient *ai_client.Client, pub TracePublisher, cbManager *callba
 	return e
 }
 
-// BuildRuntimeHandlers maps the client's custom action names to the orchestrator's primitive handlers.
-func (e *Engine) BuildRuntimeHandlers(definitions []*pb.ActionDefinition) (map[string]ActionFunc, error) {
-	runtimeHandlers := make(map[string]ActionFunc)
-
-	if len(definitions) == 0 {
-		return nil, fmt.Errorf("no action definitions provided")
-	}
-
-	for _, def := range definitions {
-		prim, exists := e.primitiveHandlers[def.OrchestratorPrimitive]
-		if !exists {
-			return nil, fmt.Errorf("unsupported orchestrator primitive: %s", def.OrchestratorPrimitive)
-		}
-		runtimeHandlers[def.ClientActionName] = prim
-	}
-	return runtimeHandlers, nil
-}
-
 func (e *Engine) fetchRulesForStep(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep, callbackAddress string) error {
 	if callbackAddress == "" {
 		return fmt.Errorf("callback address is required to fetch rules for step %s", step.StepName)
@@ -246,20 +228,20 @@ func (e *Engine) generatePlan(ctx context.Context, state *ProcessingState, step 
 	stateJson, _ := json.MarshalIndent(state.GlobalState, "", "  ")
 	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nInstructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nReturn the actions array.", step.CustomInstructions, step.ExpectedSchema, string(stateJson))
 
-	resp, err := e.aiClient.ExtractChunk(ctx, nil, "", plannerPrompt, PlannerSchema)
+	resp, err := e.aiClient.PerformAction(ctx, nil, " ", plannerPrompt, PlannerSchema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate plan: %w", err)
 	}
 
 	var plan ActionPlan
-	if err := json.Unmarshal([]byte(resp.GetExtractedJson()), &plan); err != nil {
+	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &plan); err != nil {
 		return nil, fmt.Errorf("failed to parse action plan: %w", err)
 	}
 
 	return &plan, nil
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest, handlers map[string]ActionFunc) (string, string, string, string, error) {
+func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, string, string, string, error) {
 	if state.CurrentStepReq == nil || state.CurrentStepReq != req {
 		state.CurrentStepReq = req
 		state.CurrentStepIndex = 0
@@ -374,16 +356,16 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		go func(index int, data []byte) {
 			defer wg.Done()
 			e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
-			resp, err := e.aiClient.ExtractChunk(ctx, data, "", prompt, schema)
+			resp, err := e.aiClient.PerformAction(ctx, data, "", prompt, schema)
 			if err != nil {
 				e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
 				return
 			}
-			e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetExtractedJson(), "")
+			e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetActionResultJson(), "")
 
 			resultMu.Lock()
-			stepResults[index] = resp.GetExtractedJson()
+			stepResults[index] = resp.GetActionResultJson()
 			resultMu.Unlock()
 		}(i, pdfBytes)
 	}
@@ -394,16 +376,16 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		go func(index int, text string) {
 			defer wg.Done()
 			e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
-			resp, err := e.aiClient.ExtractChunk(ctx, nil, text, prompt, schema)
+			resp, err := e.aiClient.PerformAction(ctx, nil, text, prompt, schema)
 			if err != nil {
 				e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
 				return
 			}
-			e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetExtractedJson(), "")
+			e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetActionResultJson(), "")
 
 			resultMu.Lock()
-			stepResults[index] = resp.GetExtractedJson()
+			stepResults[index] = resp.GetActionResultJson()
 			resultMu.Unlock()
 		}(offset+i, textContent)
 	}
