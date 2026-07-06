@@ -22,13 +22,13 @@ type ArtemisCallbackServer struct {
 }
 
 func (s *ArtemisCallbackServer) OnStepComplete(ctx context.Context, req *pb.StepCompleteRequest) (*pb.StepCompleteResponse, error) {
-	fmt.Printf("\n[ARTEMIS] Received Callback for Job: %s\n", req.JobId)
+	fmt.Printf("\n[%s] Received Callback for Job: %s\n", req.StepName, req.JobId)
 
 	if req.ErrorMessage != "" {
-		fmt.Printf("[ARTEMIS] Step Failed! Error: %s\n", req.ErrorMessage)
+		fmt.Printf("[%s] Step Failed! Error: %s\n", req.JobId, req.ErrorMessage)
 		s.ResultChan <- "ERROR: " + req.ErrorMessage
 	} else {
-		fmt.Printf("[ARTEMIS] Step Succeeded! Result JSON:\n%s\n", req.ResultJson)
+		fmt.Printf("[%s] Step Succeeded! Result JSON:\n%s\n", req.JobId, req.ResultJson)
 		s.ResultChan <- req.ResultJson
 	}
 
@@ -41,7 +41,7 @@ func main() {
 	}
 	inputPath := os.Args[1]
 
-	// 1. Start Artemis Local Callback Server
+	// 1. Start Local Callback Server
 	lis, err := net.Listen("tcp", ":50055")
 	if err != nil {
 		log.Fatalf("Failed to listen for callbacks: %v", err)
@@ -53,7 +53,7 @@ func main() {
 	pb.RegisterStepCallbackServiceServer(grpcServer, artemisServer)
 
 	go func() {
-		fmt.Println("🎧 [ARTEMIS] Callback Server listening on :50055")
+		fmt.Println("🎧 Callback Server listening on :50055")
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("Failed to serve callbacks: %v", err)
 		}
@@ -95,7 +95,7 @@ func main() {
 
 func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackServer, inputPath string) {
 	fmt.Println("\n==================================================")
-	fmt.Printf("📄 [ARTEMIS] PROCESSING FILE: %s\n", inputPath)
+	fmt.Printf("📄 [test_client] PROCESSING FILE: %s\n", inputPath)
 	fmt.Println("==================================================")
 
 	pdfBytes, err := os.ReadFile(inputPath)
@@ -104,10 +104,11 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		return
 	}
 
-	fmt.Println("\n[ARTEMIS] PHASE 1: Submitting Heavy Document Payload...")
+	fmt.Println("\n[test_client] PHASE 1: Submitting Heavy Document Payload...")
 	docRes, err := client.SubmitDocument(context.Background(), &pb.SubmitDocumentRequest{
 		PdfContents: [][]byte{pdfBytes},
-		TenantId:    "Artemis_Tenant",
+		TenantId:    "test_tenant",
+		AppId:       "test_client",
 	})
 	if err != nil {
 		log.Printf("Failed to submit document: %v", err)
@@ -117,7 +118,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Printf("✅ Document Cached! Job ID: %s\n", jobID)
 
 	// ReAct Loop Simulation
-	fmt.Println("\n[ARTEMIS] PHASE 2: Submitting First ReAct Step (Classification)...")
+	fmt.Printf("\n[%s] PHASE 2: Submitting First ReAct Step (Classification)...\n", jobID)
 
 	schema := `{
 		"type": "object",
@@ -144,12 +145,12 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		return
 	}
 
-	fmt.Println("⏳ [ARTEMIS] Waiting for Orchestrator Callback...")
+	fmt.Printf("⏳ [%s] Waiting for Orchestrator Callback...\n", jobID)
 
 	// Wait for Phase 3 (The Callback)
 	result := <-artemis.ResultChan
 
-	fmt.Println("\n[ARTEMIS] PHASE 4: ReAct Decision (Evaluating Output)")
+	fmt.Printf("\n[%s] PHASE 4: ReAct Decision (Evaluating Output)\n", jobID)
 	fmt.Printf("Decision Engine analyzed output: %s\n", result)
 	fmt.Println("Decision: Next path selected based on classification. End of demo loop.")
 }
