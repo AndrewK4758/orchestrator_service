@@ -59,20 +59,25 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 
 // PublishTrace sends an event securely to JetStream so the .NET Traceability Service can record it.
 func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) error {
+	log.Printf("INFO: [Publisher] Preparing to publish trace event: %+v", event)
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
+		log.Printf("ERROR: [Publisher] Failed to marshal event: %v", err)
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
 	// Publish to a specific subject, e.g., "trace.job.started"
 	subject := fmt.Sprintf("trace.%s", event.EventType)
+	log.Printf("INFO: [Publisher] Publishing to NATS subject: '%s'", subject)
 
 	// Use JetStream publish for guaranteed delivery
 	_, err = p.js.Publish(ctx, subject, eventBytes)
 	if err != nil {
+		log.Printf("ERROR: [Publisher] Failed to publish trace event to NATS subject '%s': %v", subject, err)
 		return fmt.Errorf("failed to publish trace event to jetstream: %w", err)
 	}
 
+	log.Printf("INFO: [Publisher] Successfully published to NATS subject: '%s'", subject)
 	return nil
 }
 

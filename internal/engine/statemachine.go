@@ -225,13 +225,18 @@ func (e *Engine) executeHumanValidationStep(ctx context.Context, state *Processi
 }
 
 func (e *Engine) generatePlan(ctx context.Context, state *ProcessingState, step *pb.WorkflowStep) (*ActionPlan, error) {
+	log.Println("INFO: [Engine] Generating plan for step:", step.StepName)
 	stateJson, _ := json.MarshalIndent(state.GlobalState, "", "  ")
 	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nInstructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nReturn the actions array.", step.CustomInstructions, step.ExpectedSchema, string(stateJson))
+	log.Println("DEBUG: [Engine] Planner Prompt:", plannerPrompt)
 
+	log.Println("INFO: [Engine] Sending planning request to AI service...")
 	resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, nil, " ", plannerPrompt, PlannerSchema)
 	if err != nil {
+		log.Printf("ERROR: [Engine] Failed to generate plan from AI service: %v", err)
 		return nil, fmt.Errorf("failed to generate plan: %w", err)
 	}
+	log.Println("INFO: [Engine] Successfully received plan from AI service.")
 
 	var plan ActionPlan
 	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &plan); err != nil {
@@ -328,6 +333,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 }
 
 func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep) (string, error) {
+	log.Printf("INFO: [Engine] Executing AI step: %s", req.StepName)
 	prompt := req.CustomInstructions
 	schema := req.ExpectedSchema
 
@@ -346,6 +352,7 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 			prompt = fmt.Sprintf("%s\n\n[CURRENT GLOBAL STATE]:\n%s\n", prompt, string(stateBytes))
 		}
 	}
+	log.Println("DEBUG: [Engine] AI Step Prompt:", prompt)
 
 	totalDocs := len(state.RawPDFs) + len(state.RawTextContents)
 	if totalDocs == 0 {
@@ -361,13 +368,16 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		wg.Add(1)
 		go func(index int, data []byte) {
 			defer wg.Done()
+			log.Printf("INFO: [Engine] Sending PDF chunk %d to AI service for step %s", index, req.StepName)
 			e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
 			resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, data, "", prompt, schema)
 			if err != nil {
+				log.Printf("ERROR: [Engine] AI service failed for PDF chunk %d: %v", index, err)
 				e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
 				return
 			}
+			log.Printf("INFO: [Engine] AI service completed for PDF chunk %d", index)
 			e.publishChunkTrace(ctx, state, req, index, "", "COMPLETED", resp.GetActionResultJson(), "")
 
 			resultMu.Lock()
@@ -381,13 +391,16 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		wg.Add(1)
 		go func(index int, text string) {
 			defer wg.Done()
+			log.Printf("INFO: [Engine] Sending text chunk %d to AI service for step %s", index, req.StepName)
 			e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
 			resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, nil, text, prompt, schema)
 			if err != nil {
+				log.Printf("ERROR: [Engine] AI service failed for text chunk %d: %v", index, err)
 				e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
 				return
 			}
+			log.Printf("INFO: [Engine] AI service completed for text chunk %d", index)
 			e.publishChunkTrace(ctx, state, req, index, text, "COMPLETED", resp.GetActionResultJson(), "")
 
 			resultMu.Lock()
