@@ -241,7 +241,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *ProcessingState, step 
 	return &plan, nil
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, string, string, string, error) {
+func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, req *pb.SubmitStepRequest) (string, string, string, error) {
 	if state.CurrentStepReq == nil || state.CurrentStepReq != req {
 		state.CurrentStepReq = req
 		state.CurrentStepIndex = 0
@@ -249,25 +249,23 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 		state.CurrentActionIndex = 0
 	}
 
-	var lastActionType string
 	var lastStepName string
 	lastStepId := state.CurrentStepID
 
 	for state.CurrentStepIndex < len(req.Steps) {
 		step := req.Steps[state.CurrentStepIndex]
-		lastActionType = step.ActionType
 		lastStepName = step.StepName
 
 		if step.CustomInstructions == "" || step.ExpectedSchema == "" {
 			if err := e.fetchRulesForStep(ctx, state, step, req.CallbackAddress); err != nil {
-				return "", lastActionType, lastStepName, lastStepId, err
+				return "", lastStepName, lastStepId, err
 			}
 		}
 
 		if len(state.PendingActions) == 0 {
 			plan, err := e.generatePlan(ctx, state, step)
 			if err != nil {
-				return "", lastActionType, lastStepName, lastStepId, err
+				return "", lastStepName, lastStepId, err
 			}
 			state.PendingActions = plan.Actions
 			state.CurrentActionIndex = 0
@@ -278,7 +276,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 
 			handler, exists := e.primitiveHandlers[action.ActionType]
 			if !exists {
-				return "", lastActionType, lastStepName, lastStepId, fmt.Errorf("unknown action type from planner: %s", action.ActionType)
+				return "", lastStepName, lastStepId, fmt.Errorf("unknown action type from planner: %s", action.ActionType)
 			}
 
 			prompt := action.Prompt
@@ -292,7 +290,6 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 
 			actionStep := &pb.WorkflowStep{
 				StepName:           fmt.Sprintf("%s - %s", step.StepName, action.ActionType),
-				ActionType:         action.ActionType,
 				CustomInstructions: prompt,
 				ExpectedSchema:     schema,
 				ContextInput:       step.ContextInput,
@@ -301,9 +298,9 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 			resJson, err := handler(ctx, state, actionStep)
 			if err != nil {
 				if errors.Is(err, ErrPendingHumanValidation) {
-					return "", lastActionType, lastStepName, lastStepId, err
+					return "", lastStepName, lastStepId, err
 				}
-				return "", lastActionType, lastStepName, lastStepId, err
+				return "", lastStepName, lastStepId, err
 			}
 
 			if step.WritesToStateKey != "" && resJson != "" {
@@ -327,7 +324,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *ProcessingState, re
 
 	// Final state json
 	finalJSON, _ := json.Marshal(state.GlobalState)
-	return string(finalJSON), lastActionType, lastStepName, lastStepId, nil
+	return string(finalJSON), lastStepName, lastStepId, nil
 }
 
 func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req *pb.WorkflowStep) (string, error) {

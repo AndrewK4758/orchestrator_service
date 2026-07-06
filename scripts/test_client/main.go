@@ -22,7 +22,7 @@ type ArtemisCallbackServer struct {
 }
 
 func (s *ArtemisCallbackServer) OnStepComplete(ctx context.Context, req *pb.StepCompleteRequest) (*pb.StepCompleteResponse, error) {
-	fmt.Printf("\n[ARTEMIS] Received Callback for Job: %s | Action: %s\n", req.JobId, req.ActionType)
+	fmt.Printf("\n[ARTEMIS] Received Callback for Job: %s\n", req.JobId)
 
 	if req.ErrorMessage != "" {
 		fmt.Printf("[ARTEMIS] Step Failed! Error: %s\n", req.ErrorMessage)
@@ -133,7 +133,6 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		CallbackAddress: "localhost:50055",
 		Steps: []*pb.WorkflowStep{
 			{
-				ActionType:         "AI_EXTRACTION",
 				StepName:           "Classify Document",
 				CustomInstructions: "Classify this document and provide a brief summary.",
 				ExpectedSchema:     schema,
