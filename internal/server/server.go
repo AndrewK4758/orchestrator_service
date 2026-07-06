@@ -101,6 +101,8 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 		return nil, fmt.Errorf("job %s not found in cache", jobID)
 	}
 
+	log.Printf("Received SubmitStep for JobID: %s, Steps count: %d", jobID, len(req.GetSteps()))
+
 	stepID := "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
 
 	// Create a Job Payload to queue for processing
@@ -116,6 +118,7 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 
 	err = s.pub.PublishJob(ctx, payload)
 	if err != nil {
+		log.Printf("ERROR: Failed to publish job to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue step")
 	}
 
@@ -126,7 +129,6 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 	}, nil
 }
 
-// handleJobMessage is invoked by the JetStream consumer for each step queued
 // handleJobMessage is invoked by the JetStream consumer for each step queued
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
 	var state engine.ProcessingState
