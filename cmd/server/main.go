@@ -30,23 +30,19 @@ func main() {
 		log.Fatalf("Failed to listen on port %s: %v", port, err)
 	}
 
-	aiHost := os.Getenv("AI_SERVICE_ADDRESS")
-	if aiHost == "" {
-		aiHost = "localhost:50051"
-	}
-
-	// Connect to the external AI Service (acting as the 'Brain')
-	aiClient, err := ai_client.NewClient(aiHost)
-	if err != nil {
-		log.Fatalf("Failed to create AI client: %v", err)
-	}
-	defer aiClient.Close()
-
 	// Connect to NATS JetStream
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = "nats://localhost:4222"
 	}
+
+	// Connect to the external AI Service (acting as the 'Brain') via NATS
+	aiClient, err := ai_client.NewClient(natsURL)
+	if err != nil {
+		log.Fatalf("Failed to create AI client: %v", err)
+	}
+	defer aiClient.Close()
+
 	pub, err := events.NewPublisher(natsURL)
 	if err != nil {
 		log.Fatalf("Failed to create NATS publisher: %v", err)

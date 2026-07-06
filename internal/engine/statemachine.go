@@ -228,7 +228,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *ProcessingState, step 
 	stateJson, _ := json.MarshalIndent(state.GlobalState, "", "  ")
 	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nInstructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nReturn the actions array.", step.CustomInstructions, step.ExpectedSchema, string(stateJson))
 
-	resp, err := e.aiClient.PerformAction(ctx, nil, " ", plannerPrompt, PlannerSchema)
+	resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, nil, " ", plannerPrompt, PlannerSchema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate plan: %w", err)
 	}
@@ -365,7 +365,7 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		go func(index int, data []byte) {
 			defer wg.Done()
 			e.publishChunkTrace(ctx, state, req, index, "", "STARTED", "", "")
-			resp, err := e.aiClient.PerformAction(ctx, data, "", prompt, schema)
+			resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, data, "", prompt, schema)
 			if err != nil {
 				e.publishChunkTrace(ctx, state, req, index, "", "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process PDF %d: %w", index, err)
@@ -385,7 +385,7 @@ func (e *Engine) executeAIStep(ctx context.Context, state *ProcessingState, req 
 		go func(index int, text string) {
 			defer wg.Done()
 			e.publishChunkTrace(ctx, state, req, index, text, "STARTED", "", "")
-			resp, err := e.aiClient.PerformAction(ctx, nil, text, prompt, schema)
+			resp, err := e.aiClient.PerformAction(ctx, state.AppID, state.TenantID, state.JobID, nil, text, prompt, schema)
 			if err != nil {
 				e.publishChunkTrace(ctx, state, req, index, text, "FAILED", "", err.Error())
 				errChan <- fmt.Errorf("failed to process Text %d: %w", index, err)
