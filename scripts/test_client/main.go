@@ -12,8 +12,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/structpb"
 
-	pb "doc_processor/shared_protos"
+	pb "github.com/AndrewK4758/shared_protos"
 )
 
 // ArtemisCallbackServer simulates the Client's webhook/gRPC server
@@ -108,14 +109,18 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Println("\n[test_client] PHASE 1: Submitting Initial State...")
 
 	b64Doc := base64.StdEncoding.EncodeToString(pdfBytes)
-	initialState := fmt.Sprintf(`{"document_b64": "%s"}`, b64Doc)
+	initialState, _ := structpb.NewStruct(map[string]interface{}{
+		"document_b64": b64Doc,
+	})
 
 	jobReq := &pb.SubmitJobRequest{
-		Metadata: map[string]string{
-			"app_id":    "CLI_TEST_APP",
-			"tenant_id": "TEST_TENANT",
+		Context: &pb.WorkflowContext{
+			Metadata: map[string]string{
+				"app_id":    "CLI_TEST_APP",
+				"tenant_id": "TEST_TENANT",
+			},
+			GlobalState: initialState,
 		},
-		InitialStateJson: initialState,
 	}
 
 	docRes, err := client.SubmitJob(context.Background(), jobReq)
@@ -131,7 +136,9 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 
 	// Submit a generic step using the new generic StepDefinition
 	stepReq := &pb.SubmitStepRequest{
-		ActiveExecution: &pb.ActiveJobExecution{JobId: jobID},
+		Context: &pb.WorkflowContext{
+			JobId: jobID,
+		},
 		CallbackAddress: "localhost:50055",
 		Steps: []*pb.StepDefinition{
 			{

@@ -1,19 +1,20 @@
 package engine
 
 import (
+	pb "github.com/AndrewK4758/shared_protos"
 	"testing"
 )
 
 func TestProcessingState_Initialization(t *testing.T) {
-	ps := &ProcessingState{
-		JobID: "test_job_1",
+	ps := &pb.WorkflowContext{
+		JobId: "test_job_1",
 		Metadata: map[string]string{
 			"tenant_id": "test_tenant",
 		},
 	}
 
-	if ps.JobID != "test_job_1" {
-		t.Errorf("Expected jobID test_job_1, got %s", ps.JobID)
+	if ps.JobId != "test_job_1" {
+		t.Errorf("Expected jobID test_job_1, got %s", ps.JobId)
 	}
 
 	if ps.Metadata["tenant_id"] != "test_tenant" {

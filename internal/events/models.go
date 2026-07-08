@@ -14,10 +14,18 @@ const (
 	EventChunkCompleted EventType = "chunk.completed"
 	EventChunkFailed    EventType = "chunk.failed"
 
-	EventJobStepStarted      EventType = "step.started"
-	EventJobStepCompleted    EventType = "step.completed"
-	EventJobStepFailed       EventType = "step.failed"
-	EventJobStepPendingHuman EventType = "step.pending_human"
+	EventJobStepStarted       EventType = "step.started"
+	EventJobStepCompleted     EventType = "step.completed"
+	EventJobStepFailed        EventType = "step.failed"
+	EventJobStepPendingHuman  EventType = "step.pending_human"
+	EventStepValidationFailed EventType = "step.validation_failed"
+
+	EventPlanApproved              EventType = "plan.approved"
+	EventPlanRejectedRetry         EventType = "plan.rejected_retry"
+	EventStepValidationFailedRetry EventType = "step.validation_failed_retry"
+	EventActionStarted             EventType = "action.started"
+	EventActionCompleted           EventType = "action.completed"
+	EventActionFailed              EventType = "action.failed"
 )
 
 // TraceabilityEvent is the core wrapper for all compliance and tracing data.

@@ -9,7 +9,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto"
 
-	aipb "doc_processor/shared_protos"
+	aipb "github.com/AndrewK4758/shared_protos"
 )
 
 // Client wraps the NATS connection to the AI Service.
@@ -33,6 +33,21 @@ func NewClient(natsURL string) (*Client, error) {
 		return nil, fmt.Errorf("failed to initialize JetStream: %w", err)
 	}
 
+	// Ensure AI_RESPONSES stream exists
+	streamName := "AI_RESPONSES"
+	_, err = js.StreamInfo(streamName)
+	if err != nil {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     streamName,
+			Subjects: []string{"ai.response.>"},
+		})
+		if err != nil {
+			log.Printf("Warning: failed to create AI_RESPONSES stream (might already exist): %v", err)
+		} else {
+			log.Printf("Successfully created JetStream stream: %s", streamName)
+		}
+	}
+
 	return &Client{
 		nc: nc,
 		js: js,
@@ -46,13 +61,13 @@ func (c *Client) Close() error {
 }
 
 // PerformAction publishes a request to the AI service via JetStream and waits for a response on a Core NATS reply subject.
-func (c *Client) PerformAction(ctx context.Context, appID string, tenantID string, jobID string, inputBytes []byte, inputText string, prompt string, jsonSchema string) (*aipb.PerformActionResponse, error) {
+func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowContext, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string) (*aipb.PerformActionResponse, error) {
 	req := &aipb.PerformActionRequest{
-		InputBytes:  inputBytes,
-		InputText:   inputText,
-		Prompt:      prompt,
-		JsonSchema:  jsonSchema,
-		ModelChoice: aipb.ModelChoice_MODEL_CHOICE_LOCAL,
+		InputBytes:    inputBytes,
+		InputText:     inputText,
+		Context:       workflowCtx,
+		CurrentAction: currentAction,
+		ModelChoice:   aipb.ModelChoice_MODEL_CHOICE_LOCAL,
 	}
 
 	reqBytes, err := proto.Marshal(req)
@@ -60,23 +75,29 @@ func (c *Client) PerformAction(ctx context.Context, appID string, tenantID strin
 		return nil, fmt.Errorf("failed to marshal PerformActionRequest: %w", err)
 	}
 
-	if appID == "" {
-		appID = "default"
+	appID := "default"
+	tenantID := "default"
+	if workflowCtx != nil && workflowCtx.Metadata != nil {
+		if val, ok := workflowCtx.Metadata["app_id"]; ok && val != "" {
+			appID = val
+		}
+		if val, ok := workflowCtx.Metadata["tenant_id"]; ok && val != "" {
+			tenantID = val
+		}
 	}
-	if tenantID == "" {
-		tenantID = "default"
-	}
-	if jobID == "" {
-		jobID = "default"
+
+	jobID := "default"
+	if workflowCtx != nil && workflowCtx.JobId != "" {
+		jobID = workflowCtx.JobId
 	}
 
 	subject := fmt.Sprintf("ai.action.%s.%s.%s", appID, tenantID, jobID)
-	replySubject := nats.NewInbox()
+	replySubject := fmt.Sprintf("ai.response.%s.%s.%s.%d", appID, tenantID, jobID, time.Now().UnixNano())
 
-	// Create a synchronous subscription on the reply subject
-	sub, err := c.nc.SubscribeSync(replySubject)
+	// Create a synchronous subscription on the JetStream reply subject
+	sub, err := c.js.SubscribeSync(replySubject)
 	if err != nil {
-		return nil, fmt.Errorf("failed to subscribe to reply subject: %w", err)
+		return nil, fmt.Errorf("failed to subscribe to reply subject on JetStream: %w", err)
 	}
 	defer sub.Unsubscribe()
 
@@ -99,6 +120,11 @@ func (c *Client) PerformAction(ctx context.Context, appID string, tenantID strin
 		if err != nil {
 			return nil, fmt.Errorf("timeout waiting for ai_service reply: %w", err)
 		}
+	}
+
+	// Acknowledge the JetStream message
+	if err := respMsg.Ack(); err != nil {
+		log.Printf("Warning: failed to ack AI response message: %v", err)
 	}
 
 	resp := &aipb.PerformActionResponse{}
