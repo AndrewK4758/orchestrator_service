@@ -11,7 +11,6 @@ import (
 
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
-	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
 
@@ -29,23 +28,21 @@ type JobTracker struct {
 type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
 
-	eng       *engine.Engine
-	aiClient  *ai_client.Client
-	pub       *events.Publisher
-	cbManager *callback_client.ClientManager
+	eng      *engine.Engine
+	aiClient *ai_client.Client
+	pub      *events.Publisher
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
 }
 
-func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *callback_client.ClientManager) *OrchestratorServer {
-	eng := engine.NewEngine(aiClient, pub, cbManager)
+func NewServer(aiClient *ai_client.Client, pub *events.Publisher) *OrchestratorServer {
+	eng := engine.NewEngine(aiClient, pub)
 
 	srv := &OrchestratorServer{
 		eng:        eng,
 		aiClient:   aiClient,
 		pub:        pub,
-		cbManager:  cbManager,
 		activeJobs: make(map[string]*JobTracker),
 	}
 
@@ -57,31 +54,45 @@ func NewServer(aiClient *ai_client.Client, pub *events.Publisher, cbManager *cal
 	return srv
 }
 
-func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitDocumentRequest) (*pb.SubmitDocumentResponse, error) {
-	appID := req.GetAppId()
-	if appID == "" {
-		appID = "app"
+func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobRequest) (*pb.SubmitJobResponse, error) {
+	activeExec := req.GetActiveExecution()
+	jobID := ""
+	if activeExec != nil {
+		jobID = activeExec.GetJobId()
 	}
-	jobID := fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
-	fileCount := len(req.GetPdfContents()) + len(req.GetRawTextContents())
-	log.Printf("Received %d documents, assigned JobID: %s for Tenant: %s", fileCount, jobID, req.GetTenantId())
 
-	tenantID := req.GetTenantId()
+	metadata := req.GetMetadata()
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+
+	if jobID == "" {
+		appID := metadata["app_id"]
+		if appID == "" {
+			appID = "app"
+		}
+		jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
+	}
+
+	tenantID := metadata["tenant_id"]
 	if tenantID == "" {
 		tenantID = "SYSTEM_DEFAULT_TENANT"
+		metadata["tenant_id"] = tenantID
+	}
+	log.Printf("Received job, using JobID: %s for Tenant: %s", jobID, tenantID)
+
+	globalState := make(map[string]interface{})
+	if req.GetInitialStateJson() != "" {
+		if err := json.Unmarshal([]byte(req.GetInitialStateJson()), &globalState); err != nil {
+			log.Printf("ERROR: Failed to unmarshal initial_state_json: %v", err)
+		}
 	}
 
 	tracker := &JobTracker{
 		State: &engine.ProcessingState{
-			JobID:           jobID,
-			RawPDFs:         req.GetPdfContents(),
-			RawTextContents: req.GetRawTextContents(),
-			GlobalState:     make(map[string]interface{}),
-			TenantID:        tenantID,
-			UserID:          req.GetUserId(),
-			AppID:           req.GetAppId(),
-			DocumentType:    req.GetDocumentType(),
-			CorrelationID:   req.GetCorrelationId(),
+			JobID:       jobID,
+			GlobalState: globalState,
+			Metadata:    metadata,
 		},
 	}
 
@@ -89,14 +100,18 @@ func (s *OrchestratorServer) SubmitDocument(ctx context.Context, req *pb.SubmitD
 	s.activeJobs[jobID] = tracker
 	s.mu.Unlock()
 
-	return &pb.SubmitDocumentResponse{
+	return &pb.SubmitJobResponse{
 		JobId:  jobID,
 		Status: "CACHED",
 	}, nil
 }
 
 func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepRequest) (*pb.SubmitStepResponse, error) {
-	jobID := req.GetJobId()
+	activeExec := req.GetActiveExecution()
+	jobID := ""
+	if activeExec != nil {
+		jobID = activeExec.GetJobId()
+	}
 	s.mu.RLock()
 	tracker, exists := s.activeJobs[jobID]
 	s.mu.RUnlock()
@@ -112,7 +127,10 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 	// Create a Job Payload to queue for processing
 	tracker.State.Lock()
 	tracker.State.CurrentStepReq = req // We store the current step request in the state
-	tracker.State.CurrentStepID = stepID
+	if tracker.State.ActiveExecution == nil {
+		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
+	}
+	tracker.State.ActiveExecution.CurrentStepId = stepID
 	tracker.State.Unlock()
 
 	payload, err := json.Marshal(tracker.State)
@@ -155,7 +173,6 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			for k, v := range initial {
 				state.GlobalState[k] = v
 			}
-			state.SyncMetadata()
 		}
 	}
 
@@ -255,7 +272,6 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 				tracker.State.GlobalState = make(map[string]interface{})
 			}
 			tracker.State.GlobalState[currentStep.WritesToStateKey] = parsed
-			tracker.State.SyncMetadata()
 		}
 	}
 

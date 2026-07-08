@@ -4,15 +4,18 @@
 - make the best architectural decision for the task
 - Ask me if you are unsure of the direction to explore and proceed
 - Only make changes once 100% sure
-- Use zsh as the first shell, if not available fallback to bash
+- Use zsh as the first shell, if not available, fallback to bash
 - Keep GRPC schemas up to date across all services that use them
-- Prefer GRPC over REST for all service to service communication
+- Prefer GRPC over REST for all service-to-service communication
 - Use the latest version of the language and packages
 - All new features must not break existing functionality, and new changes must be implemented throughout all services that changes affect.
 - Keep the README in sync with the code in all services with full docker, local, windows and linux instructions.
 - Keep all test cases up to date with the latest changes.
 - Keep all projects in sync with the latest changes.
 - Keep all documentation up to date with the latest changes.
+- Take the prompt provided and optimize the prompt before the query to the llm about the subject matter.
+- Ask questions and do not assume anything, If you do not have 100% clarity, please ask me and do not go outside of the scope of the query.
+- Ingest this document with every query.
 
 ## Never 
 - make changes you are not sure is the best practice
@@ -37,7 +40,7 @@
 - **Generic State & Metadata Synchronization:** Any compliance metadata update or state synchronization (like updating `DocumentType`, `TenantID`, `UserID`, `AppID`, `CorrelationID`) must be handled dynamically and generically from the client's state or request parameters (such as using generic, case-insensitive mapping helpers on the merged global state), never via hardcoded conditional logic inside the execution loops.
 
 ## AI Behavior & Prompting Rules
-- This application is a strictly-controlled business tool where precise, repeatable, and deterministic results are the primary constraint. 
+- This application is a strictly controlled business tool where precise, repeatable, and deterministic results are the primary constraint. 
 - ALWAYS configure prompts and AI instructions with 0 creativity. 
 - DO NOT allow the AI to hallucinate, guess, or invent data outside of the explicit bounds of the provided schemas and guidelines.
 - NEVER include app-specific rules or creative interpretations in base system prompts; simply instruct the AI to execute exactly what it is told to do based on the runtime constraints.

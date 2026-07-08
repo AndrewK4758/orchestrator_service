@@ -11,7 +11,6 @@ import (
 
 	pb "doc_processor/shared_protos"
 	"orchestrator_service/internal/ai_client"
-	"orchestrator_service/internal/callback_client"
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/server"
 )
@@ -49,14 +48,10 @@ func main() {
 	}
 	defer pub.Close()
 
-	// Initialize the callback client manager for dynamic app-agnostic routing
-	cbManager := callback_client.NewClientManager()
-	defer cbManager.Close()
-
 	grpcServer := grpc.NewServer()
 
 	// Register the Orchestrator service and inject dependencies
-	orchestratorServer := server.NewServer(aiClient, pub, cbManager)
+	orchestratorServer := server.NewServer(aiClient, pub)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it

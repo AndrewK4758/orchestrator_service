@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -104,12 +105,20 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		return
 	}
 
-	fmt.Println("\n[test_client] PHASE 1: Submitting Heavy Document Payload...")
-	docRes, err := client.SubmitDocument(context.Background(), &pb.SubmitDocumentRequest{
-		PdfContents: [][]byte{pdfBytes},
-		TenantId:    "test_tenant",
-		AppId:       "test_client",
-	})
+	fmt.Println("\n[test_client] PHASE 1: Submitting Initial State...")
+
+	b64Doc := base64.StdEncoding.EncodeToString(pdfBytes)
+	initialState := fmt.Sprintf(`{"document_b64": "%s"}`, b64Doc)
+
+	jobReq := &pb.SubmitJobRequest{
+		Metadata: map[string]string{
+			"app_id":    "CLI_TEST_APP",
+			"tenant_id": "TEST_TENANT",
+		},
+		InitialStateJson: initialState,
+	}
+
+	docRes, err := client.SubmitJob(context.Background(), jobReq)
 	if err != nil {
 		log.Printf("Failed to submit document: %v", err)
 		return
@@ -118,28 +127,23 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Printf("✅ Document Cached! Job ID: %s\n", jobID)
 
 	// ReAct Loop Simulation
-	fmt.Printf("\n[%s] PHASE 2: Submitting First ReAct Step (Classification)...\n", jobID)
+	fmt.Printf("\n[%s] PHASE 2: Submitting First ReAct Step (Extraction)...\n", jobID)
 
-	schema := `{
-		"type": "object",
-		"properties": {
-			"DocumentType": {"type": "string", "enum": ["Invoice", "Contract", "Other"]},
-			"Summary": {"type": "string"}
-		},
-		"required": ["DocumentType"]
-	}`
-
-	_, err = client.SubmitStep(context.Background(), &pb.SubmitStepRequest{
-		JobId:           jobID,
+	// Submit a generic step using the new generic StepDefinition
+	stepReq := &pb.SubmitStepRequest{
+		ActiveExecution: &pb.ActiveJobExecution{JobId: jobID},
 		CallbackAddress: "localhost:50055",
-		Steps: []*pb.WorkflowStep{
+		Steps: []*pb.StepDefinition{
 			{
-				StepName:           "Classify Document",
-				CustomInstructions: "Classify this document and provide a brief summary.",
-				ExpectedSchema:     schema,
+				StepName:           "Extract Invoice Data",
+				CustomInstructions: "Extract the invoice number and total amount.",
+				ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
+				WritesToStateKey:   "invoice_data",
 			},
 		},
-	})
+	}
+
+	_, err = client.SubmitStep(context.Background(), stepReq)
 	if err != nil {
 		log.Printf("Failed to submit step: %v", err)
 		return
