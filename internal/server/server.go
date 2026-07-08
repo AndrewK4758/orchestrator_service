@@ -9,10 +9,11 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/AndrewK4758/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
+
+	pb "github.com/AndrewK4758/shared_protos"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/grpc"
@@ -104,6 +105,90 @@ func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReq
 	return &pb.SubmitJobResponse{
 		JobId:  jobID,
 		Status: "CACHED",
+	}, nil
+}
+
+func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJobResponse, error) {
+	jobID := req.GetJobId()
+	if jobID == "" {
+		return nil, fmt.Errorf("job_id is required")
+	}
+
+	s.mu.RLock()
+	tracker, exists := s.activeJobs[jobID]
+	s.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("job %s not found in cache", jobID)
+	}
+
+	log.Printf("Received StartJob for JobID: %s, Steps count: %d", jobID, len(req.GetInitialSteps()))
+
+	stepID := "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// Lock the tracker and update active execution
+	tracker.Lock()
+
+	// Check if already active to enforce idempotency
+	if tracker.State.ActiveExecution != nil && tracker.State.ActiveExecution.CurrentStepId != "" {
+		tracker.Unlock()
+		return nil, fmt.Errorf("job %s is already running", jobID)
+	}
+
+	// Create a SubmitStepRequest to pass into the job stream
+	stepReq := &pb.SubmitStepRequest{
+		Context:         tracker.State,
+		Steps:           req.GetInitialSteps(),
+		CallbackAddress: req.GetCallbackAddress(),
+		CompleteJob:     req.GetCompleteJob(),
+	}
+	tracker.StepReq = stepReq
+
+	if tracker.State.ActiveExecution == nil {
+		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
+	}
+	tracker.State.ActiveExecution.CurrentStepId = stepID
+
+	// Reset step index and action index for a fresh request
+	tracker.State.CurrentStepIndex = 0
+	tracker.State.CurrentActionIndex = 0
+	tracker.State.PendingActions = nil
+	tracker.Unlock()
+
+	// Serialize the wrapper struct that will be passed into the job stream
+	type Payload struct {
+		StateBytes   []byte `json:"state_bytes"`
+		StepReqBytes []byte `json:"step_req_bytes"`
+	}
+
+	stateBytes, err := proto.Marshal(tracker.State)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize state: %v", err)
+	}
+	stepReqBytes, err := proto.Marshal(stepReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize step request: %v", err)
+	}
+
+	p := Payload{
+		StateBytes:   stateBytes,
+		StepReqBytes: stepReqBytes,
+	}
+	payloadBytes, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize payload: %v", err)
+	}
+
+	err = s.pub.PublishJob(ctx, payloadBytes)
+	if err != nil {
+		log.Printf("ERROR: Failed to publish job to JetStream for JobID %s: %v", jobID, err)
+		return nil, fmt.Errorf("failed to queue job start")
+	}
+
+	return &pb.StartJobResponse{
+		Success:      true,
+		Message:      "Job started",
+		ActiveStepId: stepID,
 	}, nil
 }
 
