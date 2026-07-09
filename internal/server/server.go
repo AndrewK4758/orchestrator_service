@@ -350,7 +350,13 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 		// Fallback 2: Query Client via CallbackAddress
 		if !exists && p.CallbackAddress != "" {
-			conn, err := grpc.NewClient(p.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			maxMsgSizeMb := 100
+			if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+				if parsed, err := strconv.Atoi(envVal); err == nil {
+					maxMsgSizeMb = parsed
+				}
+			}
+			conn, err := grpc.NewClient(p.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 			if err == nil {
 				defer conn.Close()
 				client := pb.NewOrchestratorCallbackServiceClient(conn)
@@ -450,7 +456,13 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 		return
 	}
 
-	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	maxMsgSizeMb := 100
+	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxMsgSizeMb = parsed
+		}
+	}
+	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
 		log.Printf("ERROR: Failed to dial callback address %s: %v", cbAddress, err)
 		if req.CompleteJob || errMsg != "" {

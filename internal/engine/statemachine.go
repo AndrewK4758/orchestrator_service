@@ -451,7 +451,14 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowC
 		addr = "localhost:50054"
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	maxMsgSizeMb := 100
+	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxMsgSizeMb = parsed
+		}
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
 		return "", fmt.Errorf("failed to dial human validation service: %w", err)
 	}

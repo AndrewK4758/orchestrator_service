@@ -8,6 +8,7 @@ import (
 	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"strconv"
 
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
@@ -55,7 +56,15 @@ func main() {
 	if traceabilityAddr == "" {
 		traceabilityAddr = "localhost:50053" // Default for local
 	}
-	traceConn, err := grpc.NewClient(traceabilityAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	maxMsgSizeMb := 100
+	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxMsgSizeMb = parsed
+		}
+	}
+
+	traceConn, err := grpc.NewClient(traceabilityAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
 		log.Fatalf("Failed to connect to Traceability Service: %v", err)
 	}
