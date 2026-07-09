@@ -163,7 +163,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 	return &plan, nil
 }
 
-func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, plan *ActionPlan) (bool, string, error) {
+func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (bool, string, error) {
 	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the proposed plan found in the local Action State for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema)
 
 	actionDef := &pb.ActionDefinition{
@@ -266,7 +266,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 			}
 
 			// 2. Review Phase
-			approved, reviewReason, err := e.reviewPlan(ctx, state, step, plan)
+			approved, reviewReason, err := e.reviewPlan(ctx, state, step)
 			if err != nil {
 				return "", "", lastStepName, lastStepId, err
 			}
