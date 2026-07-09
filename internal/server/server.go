@@ -22,13 +22,13 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-// JobTracker holds the state for a single job
 type JobTracker struct {
-	State     *pb.WorkflowContext
-	FullSteps []*pb.StepDefinition
-	JobGraph  []*pb.JobWorkflowEdge
-	StepReq   *pb.SubmitStepRequest
-	mu        sync.Mutex
+	State           *pb.WorkflowContext
+	FullSteps       []*pb.StepDefinition
+	JobGraph        []*pb.JobWorkflowEdge
+	StepReq         *pb.SubmitStepRequest
+	CallbackAddress string
+	mu              sync.Mutex
 }
 
 func (j *JobTracker) Lock() {
@@ -97,9 +97,10 @@ func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReq
 	log.Printf("Received job, using JobID: %s for Tenant: %s", jobID, tenantID)
 
 	tracker := &JobTracker{
-		State:     workflowCtx,
-		FullSteps: req.Steps,
-		JobGraph:  req.JobGraph,
+		State:           workflowCtx,
+		FullSteps:       req.Steps,
+		JobGraph:        req.JobGraph,
+		CallbackAddress: req.GetCallbackAddress(),
 	}
 
 	s.mu.Lock()
@@ -126,25 +127,27 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 		return nil, fmt.Errorf("job %s not found in cache", jobID)
 	}
 
-	log.Printf("Received StartJob for JobID: %s, Steps count: %d", jobID, len(req.GetInitialSteps()))
+	var stepID string
+	if tracker.State != nil && tracker.State.JobDefinition != nil && tracker.State.JobDefinition.InitialStepId != "" {
+		stepID = tracker.State.JobDefinition.InitialStepId
+	} else if len(tracker.FullSteps) > 0 {
+		stepID = tracker.FullSteps[0].Id
+	} else {
+		stepID = "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
 
-	stepID := "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	log.Printf("Received StartJob for JobID: %s, Initial StepID: %s", jobID, stepID)
 
-	// Lock the tracker and update active execution
 	tracker.Lock()
-
-	// Check if already active to enforce idempotency
 	if tracker.State.ActiveExecution != nil && tracker.State.ActiveExecution.CurrentStepId != "" {
 		tracker.Unlock()
 		return nil, fmt.Errorf("job %s is already running", jobID)
 	}
 
-	// Create a SubmitStepRequest to pass into the job stream
 	stepReq := &pb.SubmitStepRequest{
-		Context:         tracker.State,
-		Steps:           req.GetInitialSteps(),
-		CallbackAddress: req.GetCallbackAddress(),
-		CompleteJob:     req.GetCompleteJob(),
+		JobId:       jobID,
+		StepId:      stepID,
+		CompleteJob: false,
 	}
 	tracker.StepReq = stepReq
 
@@ -152,14 +155,8 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
 	}
 	tracker.State.ActiveExecution.CurrentStepId = stepID
-
-	// Reset step index and action index for a fresh request
-	tracker.State.CurrentStepIndex = 0
-	tracker.State.CurrentActionIndex = 0
-	tracker.State.PendingActions = nil
 	tracker.Unlock()
 
-	// Serialize the wrapper struct that will be passed into the job stream
 	type Payload struct {
 		StateBytes   []byte `json:"state_bytes"`
 		StepReqBytes []byte `json:"step_req_bytes"`
@@ -174,11 +171,7 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 		return nil, fmt.Errorf("failed to serialize step request: %v", err)
 	}
 
-	p := Payload{
-		StateBytes:   stateBytes,
-		StepReqBytes: stepReqBytes,
-	}
-	payloadBytes, err := json.Marshal(p)
+	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes})
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
@@ -197,12 +190,10 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 }
 
 func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepRequest) (*pb.SubmitStepResponse, error) {
-	workflowCtx := req.Context
-	if workflowCtx == nil {
-		return nil, fmt.Errorf("context is required in SubmitStepRequest")
+	jobID := req.GetJobId()
+	if jobID == "" {
+		return nil, fmt.Errorf("job_id is required in SubmitStepRequest")
 	}
-
-	jobID := workflowCtx.JobId
 
 	s.mu.RLock()
 	tracker, exists := s.activeJobs[jobID]
@@ -212,25 +203,21 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 		return nil, fmt.Errorf("job %s not found in cache", jobID)
 	}
 
-	log.Printf("Received SubmitStep for JobID: %s, Steps count: %d", jobID, len(req.GetSteps()))
+	stepID := req.GetStepId()
+	if stepID == "" {
+		return nil, fmt.Errorf("step_id is required in SubmitStepRequest")
+	}
 
-	stepID := "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	log.Printf("Received SubmitStep for JobID: %s, StepID: %s", jobID, stepID)
 
-	// Lock the tracker and update active execution
 	tracker.Lock()
-	tracker.StepReq = req // We store the current step request in the tracker
+	tracker.StepReq = req
 	if tracker.State.ActiveExecution == nil {
 		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
 	}
 	tracker.State.ActiveExecution.CurrentStepId = stepID
-
-	// Reset step index and action index for a fresh request
-	tracker.State.CurrentStepIndex = 0
-	tracker.State.CurrentActionIndex = 0
-	tracker.State.PendingActions = nil
 	tracker.Unlock()
 
-	// Serialize the wrapper struct that will be passed into the job stream
 	type Payload struct {
 		StateBytes   []byte `json:"state_bytes"`
 		StepReqBytes []byte `json:"step_req_bytes"`
@@ -245,18 +232,14 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 		return nil, fmt.Errorf("failed to serialize step request: %v", err)
 	}
 
-	p := Payload{
-		StateBytes:   stateBytes,
-		StepReqBytes: stepReqBytes,
-	}
-	payloadBytes, err := json.Marshal(p)
+	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes})
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
 
 	err = s.pub.PublishJob(ctx, payloadBytes)
 	if err != nil {
-		log.Printf("ERROR: Failed to publish job to JetStream for JobID %s: %v", jobID, err)
+		log.Printf("ERROR: Failed to publish step to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue step")
 	}
 
@@ -267,7 +250,6 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 	}, nil
 }
 
-// handleJobMessage is invoked by the JetStream consumer for each step queued
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
 	type Payload struct {
 		StateBytes   []byte `json:"state_bytes"`
@@ -289,37 +271,59 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		return fmt.Errorf("failed to unmarshal SubmitStepRequest: %w", err)
 	}
 
-	log.Printf("Executing workflow of %d steps for job %s", len(req.Steps), state.JobId)
+	s.mu.RLock()
+	tracker, exists := s.activeJobs[req.JobId]
+	s.mu.RUnlock()
 
-	resultJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, state, req)
+	if !exists {
+		return fmt.Errorf("job %s not found in cache", req.JobId)
+	}
+
+	var activeStep *pb.StepDefinition
+	for _, st := range tracker.FullSteps {
+		if st.Id == req.StepId {
+			activeStep = st
+			break
+		}
+	}
+	if activeStep == nil {
+		return fmt.Errorf("step %s not found in job %s cache", req.StepId, req.JobId)
+	}
+
+	activeStepCopy := proto.Clone(activeStep).(*pb.StepDefinition)
+	if req.CustomInstructions != "" {
+		activeStepCopy.CustomInstructions = req.CustomInstructions
+	}
+	if req.ExpectedSchema != "" {
+		activeStepCopy.ExpectedSchema = req.ExpectedSchema
+	}
+
+	log.Printf("Executing step %s for job %s", activeStepCopy.StepName, state.JobId)
+
+	_, stepOutputJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, state, activeStepCopy)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
 			log.Printf("INFO: Job %s paused for human validation", state.JobId)
-			// Update the cache with the pending state
-			s.mu.RLock()
-			tracker, exists := s.activeJobs[state.JobId]
-			s.mu.RUnlock()
-			if exists {
-				tracker.Lock()
-				tracker.State = state
-				tracker.Unlock()
-			}
+			tracker.Lock()
+			tracker.State = state
+			tracker.Unlock()
 			return nil
 		}
 		log.Printf("ERROR: Workflow execution failed: %v", err)
-		s.fireCallback(state, req, "", err.Error(), lastStepId, lastStepName)
+		s.fireCallback(tracker, state, req, stepOutputJSON, err.Error(), lastStepId, lastStepName)
 		return nil
 	}
 
-	log.Printf("Workflow completed successfully for job %s. Firing callback to %s", state.JobId, req.CallbackAddress)
-	s.fireCallback(state, req, resultJSON, "", lastStepId, lastStepName)
+	log.Printf("Workflow completed successfully for step %s. Firing callback.", activeStep.StepName)
+	s.fireCallback(tracker, state, req, stepOutputJSON, "", lastStepId, lastStepName)
 
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(state *pb.WorkflowContext, req *pb.SubmitStepRequest, resultJSON string, errMsg string, lastStepId string, lastStepName string) {
-	if req.CallbackAddress == "" {
+func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.WorkflowContext, req *pb.SubmitStepRequest, stepOutputJSON string, errMsg string, lastStepId string, lastStepName string) {
+	cbAddress := tracker.CallbackAddress
+	if cbAddress == "" {
 		log.Printf("No callback address provided, skipping callback")
 		if req.CompleteJob {
 			s.mu.Lock()
@@ -330,9 +334,9 @@ func (s *OrchestratorServer) fireCallback(state *pb.WorkflowContext, req *pb.Sub
 		return
 	}
 
-	conn, err := grpc.NewClient(req.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Printf("ERROR: Failed to dial callback address %s: %v", req.CallbackAddress, err)
+		log.Printf("ERROR: Failed to dial callback address %s: %v", cbAddress, err)
 		if req.CompleteJob {
 			s.mu.Lock()
 			delete(s.activeJobs, state.JobId)
@@ -359,11 +363,17 @@ func (s *OrchestratorServer) fireCallback(state *pb.WorkflowContext, req *pb.Sub
 		if state.JobDefinition != nil {
 			jobDefId = state.JobDefinition.Id
 		}
+
+		var stepOutMap map[string]interface{}
+		json.Unmarshal([]byte(stepOutputJSON), &stepOutMap)
+		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
+
 		_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
 			JobId:           state.JobId,
 			JobDefinitionId: jobDefId,
 			CompletedStepId: lastStepId,
 			GlobalState:     state.GlobalState,
+			StepOutput:      stepOutStruct,
 		})
 	}
 
@@ -391,26 +401,24 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	tracker.Lock()
 	stepReq := tracker.StepReq
-	if stepReq == nil || int(tracker.State.CurrentStepIndex) >= len(stepReq.Steps) {
+	if stepReq == nil {
 		tracker.Unlock()
 		return &pb.ResumeJobResponse{Success: false, Message: "No active step to resume"}, nil
 	}
 
-	currentStep := stepReq.Steps[tracker.State.CurrentStepIndex]
-
-	if currentStep.WritesToStateKey != "" && req.GetCorrectedJson() != "" {
-		var parsed interface{}
-		if err := json.Unmarshal([]byte(req.GetCorrectedJson()), &parsed); err == nil {
-			if tracker.State.GlobalState == nil {
-				tracker.State.GlobalState, _ = structpb.NewStruct(make(map[string]interface{}))
-			}
-			m := tracker.State.GlobalState.AsMap()
-			m[currentStep.WritesToStateKey] = parsed
-			newState, _ := structpb.NewStruct(m)
-			tracker.State.GlobalState = newState
+	var currentStep *pb.StepDefinition
+	for _, st := range tracker.FullSteps {
+		if st.Id == stepReq.StepId {
+			currentStep = st
+			break
 		}
 	}
+	if currentStep == nil {
+		tracker.Unlock()
+		return &pb.ResumeJobResponse{Success: false, Message: "Step definition not found in cache"}, nil
+	}
 
+	// Remove arbitrary WriteToStateKey, instead assume GlobalState merge from ReAct loop
 	tracker.State.CurrentActionIndex++
 	tracker.Unlock()
 
@@ -422,7 +430,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		reqCopy := proto.Clone(stepReq).(*pb.SubmitStepRequest)
 		tracker.Unlock()
 
-		resultJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), stateCopy, reqCopy)
+		_, stepOutputJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), stateCopy, currentStep)
 		if err != nil {
 			if errors.Is(err, engine.ErrPendingHumanValidation) {
 				log.Printf("INFO: Job %s paused again for human validation", stateCopy.JobId)
@@ -432,11 +440,11 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 				return
 			}
 			log.Printf("ERROR: Workflow execution failed after resume: %v", err)
-			s.fireCallback(stateCopy, reqCopy, "", err.Error(), lastStepId, lastStepName)
+			s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, err.Error(), lastStepId, lastStepName)
 			return
 		}
 		log.Printf("Workflow completed successfully for job %s after resume. Firing callback.", stateCopy.JobId)
-		s.fireCallback(stateCopy, reqCopy, resultJSON, "", lastStepId, lastStepName)
+		s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, "", lastStepId, lastStepName)
 	}()
 
 	return &pb.ResumeJobResponse{

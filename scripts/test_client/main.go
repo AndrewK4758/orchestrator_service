@@ -27,7 +27,8 @@ func (s *ArtemisCallbackServer) OnStepComplete(ctx context.Context, req *pb.Step
 	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, req.JobId)
 
 	bytes, _ := req.GlobalState.MarshalJSON()
-	fmt.Printf("[%s] Step Succeeded! Global State JSON:\n%s\n", req.JobId, string(bytes))
+	outBytes, _ := req.StepOutput.MarshalJSON()
+	fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", req.JobId, string(outBytes), string(bytes))
 	s.ResultChan <- string(bytes)
 
 	return &pb.StepCompleteResponse{Success: true}, nil
@@ -125,6 +126,16 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 			},
 			GlobalState: initialState,
 		},
+		CallbackAddress: "localhost:50055",
+		Steps: []*pb.StepDefinition{
+			{
+				Id:                 "step_1",
+				StepName:           "Extract Invoice Data",
+				CustomInstructions: "Extract the invoice number and total amount.",
+				ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
+				WritesToStateKey:   "invoice_data",
+			},
+		},
 	}
 
 	docRes, err := client.SubmitJob(context.Background(), jobReq)
@@ -140,18 +151,8 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 
 	// Submit a generic step using the new generic StepDefinition
 	stepReq := &pb.SubmitStepRequest{
-		Context: &pb.WorkflowContext{
-			JobId: jobID,
-		},
-		CallbackAddress: "localhost:50055",
-		Steps: []*pb.StepDefinition{
-			{
-				StepName:           "Extract Invoice Data",
-				CustomInstructions: "Extract the invoice number and total amount.",
-				ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
-				WritesToStateKey:   "invoice_data",
-			},
-		},
+		JobId:  jobID,
+		StepId: "step_1",
 	}
 
 	_, err = client.SubmitStep(context.Background(), stepReq)
