@@ -411,7 +411,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 		}
 
 		// 7. Success! Commit strictly to the Global State via a direct top-level merge.
-		// The client has full control over the schema, so we just merge their exact JSON.
+		// If WritesToStateKey is provided, nest the output safely.
 		if assembledJson != "" {
 			var parsed map[string]interface{}
 			if err := json.Unmarshal([]byte(assembledJson), &parsed); err == nil {
@@ -420,9 +420,14 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				}
 
 				m := state.GlobalState.AsMap()
-				for k, v := range parsed {
-					m[k] = v
+				if step.WritesToStateKey != "" {
+					m[step.WritesToStateKey] = parsed
+				} else {
+					for k, v := range parsed {
+						m[k] = v
+					}
 				}
+
 				newState, _ := structpb.NewStruct(m)
 				state.GlobalState = newState
 			}
