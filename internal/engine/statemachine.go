@@ -9,9 +9,10 @@ import (
 	"os"
 	"time"
 
-	pb "github.com/AndrewK4758/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
+
+	pb "github.com/AndrewK4758/shared_protos"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -114,13 +115,11 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", step.CustomInstructions, step.ExpectedSchema, statePayload)
 	log.Println("DEBUG: [Engine] Planner Prompt:", plannerPrompt)
 
-	plannerSchema := `{"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"actionType":{"type":"string"},"prompt":{"type":"string"},"schema":{"type":"string"}},"required":["actionType","prompt","schema"]}}}}`
-
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Generate Plan",
 		OrchestratorPrimitive: "PLANNING_PRIMITIVE",
 		Prompt:                plannerPrompt,
-		ExpectedOutputSchema:  plannerSchema,
+		ExpectedOutputSchema:  PlannerSchema,
 	}
 
 	log.Println("INFO: [Engine] Sending planning request to AI service...")
@@ -144,13 +143,11 @@ func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step
 	planJson, _ := json.Marshal(plan)
 	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the following proposed plan for a step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nProposed Plan:\n%s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema, string(planJson))
 
-	reviewSchema := `{"type":"object","properties":{"approved":{"type":"boolean"},"reason":{"type":"string"}},"required":["approved","reason"]}`
-
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Review Plan",
 		OrchestratorPrimitive: "REVIEW_PRIMITIVE",
 		Prompt:                reviewPrompt,
-		ExpectedOutputSchema:  reviewSchema,
+		ExpectedOutputSchema:  ReviewSchema,
 	}
 
 	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
@@ -170,16 +167,15 @@ func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step
 }
 
 func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error) {
-	actionStatePayload := "{}"
-	if state.ActionState != nil {
-		actionBytes, _ := state.ActionState.MarshalJSON()
-		actionStatePayload = string(actionBytes)
+	assemblyPrompt := fmt.Sprintf("You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nReturn ONLY the JSON object.", step.CustomInstructions, step.ExpectedSchema)
+
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Assemble Output",
+		OrchestratorPrimitive: "ASSEMBLY_PRIMITIVE",
+		Prompt:                assemblyPrompt,
+		ExpectedOutputSchema:  step.ExpectedSchema,
 	}
-
-	assemblyPrompt := fmt.Sprintf("You are an assembler. Combine the following local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nLocal Action State:\n%s\n\nReturn ONLY the JSON object.", step.CustomInstructions, step.ExpectedSchema, actionStatePayload)
-
-	actionDef := &pb.ActionDefinition{OrchestratorPrimitive: "ASSEMBLY_PRIMITIVE"}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, assemblyPrompt)
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to assemble step output: %w", err)
 	}
@@ -187,10 +183,15 @@ func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowConte
 }
 
 func (e *Engine) validateStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, assembledJson string) (bool, string, error) {
-	validationPrompt := fmt.Sprintf("You are a strict validator. Validate that the assembled output strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nAssembled Output:\n%s\n\nDoes the output satisfy the expected schema? Return a boolean 'valid' and a 'reason'.", step.CustomInstructions, step.ExpectedSchema, assembledJson)
+	validationPrompt := fmt.Sprintf("You are a strict validator. Validate that the assembled output strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nAssembled Output:\n%s\n\nDoes the output satisfy the expected schema?", step.CustomInstructions, step.ExpectedSchema, assembledJson)
 
-	actionDef := &pb.ActionDefinition{OrchestratorPrimitive: "VALIDATION_PRIMITIVE"}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, validationPrompt)
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Validate Output",
+		OrchestratorPrimitive: "VALIDATION_PRIMITIVE",
+		Prompt:                validationPrompt,
+		ExpectedOutputSchema:  ValidationSchema,
+	}
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to validate step: %w", err)
 	}
