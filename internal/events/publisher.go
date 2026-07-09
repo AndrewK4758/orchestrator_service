@@ -112,6 +112,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		AckWait:       30 * time.Minute, // Give AI service up to 30 minutes to process
 		MaxAckPending: maxAckPending,    // Concurrency control: max jobs processing simultaneously per instance
 		FilterSubject: "jobs.incoming",
+		MaxDeliver:    3, // Prevent poison messages from infinite redelivery
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create consumer: %w", err)

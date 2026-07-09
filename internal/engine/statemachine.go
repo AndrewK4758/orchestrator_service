@@ -112,7 +112,12 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		statePayload = string(stateBytes)
 	}
 
-	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", step.CustomInstructions, step.ExpectedSchema, statePayload)
+	systemContext := "system orchestrator"
+	if state.JobDefinition != nil && state.JobDefinition.SystemContext != "" {
+		systemContext = state.JobDefinition.SystemContext
+	}
+
+	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
 	log.Println("DEBUG: [Engine] Planner Prompt:", plannerPrompt)
 
 	actionDef := &pb.ActionDefinition{
