@@ -19,22 +19,26 @@ import (
 
 // ArtemisCallbackServer simulates the Client's webhook/gRPC server
 type ArtemisCallbackServer struct {
-	pb.UnimplementedStepCallbackServiceServer
+	pb.UnimplementedOrchestratorCallbackServiceServer
 	ResultChan chan string
 }
 
 func (s *ArtemisCallbackServer) OnStepComplete(ctx context.Context, req *pb.StepCompleteRequest) (*pb.StepCompleteResponse, error) {
-	fmt.Printf("\n[%s] Received Callback for Job: %s\n", req.StepName, req.JobId)
+	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, req.JobId)
 
-	if req.ErrorMessage != "" {
-		fmt.Printf("[%s] Step Failed! Error: %s\n", req.JobId, req.ErrorMessage)
-		s.ResultChan <- "ERROR: " + req.ErrorMessage
-	} else {
-		fmt.Printf("[%s] Step Succeeded! Result JSON:\n%s\n", req.JobId, req.ResultJson)
-		s.ResultChan <- req.ResultJson
-	}
+	bytes, _ := req.GlobalState.MarshalJSON()
+	fmt.Printf("[%s] Step Succeeded! Global State JSON:\n%s\n", req.JobId, string(bytes))
+	s.ResultChan <- string(bytes)
 
 	return &pb.StepCompleteResponse{Success: true}, nil
+}
+
+func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
+	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.FailedStepId, req.JobId)
+	fmt.Printf("[%s] Step Failed! Error: %s\n", req.JobId, req.ErrorMessage)
+	s.ResultChan <- "ERROR: " + req.ErrorMessage
+
+	return &pb.JobFailedResponse{Success: true}, nil
 }
 
 func main() {
@@ -52,7 +56,7 @@ func main() {
 	artemisServer := &ArtemisCallbackServer{
 		ResultChan: make(chan string, 1),
 	}
-	pb.RegisterStepCallbackServiceServer(grpcServer, artemisServer)
+	pb.RegisterOrchestratorCallbackServiceServer(grpcServer, artemisServer)
 
 	go func() {
 		fmt.Println("🎧 Callback Server listening on :50055")

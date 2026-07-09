@@ -343,18 +343,29 @@ func (s *OrchestratorServer) fireCallback(state *pb.WorkflowContext, req *pb.Sub
 	}
 	defer conn.Close()
 
-	client := pb.NewStepCallbackServiceClient(conn)
+	client := pb.NewOrchestratorCallbackServiceClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
-		JobId:        state.JobId,
-		StepId:       lastStepId,
-		ResultJson:   resultJSON,
-		ErrorMessage: errMsg,
-		StepName:     lastStepName,
-	})
+	if errMsg != "" {
+		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
+			JobId:        state.JobId,
+			FailedStepId: lastStepId,
+			ErrorMessage: errMsg,
+		})
+	} else {
+		jobDefId := ""
+		if state.JobDefinition != nil {
+			jobDefId = state.JobDefinition.Id
+		}
+		_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
+			JobId:           state.JobId,
+			JobDefinitionId: jobDefId,
+			CompletedStepId: lastStepId,
+			GlobalState:     state.GlobalState,
+		})
+	}
 
 	if err != nil {
 		log.Printf("ERROR: Callback failed: %v", err)
