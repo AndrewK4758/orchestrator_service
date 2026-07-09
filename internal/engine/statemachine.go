@@ -110,6 +110,19 @@ func (e *Engine) executeHumanValidationStep(ctx context.Context, state *pb.Workf
 func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (*ActionPlan, error) {
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, step.Id, step.StepName)
 
+	if step.RequireHumanReview {
+		log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Step requires explicit human review. Bypassing AI Planner.", state.JobId, step.Id)
+		return &ActionPlan{
+			Actions: []ActionItem{
+				{
+					ActionType: "PRIMITIVE_HUMAN_STEP",
+					Prompt:     step.CustomInstructions,
+					Schema:     []byte(step.ExpectedSchema),
+				},
+			},
+		}, nil
+	}
+
 	statePayload := "{}"
 	if state.GlobalState != nil {
 		stateBytes, _ := state.GlobalState.MarshalJSON()
@@ -466,6 +479,17 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowC
 
 	client := pb.NewHumanValidationServiceClient(conn)
 
+	jobName := ""
+	if state.JobDefinition != nil {
+		jobName = fmt.Sprintf("%d", state.JobDefinition.Name)
+	}
+
+	globalStateJSON := "{}"
+	if state.GlobalState != nil {
+		bytes, _ := state.GlobalState.MarshalJSON()
+		globalStateJSON = string(bytes)
+	}
+
 	createReq := &pb.CreateTaskRequest{
 		JobId:              state.JobId,
 		StepName:           step.StepName,
@@ -473,6 +497,10 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowC
 		ExpectedSchema:     step.ExpectedSchema,
 		PromptInstructions: step.CustomInstructions,
 		ErrorMessage:       errMsg,
+		GlobalStateJson:    globalStateJSON,
+		JobName:            jobName,
+		StepId:             step.Id,
+		StepContextInput:   step.ContextInput,
 	}
 
 	timeoutSecs := 10
