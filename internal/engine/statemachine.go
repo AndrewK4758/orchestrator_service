@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"orchestrator_service/internal/events"
@@ -134,7 +135,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		systemContext = state.JobDefinition.SystemContext
 	}
 
-	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
+	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.\n\nCRITICAL: Output ONLY valid, raw JSON. Do not wrap the JSON in markdown code blocks (e.g. ```json). Do not include any preamble, explanations, or extra characters.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
 	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s] Planner Prompt: %s\n", state.JobId, step.Id, plannerPrompt)
 
 	actionDef := &pb.ActionDefinition{
@@ -153,14 +154,30 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 	}
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Successfully received plan from AI service.\n", state.JobId, step.Id)
 
+	rawJson := cleanJSON(resp.GetActionResultJson())
+
 	var plan ActionPlan
-	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &plan); err != nil {
+	if err := json.Unmarshal([]byte(rawJson), &plan); err != nil {
 		return nil, fmt.Errorf("failed to parse action plan: %w", err)
 	}
 
-	mergeIntoActionState(state, resp.GetActionResultJson())
+	mergeIntoActionState(state, rawJson)
 
 	return &plan, nil
+}
+
+// cleanJSON removes common markdown wrappers if the AI hallucinated them.
+func cleanJSON(input string) string {
+	cleaned := strings.TrimSpace(input)
+	if strings.HasPrefix(cleaned, "```json") {
+		cleaned = strings.TrimPrefix(cleaned, "```json")
+	} else if strings.HasPrefix(cleaned, "```") {
+		cleaned = strings.TrimPrefix(cleaned, "```")
+	}
+	if strings.HasSuffix(cleaned, "```") {
+		cleaned = strings.TrimSuffix(cleaned, "```")
+	}
+	return strings.TrimSpace(cleaned)
 }
 
 func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (bool, string, error) {
@@ -262,13 +279,23 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 			// 1. Planning Phase
 			plan, err := e.generatePlan(ctx, state, step)
 			if err != nil {
-				return "", "", lastStepName, lastStepId, err
+				log.Printf("WARN: [Engine] [JobID: %s | StepID: %s] Generate plan failed: %v", state.JobId, step.Id, err)
+				if attempt == maxRetries {
+					return "", "", lastStepName, lastStepId, err
+				}
+				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, step.StepName, fmt.Sprintf("Plan generation failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
+				continue
 			}
 
 			// 2. Review Phase
 			approved, reviewReason, err := e.reviewPlan(ctx, state, step)
 			if err != nil {
-				return "", "", lastStepName, lastStepId, err
+				log.Printf("WARN: [Engine] [JobID: %s | StepID: %s] Review plan failed: %v", state.JobId, step.Id, err)
+				if attempt == maxRetries {
+					return "", "", lastStepName, lastStepId, err
+				}
+				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, step.StepName, fmt.Sprintf("Plan review failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
+				continue
 			}
 
 			if !approved {
@@ -455,7 +482,8 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service completed for step %s", state.JobId, req.Id, actionName, req.StepName)
 
-	return resp.GetActionResultJson(), nil
+	rawJson := cleanJSON(resp.GetActionResultJson())
+	return rawJson, nil
 }
 
 func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, failedOutput string, errMsg string) (string, error) {

@@ -408,7 +408,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 	log.Printf("Executing step %s for job %s", activeStepCopy.StepName, state.JobId)
 
-	_, stepOutputJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(ctx, state, activeStepCopy)
+	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(ctx, state, activeStepCopy)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
@@ -419,17 +419,17 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			return nil
 		}
 		log.Printf("ERROR: Workflow execution failed: %v", err)
-		s.fireCallback(tracker, state, req, stepOutputJSON, err.Error(), lastStepId, lastStepName)
+		s.fireCallback(tracker, state, req, stepOutputJSON, err.Error(), lastStepId)
 		return nil
 	}
 
 	log.Printf("Workflow completed successfully for step %s. Firing callback.", activeStep.StepName)
-	s.fireCallback(tracker, state, req, stepOutputJSON, "", lastStepId, lastStepName)
+	s.fireCallback(tracker, state, req, stepOutputJSON, "", lastStepId)
 
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.WorkflowContext, req *pb.SubmitStepRequest, stepOutputJSON string, errMsg string, lastStepId string, lastStepName string) {
+func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.WorkflowContext, req *pb.SubmitStepRequest, stepOutputJSON string, errMsg string, lastStepId string) {
 	cbAddress := tracker.CallbackAddress
 	if cbAddress == "" {
 		log.Printf("No callback address provided, skipping callback")
@@ -541,7 +541,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		reqCopy := proto.Clone(stepReq).(*pb.SubmitStepRequest)
 		tracker.Unlock()
 
-		_, stepOutputJSON, lastStepName, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), stateCopy, currentStep)
+		_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), stateCopy, currentStep)
 		if err != nil {
 			if errors.Is(err, engine.ErrPendingHumanValidation) {
 				log.Printf("INFO: Job %s paused again for human validation", stateCopy.JobId)
@@ -551,11 +551,11 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 				return
 			}
 			log.Printf("ERROR: Workflow execution failed after resume: %v", err)
-			s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, err.Error(), lastStepId, lastStepName)
+			s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, err.Error(), lastStepId)
 			return
 		}
 		log.Printf("Workflow completed successfully for job %s after resume. Firing callback.", stateCopy.JobId)
-		s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, "", lastStepId, lastStepName)
+		s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, "", lastStepId)
 	}()
 
 	return &pb.ResumeJobResponse{
