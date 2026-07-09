@@ -72,7 +72,7 @@ func NewClient(natsURL string) (*Client, error) {
 			// Orphaned message or timeout
 			msg.Ack()
 		}
-	})
+	}, nats.ManualAck())
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("failed to create multiplexed JS subscription: %w", err)
