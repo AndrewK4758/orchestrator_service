@@ -9,8 +9,8 @@ WORKDIR /app
 # we set the Docker build context to the root directory
 COPY shared_protos/ ./shared_protos/
 COPY orchestrator_service/ ./orchestrator_service/
-
 WORKDIR /app/orchestrator_service
+RUN go mod edit -replace github.com/AndrewK4758/shared_protos=../shared_protos
 
 # Download dependencies
 RUN go mod download
