@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto"
 
@@ -14,8 +16,11 @@ import (
 
 // Client wraps the NATS connection to the AI Service.
 type Client struct {
-	nc *nats.Conn
-	js nats.JetStreamContext
+	nc       *nats.Conn
+	js       nats.JetStreamContext
+	clientID string
+	sub      *nats.Subscription
+	pending  sync.Map
 }
 
 // NewClient connects to the NATS server.
@@ -48,14 +53,38 @@ func NewClient(natsURL string) (*Client, error) {
 		}
 	}
 
-	return &Client{
-		nc: nc,
-		js: js,
-	}, nil
+	clientID := uuid.New().String()
+	client := &Client{
+		nc:       nc,
+		js:       js,
+		clientID: clientID,
+	}
+
+	// Create a single multiplexed JetStream subscription for this orchestrator instance
+	subSubject := fmt.Sprintf("ai.response.%s.>", clientID)
+	sub, err := js.Subscribe(subSubject, func(msg *nats.Msg) {
+		replySubj := msg.Subject
+		if ch, ok := client.pending.Load(replySubj); ok {
+			ch.(chan *nats.Msg) <- msg
+		} else {
+			// Orphaned message or timeout
+			msg.Ack()
+		}
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to create multiplexed JS subscription: %w", err)
+	}
+	client.sub = sub
+
+	return client, nil
 }
 
 // Close gracefully closes the NATS connection.
 func (c *Client) Close() error {
+	if c.sub != nil {
+		c.sub.Unsubscribe()
+	}
 	c.nc.Close()
 	return nil
 }
@@ -92,14 +121,13 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 	}
 
 	subject := fmt.Sprintf("ai.action.%s.%s.%s", appID, tenantID, jobID)
-	replySubject := fmt.Sprintf("ai.response.%s.%s.%s.%d", appID, tenantID, jobID, time.Now().UnixNano())
+	// Incorporate the orchestrator clientID so the multiplexed subscriber catches it
+	replySubject := fmt.Sprintf("ai.response.%s.%s.%s.%s.%d", c.clientID, appID, tenantID, jobID, time.Now().UnixNano())
 
-	// Create a synchronous subscription on the JetStream reply subject
-	sub, err := c.js.SubscribeSync(replySubject)
-	if err != nil {
-		return nil, fmt.Errorf("failed to subscribe to reply subject on JetStream: %w", err)
-	}
-	defer sub.Unsubscribe()
+	// Register the channel for the multiplexed reply
+	respCh := make(chan *nats.Msg, 1)
+	c.pending.Store(replySubject, respCh)
+	defer c.pending.Delete(replySubject)
 
 	// Publish to JetStream
 	msg := nats.NewMsg(subject)
@@ -114,14 +142,14 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 	}
 
 	// Wait for response
-	// The AI Service could take a long time to process an LLM prompt. Wait up to 5 minutes.
-	respMsg, err := sub.NextMsgWithContext(ctx)
-	if err != nil {
-		// Fallback to a long timeout if context doesn't have one
-		respMsg, err = sub.NextMsg(5 * time.Minute)
-		if err != nil {
-			return nil, fmt.Errorf("timeout waiting for ai_service reply: %w", err)
-		}
+	var respMsg *nats.Msg
+	select {
+	case msg := <-respCh:
+		respMsg = msg
+	case <-ctx.Done():
+		return nil, fmt.Errorf("timeout or context cancelled waiting for ai_service reply: %w", ctx.Err())
+	case <-time.After(5 * time.Minute):
+		return nil, fmt.Errorf("timeout waiting for ai_service reply (5m fallback)")
 	}
 
 	// Acknowledge the JetStream message
