@@ -496,25 +496,7 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 	}
 
 	if req.CompleteJob || errMsg != "" {
-		s.mu.Lock()
-		delete(s.activeJobs, state.JobId)
-		s.mu.Unlock()
-		log.Printf("INFO: Job %s complete or failed. Teared down cache.", state.JobId)
-
-		if s.traceClient != nil {
-			go func() {
-				status := "COMPLETED"
-				if errMsg != "" {
-					status = "FAILED"
-				}
-				ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancelTrace()
-				_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
-					JobId:  state.JobId,
-					Status: status,
-				})
-			}()
-		}
+		s.handleCallbackError(errMsg, state)
 	}
 }
 
