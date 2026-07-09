@@ -136,12 +136,13 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		return nil, fmt.Errorf("failed to parse action plan: %w", err)
 	}
 
+	mergeIntoActionState(state, resp.GetActionResultJson())
+
 	return &plan, nil
 }
 
 func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, plan *ActionPlan) (bool, string, error) {
-	planJson, _ := json.Marshal(plan)
-	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the following proposed plan for a step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nProposed Plan:\n%s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema, string(planJson))
+	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the proposed plan found in the local Action State for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Review Plan",
@@ -162,6 +163,8 @@ func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step
 	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &result); err != nil {
 		return false, "", fmt.Errorf("failed to parse review result: %w", err)
 	}
+
+	mergeIntoActionState(state, resp.GetActionResultJson())
 
 	return result.Approved, result.Reason, nil
 }
@@ -231,6 +234,11 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 		stepSuccess := false
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// Initialize fresh Local ActionState for isolated execution scope across the step
+			if state.ActionState == nil || len(state.PendingActions) == 0 {
+				state.ActionState, _ = structpb.NewStruct(make(map[string]interface{}))
+			}
+
 			// PLANNING AND REVIEW LOOP
 			if len(state.PendingActions) == 0 {
 				// 1. Planning Phase
@@ -273,9 +281,6 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				}
 				state.PendingActions = pbActions
 				state.CurrentActionIndex = 0
-
-				// Initialize fresh Local ActionState for isolated execution scope
-				state.ActionState, _ = structpb.NewStruct(make(map[string]interface{}))
 			}
 
 			// 4. Execution Phase
@@ -306,11 +311,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 				// The AI handler produces mutated JSON reflecting the new ActionState
 				if resJson != "" {
-					var parsed map[string]interface{}
-					if err := json.Unmarshal([]byte(resJson), &parsed); err == nil {
-						newActionState, _ := structpb.NewStruct(parsed)
-						state.ActionState = newActionState
-					}
+					mergeIntoActionState(state, resJson)
 				}
 
 				e.publishEvent(ctx, state, events.EventActionCompleted, action.Id, "Action Completed", "")
@@ -502,4 +503,26 @@ func (e *Engine) publishEvent(ctx context.Context, state *pb.WorkflowContext, ev
 			ChunkID:       chunkID,
 		})
 	}
+}
+
+func mergeIntoActionState(state *pb.WorkflowContext, jsonStr string) {
+	if jsonStr == "" {
+		return
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		return
+	}
+
+	if state.ActionState == nil {
+		state.ActionState, _ = structpb.NewStruct(parsed)
+		return
+	}
+
+	currentMap := state.ActionState.AsMap()
+	for k, v := range parsed {
+		currentMap[k] = v
+	}
+	newState, _ := structpb.NewStruct(currentMap)
+	state.ActionState = newState
 }
