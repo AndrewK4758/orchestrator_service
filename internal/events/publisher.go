@@ -117,7 +117,14 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		return fmt.Errorf("failed to create consumer: %w", err)
 	}
 
+	log.Printf("DEBUG: Consumer started on stream JOBS, subject jobs.incoming, waiting for messages...")
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		meta, _ := msg.Metadata()
+		if meta != nil {
+			log.Printf("DEBUG: Consumer received a message! Seq: %v", meta.Sequence.Stream)
+		} else {
+			log.Printf("DEBUG: Consumer received a message!")
+		}
 		err := handler(ctx, msg)
 		if err != nil {
 			log.Printf("ERROR: Failed to process job msg: %v", err)

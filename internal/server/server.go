@@ -139,10 +139,8 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 	log.Printf("Received StartJob for JobID: %s, Initial StepID: %s", jobID, stepID)
 
 	tracker.Lock()
-	if tracker.State.ActiveExecution != nil && tracker.State.ActiveExecution.CurrentStepId != "" {
-		tracker.Unlock()
-		return nil, fmt.Errorf("job %s is already running", jobID)
-	}
+	// We don't check CurrentStepId != "" here anymore, because the client might
+	// pre-populate the ActiveExecution state when submitting a new job.
 
 	stepReq := &pb.SubmitStepRequest{
 		JobId:       jobID,
@@ -176,11 +174,13 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
 
+	log.Printf("DEBUG: Publishing payload of size %d to NATS...", len(payloadBytes))
 	err = s.pub.PublishJob(ctx, payloadBytes)
 	if err != nil {
 		log.Printf("ERROR: Failed to publish job to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue job start")
+		return nil, fmt.Errorf("failed to queue job start: %w", err)
 	}
+	log.Printf("DEBUG: Successfully published JobID %s to JetStream!", jobID)
 
 	return &pb.StartJobResponse{
 		Success:      true,
