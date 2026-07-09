@@ -111,13 +111,21 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		statePayload = string(stateBytes)
 	}
 
-	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nInstructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nReturn the actions array.", step.CustomInstructions, step.ExpectedSchema, statePayload)
+	plannerPrompt := fmt.Sprintf("You are an AI planner for a document orchestrator. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", step.CustomInstructions, step.ExpectedSchema, statePayload)
 	log.Println("DEBUG: [Engine] Planner Prompt:", plannerPrompt)
+
+	plannerSchema := `{"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"actionType":{"type":"string"},"prompt":{"type":"string"},"schema":{"type":"string"}},"required":["actionType","prompt","schema"]}}}}`
+
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Generate Plan",
+		OrchestratorPrimitive: "PLANNING_PRIMITIVE",
+		Prompt:                plannerPrompt,
+		ExpectedOutputSchema:  plannerSchema,
+	}
 
 	log.Println("INFO: [Engine] Sending planning request to AI service...")
 
-	actionDef := &pb.ActionDefinition{OrchestratorPrimitive: "PLANNING_PRIMITIVE"}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, plannerPrompt)
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
 	if err != nil {
 		log.Printf("ERROR: [Engine] Failed to generate plan from AI service: %v", err)
 		return nil, fmt.Errorf("failed to generate plan: %w", err)
@@ -134,10 +142,18 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 
 func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, plan *ActionPlan) (bool, string, error) {
 	planJson, _ := json.Marshal(plan)
-	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the following proposed plan for a step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nProposed Plan:\n%s\n\nDoes this plan satisfy the step's goal and schema? Return a boolean 'approved' and a 'reason'.", step.CustomInstructions, step.ExpectedSchema, string(planJson))
+	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the following proposed plan for a step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nProposed Plan:\n%s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema, string(planJson))
 
-	actionDef := &pb.ActionDefinition{OrchestratorPrimitive: "REVIEW_PRIMITIVE"}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, reviewPrompt)
+	reviewSchema := `{"type":"object","properties":{"approved":{"type":"boolean"},"reason":{"type":"string"}},"required":["approved","reason"]}`
+
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Review Plan",
+		OrchestratorPrimitive: "REVIEW_PRIMITIVE",
+		Prompt:                reviewPrompt,
+		ExpectedOutputSchema:  reviewSchema,
+	}
+
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to review plan: %w", err)
 	}
@@ -397,24 +413,6 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 		return "", fmt.Errorf("prompt and schema must be provided for AI step")
 	}
 
-	if req.ContextInput != "" {
-		prompt = fmt.Sprintf("%s\n\n[CONTEXT PROVIDED BY CLIENT]:\n%s\n", prompt, req.ContextInput)
-	}
-
-	statePayload := "{}"
-	if state.GlobalState != nil {
-		stateBytes, _ := state.GlobalState.MarshalJSON()
-		statePayload = string(stateBytes)
-	}
-
-	actionStatePayload := "{}"
-	if state.ActionState != nil {
-		actionBytes, _ := state.ActionState.MarshalJSON()
-		actionStatePayload = string(actionBytes)
-	}
-
-	prompt = fmt.Sprintf("%s\n\n[READ-ONLY GLOBAL STATE]:\n%s\n\n[CURRENT ACTION STATE (Modify this)]: \n%s\n", prompt, statePayload, actionStatePayload)
-
 	log.Println("DEBUG: [Engine] AI Step Prompt:", prompt)
 
 	var currentAction *pb.ActionDefinition
@@ -422,8 +420,10 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 		currentAction = state.PendingActions[state.CurrentActionIndex]
 	}
 
-	// Single AI execution against the generic state payload
-	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, prompt)
+	// The AI service natively extracts the schema and instructions from the ActionDefinition,
+	// and automatically appends the GlobalState and ActionState from the workflowCtx.
+	// We only need to pass the raw context input as the document text.
+	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, req.ContextInput)
 	if err != nil {
 		log.Printf("ERROR: [Engine] AI service failed for step %s: %v", req.StepName, err)
 		return "", fmt.Errorf("failed to process step %s: %w", req.StepName, err)
