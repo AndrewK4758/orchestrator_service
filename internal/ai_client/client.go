@@ -104,6 +104,8 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 	// Publish to JetStream
 	msg := nats.NewMsg(subject)
 	msg.Reply = replySubject
+	msg.Header = make(nats.Header)
+	msg.Header.Set("Reply-Subject", replySubject)
 	msg.Data = reqBytes
 
 	_, err = c.js.PublishMsg(msg)
