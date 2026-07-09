@@ -9,10 +9,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	pb "github.com/AndrewK4758/shared_protos"
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/server"
+
+	pb "github.com/AndrewK4758/shared_protos"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -48,10 +50,22 @@ func main() {
 	}
 	defer pub.Close()
 
+	// Connect to Traceability Service
+	traceabilityAddr := os.Getenv("TRACEABILITY_SERVICE_ADDRESS")
+	if traceabilityAddr == "" {
+		traceabilityAddr = "localhost:50053" // Default for local
+	}
+	traceConn, err := grpc.NewClient(traceabilityAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to Traceability Service: %v", err)
+	}
+	defer traceConn.Close()
+	traceClient := pb.NewTraceabilityQueryClient(traceConn)
+
 	grpcServer := grpc.NewServer()
 
 	// Register the Orchestrator service and inject dependencies
-	orchestratorServer := server.NewServer(aiClient, pub)
+	orchestratorServer := server.NewServer(aiClient, pub, traceClient)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it

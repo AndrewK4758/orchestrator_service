@@ -51,16 +51,43 @@ type OrchestratorServer struct {
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
+
+	traceClient pb.TraceabilityQueryClient
 }
 
-func NewServer(aiClient *ai_client.Client, pub *events.Publisher) *OrchestratorServer {
+func NewServer(aiClient *ai_client.Client, pub *events.Publisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	eng := engine.NewEngine(aiClient, pub)
 
 	srv := &OrchestratorServer{
-		eng:        eng,
-		aiClient:   aiClient,
-		pub:        pub,
-		activeJobs: make(map[string]*JobTracker),
+		eng:         eng,
+		aiClient:    aiClient,
+		pub:         pub,
+		activeJobs:  make(map[string]*JobTracker),
+		traceClient: traceClient,
+	}
+
+	// Load pending jobs from Traceability Service
+	if traceClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resp, err := traceClient.GetPendingJobs(ctx, &pb.GetPendingJobsRequest{})
+		if err != nil {
+			log.Printf("WARNING: Failed to load pending jobs from Traceability: %v", err)
+		} else {
+			loadedCount := 0
+			for _, jobRecord := range resp.Jobs {
+				if jobRecord.OriginalRequest != nil {
+					srv.activeJobs[jobRecord.JobId] = &JobTracker{
+						State:           jobRecord.OriginalRequest.Context,
+						FullSteps:       jobRecord.OriginalRequest.Steps,
+						JobGraph:        jobRecord.OriginalRequest.JobGraph,
+						CallbackAddress: jobRecord.OriginalRequest.CallbackAddress,
+					}
+					loadedCount++
+				}
+			}
+			log.Printf("Successfully loaded %d pending jobs from Traceability.", loadedCount)
+		}
 	}
 
 	err := srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
@@ -108,6 +135,24 @@ func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReq
 	s.mu.Lock()
 	s.activeJobs[jobID] = tracker
 	s.mu.Unlock()
+
+	// Mirror State to Traceability
+	if s.traceClient != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := s.traceClient.SaveJobState(ctx, &pb.SaveJobStateRequest{
+				JobId:           jobID,
+				OriginalRequest: req,
+				Status:          "PENDING",
+			})
+			if err != nil {
+				log.Printf("ERROR: Failed to save job state to Traceability for JobID %s: %v", jobID, err)
+			} else {
+				log.Printf("Saved job state to Traceability for JobID %s", jobID)
+			}
+		}()
+	}
 
 	return &pb.SubmitJobResponse{
 		JobId:  jobID,
@@ -158,8 +203,9 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 	tracker.Unlock()
 
 	type Payload struct {
-		StateBytes   []byte `json:"state_bytes"`
-		StepReqBytes []byte `json:"step_req_bytes"`
+		StateBytes      []byte `json:"state_bytes"`
+		StepReqBytes    []byte `json:"step_req_bytes"`
+		CallbackAddress string `json:"callback_address"`
 	}
 
 	stateBytes, err := proto.Marshal(tracker.State)
@@ -171,7 +217,7 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 		return nil, fmt.Errorf("failed to serialize step request: %v", err)
 	}
 
-	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes})
+	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
@@ -221,8 +267,9 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 	tracker.Unlock()
 
 	type Payload struct {
-		StateBytes   []byte `json:"state_bytes"`
-		StepReqBytes []byte `json:"step_req_bytes"`
+		StateBytes      []byte `json:"state_bytes"`
+		StepReqBytes    []byte `json:"step_req_bytes"`
+		CallbackAddress string `json:"callback_address"`
 	}
 
 	stateBytes, err := proto.Marshal(tracker.State)
@@ -234,7 +281,7 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 		return nil, fmt.Errorf("failed to serialize step request: %v", err)
 	}
 
-	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes})
+	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
@@ -254,8 +301,9 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
 	type Payload struct {
-		StateBytes   []byte `json:"state_bytes"`
-		StepReqBytes []byte `json:"step_req_bytes"`
+		StateBytes      []byte `json:"state_bytes"`
+		StepReqBytes    []byte `json:"step_req_bytes"`
+		CallbackAddress string `json:"callback_address"`
 	}
 
 	var p Payload
@@ -278,7 +326,59 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	s.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("job %s not found in cache", req.JobId)
+		log.Printf("INFO: Job %s not found in cache. Attempting state recovery.", req.JobId)
+
+		// Fallback 1: Query Traceability Service
+		if s.traceClient != nil {
+			ctxTrace, cancelTrace := context.WithTimeout(ctx, 5*time.Second)
+			defer cancelTrace()
+			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{JobId: req.JobId})
+			if err == nil && resp.Found && resp.Job != nil && resp.Job.OriginalRequest != nil {
+				tracker = &JobTracker{
+					State:           resp.Job.OriginalRequest.Context,
+					FullSteps:       resp.Job.OriginalRequest.Steps,
+					JobGraph:        resp.Job.OriginalRequest.JobGraph,
+					CallbackAddress: resp.Job.OriginalRequest.CallbackAddress,
+				}
+				s.mu.Lock()
+				s.activeJobs[req.JobId] = tracker
+				s.mu.Unlock()
+				exists = true
+				log.Printf("INFO: [JobID: %s] Recovered state from Traceability", req.JobId)
+			}
+		}
+
+		// Fallback 2: Query Client via CallbackAddress
+		if !exists && p.CallbackAddress != "" {
+			conn, err := grpc.NewClient(p.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err == nil {
+				defer conn.Close()
+				client := pb.NewOrchestratorCallbackServiceClient(conn)
+				ctxCb, cancelCb := context.WithTimeout(ctx, 5*time.Second)
+				defer cancelCb()
+
+				resp, err := client.GetJobDetails(ctxCb, &pb.GetJobDetailsRequest{JobId: req.JobId})
+				if err == nil && resp.Found && resp.OriginalRequest != nil {
+					tracker = &JobTracker{
+						State:           resp.OriginalRequest.Context,
+						FullSteps:       resp.OriginalRequest.Steps,
+						JobGraph:        resp.OriginalRequest.JobGraph,
+						CallbackAddress: resp.OriginalRequest.CallbackAddress,
+					}
+					s.mu.Lock()
+					s.activeJobs[req.JobId] = tracker
+					s.mu.Unlock()
+					exists = true
+					log.Printf("INFO: [JobID: %s] Recovered state from Client", req.JobId)
+				}
+			}
+		}
+
+		if !exists {
+			log.Printf("CRITICAL: Job %s could not be recovered from Traceability or Client. Dropping message.", req.JobId)
+			msg.Ack()
+			return nil
+		}
 	}
 
 	var activeStep *pb.StepDefinition
@@ -327,11 +427,25 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 	cbAddress := tracker.CallbackAddress
 	if cbAddress == "" {
 		log.Printf("No callback address provided, skipping callback")
-		if req.CompleteJob {
+		if req.CompleteJob || errMsg != "" {
 			s.mu.Lock()
 			delete(s.activeJobs, state.JobId)
 			s.mu.Unlock()
-			log.Printf("INFO: Job %s complete. Teared down cache.", state.JobId)
+			log.Printf("INFO: Job %s complete or failed. Teared down cache.", state.JobId)
+			if s.traceClient != nil {
+				go func() {
+					status := "COMPLETED"
+					if errMsg != "" {
+						status = "FAILED"
+					}
+					ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancelTrace()
+					_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
+						JobId:  state.JobId,
+						Status: status,
+					})
+				}()
+			}
 		}
 		return
 	}
@@ -339,11 +453,25 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("ERROR: Failed to dial callback address %s: %v", cbAddress, err)
-		if req.CompleteJob {
+		if req.CompleteJob || errMsg != "" {
 			s.mu.Lock()
 			delete(s.activeJobs, state.JobId)
 			s.mu.Unlock()
-			log.Printf("INFO: Job %s complete. Teared down cache.", state.JobId)
+			log.Printf("INFO: Job %s complete or failed. Teared down cache.", state.JobId)
+			if s.traceClient != nil {
+				go func() {
+					status := "COMPLETED"
+					if errMsg != "" {
+						status = "FAILED"
+					}
+					ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancelTrace()
+					_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
+						JobId:  state.JobId,
+						Status: status,
+					})
+				}()
+			}
 		}
 		return
 	}
@@ -389,11 +517,26 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 		log.Printf("ERROR: Callback failed: %v", err)
 	}
 
-	if req.CompleteJob {
+	if req.CompleteJob || errMsg != "" {
 		s.mu.Lock()
 		delete(s.activeJobs, state.JobId)
 		s.mu.Unlock()
-		log.Printf("INFO: Job %s complete. Teared down cache.", state.JobId)
+		log.Printf("INFO: Job %s complete or failed. Teared down cache.", state.JobId)
+
+		if s.traceClient != nil {
+			go func() {
+				status := "COMPLETED"
+				if errMsg != "" {
+					status = "FAILED"
+				}
+				ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelTrace()
+				_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
+					JobId:  state.JobId,
+					Status: status,
+				})
+			}()
+		}
 	}
 }
 
