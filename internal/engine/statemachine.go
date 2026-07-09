@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"orchestrator_service/internal/events"
@@ -107,7 +108,7 @@ func (e *Engine) executeHumanValidationStep(ctx context.Context, state *pb.Workf
 }
 
 func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (*ActionPlan, error) {
-	log.Println("INFO: [Engine] Generating plan for step:", step.StepName)
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, step.Id, step.StepName)
 
 	statePayload := "{}"
 	if state.GlobalState != nil {
@@ -121,7 +122,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 	}
 
 	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
-	log.Println("DEBUG: [Engine] Planner Prompt:", plannerPrompt)
+	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s] Planner Prompt: %s\n", state.JobId, step.Id, plannerPrompt)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Generate Plan",
@@ -130,14 +131,14 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		ExpectedOutputSchema:  PlannerSchema,
 	}
 
-	log.Println("INFO: [Engine] Sending planning request to AI service...")
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Sending planning request to AI service...\n", state.JobId, step.Id)
 
 	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
 	if err != nil {
-		log.Printf("ERROR: [Engine] Failed to generate plan from AI service: %v", err)
+		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Failed to generate plan from AI service: %v", state.JobId, step.Id, err)
 		return nil, fmt.Errorf("failed to generate plan: %w", err)
 	}
-	log.Println("INFO: [Engine] Successfully received plan from AI service.")
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Successfully received plan from AI service.\n", state.JobId, step.Id)
 
 	var plan ActionPlan
 	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &plan); err != nil {
@@ -258,7 +259,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 			}
 
 			if !approved {
-				log.Printf("INFO: Plan rejected during Review Phase: %s", reviewReason)
+				log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Plan rejected during Review Phase: %s", state.JobId, step.Id, reviewReason)
 				if attempt == maxRetries {
 					e.publishEvent(ctx, state, events.EventJobStepFailed, step.StepName, "Review rejected plan after retries", reviewReason)
 					taskID, _ := e.triggerHumanValidation(ctx, state, step, "Plan Rejected: "+reviewReason, "Please correct the instructions or schema.")
@@ -354,7 +355,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 		}
 
 		if !valid {
-			log.Printf("INFO: Step Validation Failed: %s", valReason)
+			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Step Validation Failed: %s", state.JobId, step.Id, valReason)
 			if attempt == maxRetries {
 				e.publishEvent(ctx, state, events.EventStepValidationFailed, step.StepName, "Step Validation Failed after retries", valReason)
 				taskID, _ := e.triggerHumanValidation(ctx, state, step, "Validation Failed: "+valReason, "The final output did not match the expected schema.")
@@ -414,30 +415,32 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 }
 
 func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
-	log.Printf("INFO: [Engine] Executing AI step: %s", req.StepName)
+	var currentAction *pb.ActionDefinition
+	var actionName string
+	if state.PendingActions != nil && len(state.PendingActions) > int(state.CurrentActionIndex) {
+		currentAction = state.PendingActions[state.CurrentActionIndex]
+		actionName = currentAction.Name
+	}
+
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s | Action: %s] Executing AI step: %s", state.JobId, req.Id, actionName, req.StepName)
 	prompt := req.CustomInstructions
 
 	if prompt == "" || req.ExpectedSchema == "" {
 		return "", fmt.Errorf("prompt and schema must be provided for AI step")
 	}
 
-	log.Println("DEBUG: [Engine] AI Step Prompt:", prompt)
-
-	var currentAction *pb.ActionDefinition
-	if state.PendingActions != nil && len(state.PendingActions) > int(state.CurrentActionIndex) {
-		currentAction = state.PendingActions[state.CurrentActionIndex]
-	}
+	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s | Action: %s] AI Step Prompt: %s\n", state.JobId, req.Id, actionName, prompt)
 
 	// The AI service natively extracts the schema and instructions from the ActionDefinition,
 	// and automatically appends the GlobalState and ActionState from the workflowCtx.
 	// We only need to pass the raw context input as the document text.
 	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, req.ContextInput)
 	if err != nil {
-		log.Printf("ERROR: [Engine] AI service failed for step %s: %v", req.StepName, err)
+		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service failed for step %s: %v", state.JobId, req.Id, actionName, req.StepName, err)
 		return "", fmt.Errorf("failed to process step %s: %w", req.StepName, err)
 	}
 
-	log.Printf("INFO: [Engine] AI service completed for step %s", req.StepName)
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service completed for step %s", state.JobId, req.Id, actionName, req.StepName)
 
 	return resp.GetActionResultJson(), nil
 }
@@ -465,7 +468,13 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowC
 		ErrorMessage:       errMsg,
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	timeoutSecs := 10
+	if envVal := os.Getenv("GRPC_TIMEOUT_SECONDS"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			timeoutSecs = parsed
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
 	resp, err := client.CreateValidationTask(ctx, createReq)

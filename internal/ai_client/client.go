@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -141,6 +143,13 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 		return nil, fmt.Errorf("failed to publish to JetStream %s: %w", subject, err)
 	}
 
+	timeoutSecs := 300 // 5 minutes default
+	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			timeoutSecs = parsed
+		}
+	}
+
 	// Wait for response
 	var respMsg *nats.Msg
 	select {
@@ -148,8 +157,8 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 		respMsg = msg
 	case <-ctx.Done():
 		return nil, fmt.Errorf("timeout or context cancelled waiting for ai_service reply: %w", ctx.Err())
-	case <-time.After(5 * time.Minute):
-		return nil, fmt.Errorf("timeout waiting for ai_service reply (5m fallback)")
+	case <-time.After(time.Duration(timeoutSecs) * time.Second):
+		return nil, fmt.Errorf("timeout waiting for ai_service reply (%ds fallback)", timeoutSecs)
 	}
 
 	// Acknowledge the JetStream message

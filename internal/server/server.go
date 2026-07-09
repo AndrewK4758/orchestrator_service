@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -349,7 +351,13 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 
 	client := pb.NewOrchestratorCallbackServiceClient(conn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeoutSecs := 10
+	if envVal := os.Getenv("GRPC_TIMEOUT_SECONDS"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			timeoutSecs = parsed
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
 	if errMsg != "" {

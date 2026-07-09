@@ -106,11 +106,18 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
+	ackWaitSecs := 1800 // 30 minutes default
+	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			ackWaitSecs = parsed
+		}
+	}
+
 	cons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
 		Durable:       "orchestrator_jobs_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       30 * time.Minute, // Give AI service up to 30 minutes to process
-		MaxAckPending: maxAckPending,    // Concurrency control: max jobs processing simultaneously per instance
+		AckWait:       time.Duration(ackWaitSecs) * time.Second,
+		MaxAckPending: maxAckPending, // Concurrency control: max jobs processing simultaneously per instance
 		FilterSubject: "jobs.incoming",
 		MaxDeliver:    3, // Prevent poison messages from infinite redelivery
 	})
