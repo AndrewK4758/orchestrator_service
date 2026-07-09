@@ -203,7 +203,6 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 	for int(state.CurrentStepIndex) < len(req.Steps) {
 		step := req.Steps[state.CurrentStepIndex]
-		state.CurrentStep = step
 		lastStepName = step.StepName
 		lastStepId = step.Id
 

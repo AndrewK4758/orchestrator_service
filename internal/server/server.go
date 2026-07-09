@@ -24,9 +24,11 @@ import (
 
 // JobTracker holds the state for a single job
 type JobTracker struct {
-	State   *pb.WorkflowContext
-	StepReq *pb.SubmitStepRequest
-	mu      sync.Mutex
+	State     *pb.WorkflowContext
+	FullSteps []*pb.StepDefinition
+	JobGraph  []*pb.JobWorkflowEdge
+	StepReq   *pb.SubmitStepRequest
+	mu        sync.Mutex
 }
 
 func (j *JobTracker) Lock() {
@@ -95,7 +97,9 @@ func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobReq
 	log.Printf("Received job, using JobID: %s for Tenant: %s", jobID, tenantID)
 
 	tracker := &JobTracker{
-		State: workflowCtx,
+		State:     workflowCtx,
+		FullSteps: req.Steps,
+		JobGraph:  req.JobGraph,
 	}
 
 	s.mu.Lock()

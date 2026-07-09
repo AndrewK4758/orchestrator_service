@@ -3,7 +3,7 @@ module orchestrator_service
 go 1.26.4
 
 require (
-	github.com/AndrewK4758/shared_protos v0.0.0-20260708230548-c7ddf439f3d4
+	github.com/AndrewK4758/shared_protos v0.0.0-20260709011136-f55ddc746c56
 	github.com/joho/godotenv v1.5.1
 	github.com/nats-io/nats.go v1.52.0
 	google.golang.org/grpc v1.81.1
