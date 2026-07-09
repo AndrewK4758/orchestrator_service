@@ -9,7 +9,6 @@ import (
 	"os"
 	"time"
 
-	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -74,15 +73,19 @@ type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 }
 
+type AIClient interface {
+	PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error)
+}
+
 type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error)
 
 type Engine struct {
-	aiClient          *ai_client.Client
+	aiClient          AIClient
 	pub               TracePublisher
 	primitiveHandlers map[string]ActionFunc
 }
 
-func NewEngine(aiClient *ai_client.Client, pub TracePublisher) *Engine {
+func NewEngine(aiClient AIClient, pub TracePublisher) *Engine {
 	e := &Engine{
 		aiClient: aiClient,
 		pub:      pub,
