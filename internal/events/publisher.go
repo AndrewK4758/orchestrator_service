@@ -126,6 +126,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	log.Printf("DEBUG: Consumer started on stream JOBS, subject jobs.incoming, waiting for messages...")
+	sem := make(chan struct{}, maxAckPending)
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		meta, _ := msg.Metadata()
 		if meta != nil {
@@ -133,19 +134,18 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		} else {
 			log.Printf("DEBUG: Consumer received a message!")
 		}
-		err := handler(ctx, msg)
-		if err != nil {
-			log.Printf("ERROR: Failed to process job msg: %v", err)
-			err := msg.Nak()
+
+		sem <- struct{}{}
+		go func(m jetstream.Msg) {
+			defer func() { <-sem }()
+			err := handler(ctx, m)
 			if err != nil {
-				return
+				log.Printf("ERROR: Failed to process job msg: %v", err)
+				_ = m.Nak()
+			} else {
+				_ = m.Ack()
 			}
-		} else {
-			err := msg.Ack()
-			if err != nil {
-				return
-			}
-		}
+		}(msg)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start consuming: %w", err)
