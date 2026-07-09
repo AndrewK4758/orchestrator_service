@@ -31,7 +31,7 @@ const PlannerSchema = `{
         "properties": {
           "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP"] },
           "prompt": { "type": "string" },
-          "schema": { "type": "string" },
+          "schema": { "type": "object" },
           "rules": { "type": "array", "items": { "type": "string" } }
         },
         "required": ["action_type", "prompt", "schema"]
@@ -60,10 +60,10 @@ const ValidationSchema = `{
 }`
 
 type ActionItem struct {
-	ActionType string   `json:"action_type"`
-	Prompt     string   `json:"prompt"`
-	Schema     string   `json:"schema"`
-	Rules      []string `json:"rules"`
+	ActionType string          `json:"action_type"`
+	Prompt     string          `json:"prompt"`
+	Schema     json.RawMessage `json:"schema"`
+	Rules      []string        `json:"rules"`
 }
 
 type ActionPlan struct {
@@ -275,7 +275,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 						Name:                  action.ActionType,
 						OrchestratorPrimitive: action.ActionType,
 						Prompt:                action.Prompt,
-						ExpectedOutputSchema:  action.Schema,
+						ExpectedOutputSchema:  string(action.Schema),
 						Rules:                 action.Rules,
 					})
 				}
