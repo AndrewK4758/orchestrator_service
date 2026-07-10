@@ -29,6 +29,19 @@ This allows massive PDFs to be processed in a single multi-step workflow without
 
 ---
 
+## ⚡ Queue Tuning & Concurrency (Hardware-Aware)
+
+The Orchestrator uses native **NATS JetStream Backpressure** to strictly throttle throughput based on your hardware capabilities (especially when running local AI like Ollama on a single GPU).
+
+You can tune the throughput via the `.env` file:
+* **`MAX_ACK_PENDING`**: This strictly mathematically limits the maximum number of concurrent jobs the Orchestrator is allowed to pull from NATS.
+  * **Default (5)**: Perfectly tuned for an Ollama node with exactly 12GB VRAM (`OLLAMA_NUM_PARALLEL=4`). This prevents the GPU from being starved or OOM crashing, allowing NATS to queue the remaining backlog gracefully.
+  * **High-Throughput (1000+)**: If you switch to an enterprise cloud AI (like Gemini 1.5 via API), increase this limit to scale Go's highly-concurrent network I/O up to process thousands of simultaneous tasks.
+
+The Orchestrator also utilizes dynamic `msg.InProgress()` heartbeats, allowing lightning-fast crash recovery (`AckWait` = 2 minutes) without prematurely terminating long-running GPU inference tasks!
+
+---
+
 ## 🚀 Running the Orchestrator
 
 Because this service depends on the `ai_service` protobufs, it must be run within the context of the parent `doc_processor_service` directory.

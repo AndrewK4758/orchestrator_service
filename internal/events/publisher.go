@@ -147,7 +147,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	ackWaitSecs := 1800 // 30 minutes default
+	ackWaitSecs := 120 // 2 minutes default
 	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			ackWaitSecs = parsed
@@ -181,15 +181,28 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	log.Printf("DEBUG: Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
-	sem := make(chan struct{}, totalWorkers)
-
 	createProcessMsg := func(consumerName string) func(msg jetstream.Msg) {
 		return func(msg jetstream.Msg) {
 			p.LogQueueSizeAsync("Dequeue", consumerName)
-			sem <- struct{}{}
 			go func(m jetstream.Msg) {
-				defer func() { <-sem }()
+				// Heartbeat goroutine to keep the message alive during long AI processing
+				done := make(chan struct{})
+				go func() {
+					ticker := time.NewTicker(60 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ticker.C:
+							_ = m.InProgress()
+						case <-done:
+							return
+						}
+					}
+				}()
+
 				err := handler(ctx, m)
+				close(done) // Signal heartbeat to stop
+
 				if err != nil {
 					log.Printf("ERROR: Failed to process job msg: %v", err)
 					_ = m.Nak()
