@@ -95,6 +95,7 @@ func (p *Publisher) PublishJob(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to publish job to jetstream: %w", err)
 	}
+	p.LogQueueSizeAsync("Enqueue", "orchestrator_jobs_consumer")
 	return nil
 }
 
@@ -105,7 +106,25 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, payload []byte) erro
 	if err != nil {
 		return fmt.Errorf("failed to publish priority job to jetstream: %w", err)
 	}
+	p.LogQueueSizeAsync("Enqueue", "orchestrator_priority_consumer")
 	return nil
+}
+
+// LogQueueSizeAsync asynchronously queries JetStream for queue depths to provide non-blocking observability.
+func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		cons, err := p.js.Consumer(ctx, "JOBS", consumerName)
+		if err != nil {
+			return
+		}
+		info, err := cons.Info(ctx)
+		if err == nil {
+			log.Printf("METRIC: [%s] Queue: %s | Pending: %d | AckPending: %d | Waiting: %d",
+				action, consumerName, info.NumPending, info.NumAckPending, info.NumWaiting)
+		}
+	}()
 }
 
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
@@ -164,26 +183,29 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	log.Printf("DEBUG: Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
 	sem := make(chan struct{}, totalWorkers)
 
-	processMsg := func(msg jetstream.Msg) {
-		sem <- struct{}{}
-		go func(m jetstream.Msg) {
-			defer func() { <-sem }()
-			err := handler(ctx, m)
-			if err != nil {
-				log.Printf("ERROR: Failed to process job msg: %v", err)
-				_ = m.Nak()
-			} else {
-				_ = m.Ack()
-			}
-		}(msg)
+	createProcessMsg := func(consumerName string) func(msg jetstream.Msg) {
+		return func(msg jetstream.Msg) {
+			p.LogQueueSizeAsync("Dequeue", consumerName)
+			sem <- struct{}{}
+			go func(m jetstream.Msg) {
+				defer func() { <-sem }()
+				err := handler(ctx, m)
+				if err != nil {
+					log.Printf("ERROR: Failed to process job msg: %v", err)
+					_ = m.Nak()
+				} else {
+					_ = m.Ack()
+				}
+			}(msg)
+		}
 	}
 
-	ccPriority, err := priorityCons.Consume(processMsg)
+	ccPriority, err := priorityCons.Consume(createProcessMsg("orchestrator_priority_consumer"))
 	if err != nil {
 		return fmt.Errorf("failed to start consuming priority: %w", err)
 	}
 
-	ccNormal, err := normalCons.Consume(processMsg)
+	ccNormal, err := normalCons.Consume(createProcessMsg("orchestrator_jobs_consumer"))
 	if err != nil {
 		ccPriority.Stop()
 		return fmt.Errorf("failed to start consuming normal: %w", err)
