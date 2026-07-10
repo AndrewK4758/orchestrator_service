@@ -85,6 +85,61 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 	}
 }
 
+func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
+	// Proves that when the Client passes WritesToStateKey, the Go Orchestrator correctly
+	// nests the state output without hardcoding the key check anywhere in business logic.
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "fuzz_namespace_123",
+		GlobalState: statePayload,
+	}
+
+	step := &pb.StepDefinition{
+		Id:                 "step-999",
+		StepName:           "Namespaced Step",
+		CustomInstructions: "Output anything",
+		ExpectedSchema:     `{"type": "object"}`,
+		WritesToStateKey:   "DynamicTargetEntityKey",
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"extracted_data": "success"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Execute") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"result": "success"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Plan") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+		},
+	}
+
+	mockPub := &MockTracePublisher{}
+	eng := NewEngine(mockAI, mockPub)
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	if err != nil {
+		t.Fatalf("Engine failed to process namespaced state: %v", err)
+	}
+
+	// Verify that the global state now contains the nested key
+	m := state.GlobalState.AsMap()
+	val, ok := m["DynamicTargetEntityKey"]
+	if !ok {
+		t.Fatalf("Expected GlobalState to contain 'DynamicTargetEntityKey', but it didn't. Result: %s, State: %v", resultJson, m)
+	}
+
+	nestedMap, ok := val.(map[string]interface{})
+	if !ok || nestedMap["extracted_data"] != "success" {
+		t.Errorf("Expected nested extracted_data == 'success', got: %v", val)
+	}
+}
+
 func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	// 2. Idempotency & Resiliency Checks
 	// Simulate AI service unavailability. Verify the system handles it gracefully.

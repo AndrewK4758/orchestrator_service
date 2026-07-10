@@ -13,7 +13,6 @@ import (
 
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/engine"
-	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
 
@@ -47,7 +46,7 @@ type OrchestratorServer struct {
 
 	eng      *engine.Engine
 	aiClient *ai_client.Client
-	pub      *events.Publisher
+	pub      JobPublisher
 
 	mu         sync.RWMutex
 	activeJobs map[string]*JobTracker
@@ -55,7 +54,14 @@ type OrchestratorServer struct {
 	traceClient pb.TraceabilityQueryClient
 }
 
-func NewServer(aiClient *ai_client.Client, pub *events.Publisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
+type JobPublisher interface {
+	engine.TracePublisher
+	PublishJob(ctx context.Context, payload []byte) error
+	PublishPriorityJob(ctx context.Context, payload []byte) error
+	ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
+}
+
+func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	eng := engine.NewEngine(aiClient, pub)
 
 	srv := &OrchestratorServer{
@@ -286,9 +292,9 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 		return nil, fmt.Errorf("failed to serialize payload: %v", err)
 	}
 
-	err = s.pub.PublishJob(ctx, payloadBytes)
+	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
 	if err != nil {
-		log.Printf("ERROR: Failed to publish step to JetStream for JobID %s: %v", jobID, err)
+		log.Printf("ERROR: Failed to publish priority step to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue step")
 	}
 
@@ -535,28 +541,31 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	log.Printf("INFO: Resuming job %s after human correction", jobID)
 
-	go func() {
-		tracker.Lock()
-		stateCopy := proto.Clone(tracker.State).(*pb.WorkflowContext)
-		reqCopy := proto.Clone(stepReq).(*pb.SubmitStepRequest)
-		tracker.Unlock()
+	type Payload struct {
+		StateBytes      []byte `json:"state_bytes"`
+		StepReqBytes    []byte `json:"step_req_bytes"`
+		CallbackAddress string `json:"callback_address"`
+	}
 
-		_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(context.Background(), stateCopy, currentStep)
-		if err != nil {
-			if errors.Is(err, engine.ErrPendingHumanValidation) {
-				log.Printf("INFO: Job %s paused again for human validation", stateCopy.JobId)
-				tracker.Lock()
-				tracker.State = stateCopy
-				tracker.Unlock()
-				return
-			}
-			log.Printf("ERROR: Workflow execution failed after resume: %v", err)
-			s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, err.Error(), lastStepId)
-			return
-		}
-		log.Printf("Workflow completed successfully for job %s after resume. Firing callback.", stateCopy.JobId)
-		s.fireCallback(tracker, stateCopy, reqCopy, stepOutputJSON, "", lastStepId)
-	}()
+	stateBytes, err := proto.Marshal(tracker.State)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize state: %v", err)
+	}
+	stepReqBytes, err := proto.Marshal(stepReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize step request: %v", err)
+	}
+
+	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize payload: %v", err)
+	}
+
+	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
+	if err != nil {
+		log.Printf("ERROR: Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
+		return nil, fmt.Errorf("failed to queue resumed step")
+	}
 
 	return &pb.ResumeJobResponse{
 		Success: true,

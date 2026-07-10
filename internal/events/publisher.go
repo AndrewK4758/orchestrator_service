@@ -98,11 +98,33 @@ func (p *Publisher) PublishJob(ctx context.Context, payload []byte) error {
 	return nil
 }
 
+// PublishPriorityJob publishes an active job continuation to the priority JetStream subject.
+func (p *Publisher) PublishPriorityJob(ctx context.Context, payload []byte) error {
+	subject := "jobs.priority"
+	_, err := p.js.Publish(ctx, subject, payload)
+	if err != nil {
+		return fmt.Errorf("failed to publish priority job to jetstream: %w", err)
+	}
+	return nil
+}
+
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
-	maxAckPending := 50
+	totalWorkers := 50
+	normalAckPending := 10
+	priorityAckPending := 40
+
 	if envMax := os.Getenv("MAX_ACK_PENDING"); envMax != "" {
 		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
-			maxAckPending = m
+			totalWorkers = m
+			// 80/20 split
+			priorityAckPending = int(float64(totalWorkers) * 0.8)
+			if priorityAckPending == 0 {
+				priorityAckPending = 1
+			}
+			normalAckPending = totalWorkers - priorityAckPending
+			if normalAckPending == 0 {
+				normalAckPending = 1
+			}
 		}
 	}
 
@@ -113,28 +135,36 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	cons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
+	// Priority Consumer
+	priorityCons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
+		Durable:       "orchestrator_priority_consumer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Duration(ackWaitSecs) * time.Second,
+		MaxAckPending: priorityAckPending,
+		FilterSubject: "jobs.priority",
+		MaxDeliver:    3,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create priority consumer: %w", err)
+	}
+
+	// Normal Consumer
+	normalCons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
 		Durable:       "orchestrator_jobs_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       time.Duration(ackWaitSecs) * time.Second,
-		MaxAckPending: maxAckPending, // Concurrency control: max jobs processing simultaneously per instance
+		MaxAckPending: normalAckPending,
 		FilterSubject: "jobs.incoming",
-		MaxDeliver:    3, // Prevent poison messages from infinite redelivery
+		MaxDeliver:    3,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create consumer: %w", err)
+		return fmt.Errorf("failed to create normal consumer: %w", err)
 	}
 
-	log.Printf("DEBUG: Consumer started on stream JOBS, subject jobs.incoming, waiting for messages...")
-	sem := make(chan struct{}, maxAckPending)
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
-		meta, _ := msg.Metadata()
-		if meta != nil {
-			log.Printf("DEBUG: Consumer received a message! Seq: %v", meta.Sequence.Stream)
-		} else {
-			log.Printf("DEBUG: Consumer received a message!")
-		}
+	log.Printf("DEBUG: Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
+	sem := make(chan struct{}, totalWorkers)
 
+	processMsg := func(msg jetstream.Msg) {
 		sem <- struct{}{}
 		go func(m jetstream.Msg) {
 			defer func() { <-sem }()
@@ -146,14 +176,23 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 				_ = m.Ack()
 			}
 		}(msg)
-	})
+	}
+
+	ccPriority, err := priorityCons.Consume(processMsg)
 	if err != nil {
-		return fmt.Errorf("failed to start consuming: %w", err)
+		return fmt.Errorf("failed to start consuming priority: %w", err)
+	}
+
+	ccNormal, err := normalCons.Consume(processMsg)
+	if err != nil {
+		ccPriority.Stop()
+		return fmt.Errorf("failed to start consuming normal: %w", err)
 	}
 
 	go func() {
 		<-ctx.Done()
-		cc.Stop()
+		ccPriority.Stop()
+		ccNormal.Stop()
 	}()
 
 	return nil
