@@ -216,16 +216,16 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 
 	stateBytes, err := proto.Marshal(tracker.State)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %v", err)
+		return nil, fmt.Errorf("failed to serialize state: %w", err)
 	}
 	stepReqBytes, err := proto.Marshal(stepReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %v", err)
+		return nil, fmt.Errorf("failed to serialize step request: %w", err)
 	}
 
 	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %v", err)
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 
 	log.Printf("DEBUG: Publishing payload of size %d to NATS...", len(payloadBytes))
@@ -280,22 +280,22 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 
 	stateBytes, err := proto.Marshal(tracker.State)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %v", err)
+		return nil, fmt.Errorf("failed to serialize state: %w", err)
 	}
 	stepReqBytes, err := proto.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %v", err)
+		return nil, fmt.Errorf("failed to serialize step request: %w", err)
 	}
 
 	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %v", err)
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 
 	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
 	if err != nil {
 		log.Printf("ERROR: Failed to publish priority step to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue step")
+		return nil, fmt.Errorf("failed to queue step: %w", err)
 	}
 
 	return &pb.SubmitStepResponse{
@@ -549,22 +549,22 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	stateBytes, err := proto.Marshal(tracker.State)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %v", err)
+		return nil, fmt.Errorf("failed to serialize state: %w", err)
 	}
 	stepReqBytes, err := proto.Marshal(stepReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %v", err)
+		return nil, fmt.Errorf("failed to serialize step request: %w", err)
 	}
 
 	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %v", err)
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 
 	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
 	if err != nil {
 		log.Printf("ERROR: Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue resumed step")
+		return nil, fmt.Errorf("failed to queue resumed step: %w", err)
 	}
 
 	return &pb.ResumeJobResponse{
