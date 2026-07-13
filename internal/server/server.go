@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"orchestrator_service/internal/ai_client"
+	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/engine"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -62,7 +63,12 @@ type JobPublisher interface {
 }
 
 func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
-	eng := engine.NewEngine(aiClient, pub)
+	cacheClient, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
+	if err != nil {
+		log.Printf("Warning: failed to connect to cache service, cache will be disabled: %v", err)
+	}
+
+	eng := engine.NewEngine(aiClient, cacheClient, pub)
 
 	srv := &OrchestratorServer{
 		eng:         eng,
@@ -96,7 +102,7 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 		}
 	}
 
-	err := srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
+	err = srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
 	if err != nil {
 		log.Printf("ERROR: Failed to start job consumer: %v", err)
 	}

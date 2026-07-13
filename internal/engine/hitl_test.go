@@ -9,7 +9,7 @@ import (
 
 func TestGeneratePlan_RequireHumanReview(t *testing.T) {
 	// 4. Comprehensive Coverage: Unit test for Human in the Loop bypass
-	eng := NewEngine(nil, nil)
+	eng := NewEngine(nil, nil, nil)
 
 	state := &pb.WorkflowContext{JobId: "hitl_job"}
 	step := &pb.StepDefinition{

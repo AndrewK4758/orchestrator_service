@@ -25,6 +25,9 @@ If provided, the Orchestrator will:
 2. Fetch the specific parsing schema and rules for the classified document type.
 3. Automatically execute the heavy `PARSE` stage using those dynamic rules without requiring the client to send the PDF again.
 
+## 💾 Semantic Cache Integration
+The Orchestrator natively connects to the `semantic_cache_service` via gRPC. This allows the external client to sequence generic Cache lookups and storage steps natively within its LangGraph workflows by evaluating the `PRIMITIVE_SEMANTIC_CACHE_CHECK` and `PRIMITIVE_SEMANTIC_CACHE_STORE` execution handlers.
+
 This allows massive PDFs to be processed in a single multi-step workflow without bouncing the heavy payload back and forth across the network.
 
 ---
@@ -59,6 +62,7 @@ Ensure the `ai_service` is already running on port 50051. Then run:
 ```bash
 cd /home/ak/projects/doc_processor_service/orchestrator_service
 export AI_SERVICE_ADDRESS=localhost:50051
+export SEMANTIC_CACHE_SERVICE_ADDRESS=localhost:50055
 export DEFAULT_CALLBACK_ADDRESS=localhost:5133
 go run cmd/server/main.go
 ```
@@ -68,6 +72,7 @@ Ensure the `ai_service` is already running on port 50051. Then run:
 ```powershell
 cd \home\ak\projects\doc_processor_service\orchestrator_service
 $env:AI_SERVICE_ADDRESS="localhost:50051"
+$env:SEMANTIC_CACHE_SERVICE_ADDRESS="localhost:50055"
 $env:DEFAULT_CALLBACK_ADDRESS="localhost:5133"
 go run cmd\server\main.go
 ```

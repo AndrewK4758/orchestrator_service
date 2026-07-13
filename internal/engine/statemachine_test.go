@@ -73,7 +73,7 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, mockPub)
+	eng := NewEngine(mockAI, nil, mockPub)
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, mockPub)
+	eng := NewEngine(mockAI, nil, mockPub)
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err != nil {
@@ -164,7 +164,7 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, mockPub)
+	eng := NewEngine(mockAI, nil, mockPub)
 
 	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err == nil {

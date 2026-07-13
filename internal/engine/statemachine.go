@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -30,7 +31,7 @@ const PlannerSchema = `{
       "items": {
         "type": "object",
         "properties": {
-          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP"] },
+          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP", "PRIMITIVE_SEMANTIC_CACHE_CHECK", "PRIMITIVE_SEMANTIC_CACHE_STORE"] },
           "prompt": { "type": "string" },
           "schema": { "type": "object" },
           "rules": { "type": "array", "items": { "type": "string" } }
@@ -83,18 +84,22 @@ type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, step *pb.St
 
 type Engine struct {
 	aiClient          AIClient
+	cacheClient       cache_client.Client
 	pub               TracePublisher
 	primitiveHandlers map[string]ActionFunc
 }
 
-func NewEngine(aiClient AIClient, pub TracePublisher) *Engine {
+func NewEngine(aiClient AIClient, cacheClient cache_client.Client, pub TracePublisher) *Engine {
 	e := &Engine{
-		aiClient: aiClient,
-		pub:      pub,
+		aiClient:    aiClient,
+		cacheClient: cacheClient,
+		pub:         pub,
 	}
 	e.primitiveHandlers = map[string]ActionFunc{
-		"PRIMITIVE_AI_STEP":    e.executeAIStep,
-		"PRIMITIVE_HUMAN_STEP": e.executeHumanValidationStep,
+		"PRIMITIVE_AI_STEP":              e.executeAIStep,
+		"PRIMITIVE_HUMAN_STEP":           e.executeHumanValidationStep,
+		"PRIMITIVE_SEMANTIC_CACHE_CHECK": e.executeSemanticCacheCheck,
+		"PRIMITIVE_SEMANTIC_CACHE_STORE": e.executeSemanticCacheStore,
 	}
 	return e
 }
@@ -489,6 +494,66 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 
 	rawJson := cleanJSON(resp.GetActionResultJson())
 	return rawJson, nil
+}
+
+func (e *Engine) executeSemanticCacheCheck(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Check Step: %s", state.JobId, req.Id, req.StepName)
+
+	if e.cacheClient == nil {
+		return "", fmt.Errorf("cache client is not configured")
+	}
+
+	threshold := float32(0.95)
+	if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
+		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
+			threshold = float32(parsed)
+		}
+	}
+
+	resp, err := e.cacheClient.CheckCache(ctx, req.ContextInput, state.Metadata, threshold)
+	if err != nil {
+		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
+		// Graceful degradation: If cache fails, treat as a cache miss instead of failing the workflow!
+		resp = &pb.CheckCacheResponse{Hit: false}
+	}
+
+	resultMap := map[string]interface{}{
+		"cache_hit":        resp.Hit,
+		"confidence_score": resp.Confidence,
+	}
+	if resp.Hit && resp.ExtractedPayload != "" {
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(resp.ExtractedPayload), &payload); err == nil {
+			resultMap["extracted_payload"] = payload
+		}
+	}
+
+	bytes, _ := json.Marshal(resultMap)
+	return string(bytes), nil
+}
+
+func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Store Step: %s", state.JobId, req.Id, req.StepName)
+
+	if e.cacheClient == nil {
+		return "", fmt.Errorf("cache client is not configured")
+	}
+
+	// We need to fetch the JSON payload to store. We assume it's currently in the GlobalState,
+	// or passed down via some assembled step. For now, we take the entire GlobalState as the cached representation.
+	payload := "{}"
+	if state.GlobalState != nil {
+		bytes, _ := state.GlobalState.MarshalJSON()
+		payload = string(bytes)
+	}
+
+	err := e.cacheClient.StoreExtraction(ctx, req.ContextInput, state.Metadata, payload)
+	if err != nil {
+		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
+		// We don't fail the workflow if caching fails, we gracefully degrade.
+	}
+
+	return "{\"cache_stored\": true}", nil
 }
 
 func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, failedOutput string, errMsg string) (string, error) {
