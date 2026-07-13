@@ -34,7 +34,7 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 
 	// Ensure the Trace Stream exists
 	ctx := context.Background()
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	traceStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     "TRACE_EVENTS",
 		Subjects: []string{"trace.>"},
 	})
@@ -43,12 +43,18 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 	}
 
 	// Ensure the Jobs Stream exists
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	jobsStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     "JOBS",
 		Subjects: []string{"jobs.>"},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create or update jobs stream: %w", err)
+	}
+
+	if os.Getenv("PURGE_QUEUE_ON_STARTUP") == "true" {
+		log.Println("DEVELOPMENT MODE: Purging JOBS and TRACE_EVENTS streams on startup...")
+		_ = jobsStream.Purge(ctx)
+		_ = traceStream.Purge(ctx)
 	}
 
 	return &Publisher{
