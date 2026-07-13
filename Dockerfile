@@ -5,10 +5,8 @@ RUN apk add --no-cache git
 
 WORKDIR /app
 
-# In order to support the local `replace shared_protos` go.mod directive,
-# we set the Docker build context to the root directory
-COPY shared_protos/ ./shared_protos/
-COPY orchestrator_service/ ./orchestrator_service/
+COPY --from=shared_protos . /app/shared_protos
+COPY . /app/orchestrator_service
 WORKDIR /app/orchestrator_service
 RUN go mod edit -replace github.com/AndrewK4758/shared_protos=../shared_protos
 
