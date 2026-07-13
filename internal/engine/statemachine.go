@@ -351,6 +351,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				CustomInstructions: action.Prompt,
 				ExpectedSchema:     action.ExpectedOutputSchema,
 				ContextInput:       step.ContextInput,
+				UseCache:           step.UseCache,
 			}
 
 			resJson, err := handler(ctx, state, actionStep)
