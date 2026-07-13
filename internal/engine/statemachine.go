@@ -140,7 +140,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		systemContext = state.JobDefinition.SystemContext
 	}
 
-	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, output a single PRIMITIVE_AI_STEP with the client's instructions and schema.\n\nCRITICAL: Output ONLY valid, raw JSON. Do not wrap the JSON in markdown code blocks (e.g. ```json). Do not include any preamble, explanations, or extra characters.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
+	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. For a standard extraction, you MUST output this exact sequence of 3 actions to utilize the semantic cache: 1) PRIMITIVE_SEMANTIC_CACHE_CHECK, 2) PRIMITIVE_AI_STEP, 3) PRIMITIVE_SEMANTIC_CACHE_STORE. Provide the client's instructions and schema for all 3 steps.\n\nCRITICAL: Output ONLY valid, raw JSON. Do not wrap the JSON in markdown code blocks (e.g. ```json). Do not include any preamble, explanations, or extra characters.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
 	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s] Planner Prompt: %s\n", state.JobId, step.Id, plannerPrompt)
 
 	actionDef := &pb.ActionDefinition{
@@ -479,6 +479,17 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 		return "", fmt.Errorf("prompt and schema must be provided for AI step")
 	}
 
+	if state.ActionState != nil {
+		actionStateMap := state.ActionState.AsMap()
+		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
+			if payload, ok := actionStateMap["extracted_payload"]; ok {
+				log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.Id)
+				bytes, _ := json.Marshal(payload)
+				return string(bytes), nil
+			}
+		}
+	}
+
 	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s | Action: %s] AI Step Prompt: %s\n", state.JobId, req.Id, actionName, prompt)
 
 	// The AI service natively extracts the schema and instructions from the ActionDefinition,
@@ -503,17 +514,23 @@ func (e *Engine) executeSemanticCacheCheck(ctx context.Context, state *pb.Workfl
 		return "", fmt.Errorf("cache client is not configured")
 	}
 
-	threshold := float32(0.95)
+	threshold := float32(0.99) // Updated per design doc
 	if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
 		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
 			threshold = float32(parsed)
 		}
 	}
 
-	resp, err := e.cacheClient.CheckCache(ctx, req.ContextInput, state.Metadata, threshold)
-	if err != nil {
-		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
-		// Graceful degradation: If cache fails, treat as a cache miss instead of failing the workflow!
+	var resp *pb.CheckCacheResponse
+	if req.UseCache {
+		var err error
+		resp, err = e.cacheClient.CheckCache(ctx, req.ContextInput, state.Metadata, threshold)
+		if err != nil {
+			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
+			// Graceful degradation: If cache fails, treat as a cache miss instead of failing the workflow!
+			resp = &pb.CheckCacheResponse{Hit: false}
+		}
+	} else {
 		resp = &pb.CheckCacheResponse{Hit: false}
 	}
 
@@ -539,6 +556,14 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		return "", fmt.Errorf("cache client is not configured")
 	}
 
+	if state.ActionState != nil {
+		actionStateMap := state.ActionState.AsMap()
+		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
+			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Cache hit was detected previously. Skipping Store.", state.JobId, req.Id)
+			return "{}", nil
+		}
+	}
+
 	// We need to fetch the JSON payload to store. We assume it's currently in the GlobalState,
 	// or passed down via some assembled step. For now, we take the entire GlobalState as the cached representation.
 	payload := "{}"
@@ -547,10 +572,12 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		payload = string(bytes)
 	}
 
-	err := e.cacheClient.StoreExtraction(ctx, req.ContextInput, state.Metadata, payload)
-	if err != nil {
-		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
-		// We don't fail the workflow if caching fails, we gracefully degrade.
+	if req.UseCache {
+		err := e.cacheClient.StoreExtraction(ctx, req.ContextInput, state.Metadata, payload)
+		if err != nil {
+			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
+			// We don't fail the workflow if caching fails, we gracefully degrade.
+		}
 	}
 
 	return "{\"cache_stored\": true}", nil
