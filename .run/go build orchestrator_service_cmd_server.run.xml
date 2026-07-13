@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="go build orchestrator_service/cmd/server" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+    <module name="doc_processor_Service" />
+    <working_directory value="$PROJECT_DIR$/orchestrator_service" />
+    <kind value="PACKAGE" />
+    <package value="orchestrator_service/cmd/server" />
+    <directory value="$PROJECT_DIR$" />
+    <auto_managed_config_id value="$PROJECT_DIR$/orchestrator_service/cmd/server" />
+    <method v="2" />
+  </configuration>
+</component>
