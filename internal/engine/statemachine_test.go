@@ -175,3 +175,123 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 		t.Errorf("Expected error to contain '%v', got: %v", expectedErr, err)
 	}
 }
+
+type MockCacheClient struct {
+	CheckCacheFunc      func(ctx context.Context, text string, metadata map[string]string, threshold float32) (*pb.CheckCacheResponse, error)
+	StoreExtractionFunc func(ctx context.Context, text string, metadata map[string]string, payload string) error
+}
+
+func (m *MockCacheClient) CheckCache(ctx context.Context, text string, metadata map[string]string, threshold float32) (*pb.CheckCacheResponse, error) {
+	if m.CheckCacheFunc != nil {
+		return m.CheckCacheFunc(ctx, text, metadata, threshold)
+	}
+	return &pb.CheckCacheResponse{Hit: false}, nil
+}
+
+func (m *MockCacheClient) StoreExtraction(ctx context.Context, text string, metadata map[string]string, payload string) error {
+	if m.StoreExtractionFunc != nil {
+		return m.StoreExtractionFunc(ctx, text, metadata, payload)
+	}
+	return nil
+}
+
+func TestExecuteWorkflow_SemanticCacheCheck_Hit(t *testing.T) {
+	// Proves that when Cache Check hits, the response is accurately merged into State.
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "cache_hit_job",
+		GlobalState: statePayload,
+	}
+	step := &pb.StepDefinition{
+		Id:                 "step-cache-1",
+		StepName:           "Cache Step",
+		CustomInstructions: "Check cache",
+		ExpectedSchema:     `{"type": "object"}`,
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Plan") {
+				planJSON := `{"actions": [{"action_type": "PRIMITIVE_SEMANTIC_CACHE_CHECK", "prompt": "test", "schema": {}}]}`
+				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"cache_hit": true, "confidence_score": 0.99, "extracted_payload": {"cached": "data"}}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{
+		CheckCacheFunc: func(ctx context.Context, text string, metadata map[string]string, threshold float32) (*pb.CheckCacheResponse, error) {
+			return &pb.CheckCacheResponse{
+				Hit:              true,
+				Confidence:       0.99,
+				ExtractedPayload: `{"cached": "data"}`,
+			}, nil
+		},
+	}
+
+	mockPub := &MockTracePublisher{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	if err != nil {
+		t.Fatalf("Engine failed to process cache hit state: %v", err)
+	}
+
+	if !strings.Contains(resultJson, "cache_hit\":true") && !strings.Contains(resultJson, "cache_hit\": true") {
+		t.Errorf("Expected result JSON to contain cache_hit, got: %s", resultJson)
+	}
+	if !strings.Contains(resultJson, "cached\":\"data") && !strings.Contains(resultJson, "cached\": \"data") {
+		t.Errorf("Expected result JSON to contain cached: data, got: %s", resultJson)
+	}
+}
+
+func TestExecuteWorkflow_SemanticCacheStore_Resiliency(t *testing.T) {
+	// Proves that when Cache Store throws an error (DB down), the Orchestrator degrades gracefully and does NOT fail the job.
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "cache_store_fail_job",
+		GlobalState: statePayload,
+	}
+	step := &pb.StepDefinition{
+		Id:                 "step-cache-store-1",
+		StepName:           "Cache Store Step",
+		CustomInstructions: "Store cache",
+		ExpectedSchema:     `{"type": "object"}`,
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Plan") {
+				planJSON := `{"actions": [{"action_type": "PRIMITIVE_SEMANTIC_CACHE_STORE", "prompt": "test", "schema": {}}]}`
+				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"cache_stored": true}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{
+		StoreExtractionFunc: func(ctx context.Context, text string, metadata map[string]string, payload string) error {
+			return errors.New("cache DB timeout")
+		},
+	}
+
+	mockPub := &MockTracePublisher{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
+
+	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	if err != nil {
+		t.Fatalf("Engine failed the job because of a cache failure, expected graceful degradation! err: %v", err)
+	}
+}
