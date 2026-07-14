@@ -2,12 +2,15 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"strings"
 	"time"
 
@@ -77,7 +80,7 @@ type TracePublisher interface {
 }
 
 type AIClient interface {
-	PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error)
+	PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
 }
 
 type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error)
@@ -87,6 +90,7 @@ type Engine struct {
 	cacheClient       cache_client.Client
 	pub               TracePublisher
 	primitiveHandlers map[string]ActionFunc
+	pendingCacheJobs  sync.Map
 }
 
 func NewEngine(aiClient AIClient, cacheClient cache_client.Client, pub TracePublisher) *Engine {
@@ -129,46 +133,36 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		}, nil
 	}
 
-	statePayload := "{}"
-	if state.GlobalState != nil {
-		stateBytes, _ := state.GlobalState.MarshalJSON()
-		statePayload = string(stateBytes)
+	// Bypass the AI Planner to statically inject the Cache Lifecycle for all steps.
+	// This eliminates a massive bottleneck (5s per step per job) and allows the Orchestrator
+	// to dynamically sequence caching without hitting the LLM API.
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Bypassing AI Planner to statically inject Cache Lifecycle.", state.JobId, step.Id)
+	
+	plan := &ActionPlan{
+		Actions: []ActionItem{
+			{
+				ActionType: "PRIMITIVE_SEMANTIC_CACHE_CHECK",
+				Prompt:     step.CustomInstructions,
+				Schema:     []byte(step.ExpectedSchema),
+			},
+			{
+				ActionType: "PRIMITIVE_AI_STEP",
+				Prompt:     step.CustomInstructions,
+				Schema:     []byte(step.ExpectedSchema),
+			},
+			{
+				ActionType: "PRIMITIVE_SEMANTIC_CACHE_STORE",
+				Prompt:     step.CustomInstructions,
+				Schema:     []byte(step.ExpectedSchema),
+			},
+		},
 	}
-
-	systemContext := "system orchestrator"
-	if state.JobDefinition != nil && state.JobDefinition.SystemContext != "" {
-		systemContext = state.JobDefinition.SystemContext
-	}
-
-	plannerPrompt := fmt.Sprintf("You are an AI planner for a %s. Based on the client instructions and current state, decide the linear sequence of actions to take.\n\nClient Instructions: %s\nTarget Schema: %s\nCurrent State: %s\n\nOutput an actions array. You MUST unconditionally output this exact sequence of 3 actions for every task to utilize the semantic cache lifecycle: 1) PRIMITIVE_SEMANTIC_CACHE_CHECK, 2) PRIMITIVE_AI_STEP, 3) PRIMITIVE_SEMANTIC_CACHE_STORE. Provide the client's instructions and schema for all 3 steps.\n\nCRITICAL: Output ONLY valid, raw JSON. Do not wrap the JSON in markdown code blocks (e.g. ```json). Do not include any preamble, explanations, or extra characters.", systemContext, step.CustomInstructions, step.ExpectedSchema, statePayload)
-	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s] Planner Prompt: %s\n", state.JobId, step.Id, plannerPrompt)
-
-	actionDef := &pb.ActionDefinition{
-		Name:                  "Generate Plan",
-		OrchestratorPrimitive: "PLANNING_PRIMITIVE",
-		Prompt:                plannerPrompt,
-		ExpectedOutputSchema:  PlannerSchema,
-	}
-
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Sending planning request to AI service...\n", state.JobId, step.Id)
-
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
-	if err != nil {
-		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Failed to generate plan from AI service: %v", state.JobId, step.Id, err)
-		return nil, fmt.Errorf("failed to generate plan: %w", err)
-	}
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Successfully received plan from AI service.\n", state.JobId, step.Id)
-
-	rawJson := cleanJSON(resp.GetActionResultJson())
-
-	var plan ActionPlan
-	if err := json.Unmarshal([]byte(rawJson), &plan); err != nil {
-		return nil, fmt.Errorf("failed to parse action plan: %w", err)
-	}
-
-	mergeIntoActionState(state, rawJson)
-
-	return &plan, nil
+	
+	// We still merge the plan into ActionState as if it was returned by the AI, for consistency
+	rawJson, _ := json.Marshal(plan)
+	mergeIntoActionState(state, string(rawJson))
+	
+	return plan, nil
 }
 
 // cleanJSON removes common markdown wrappers if the AI hallucinated them.
@@ -186,31 +180,13 @@ func cleanJSON(input string) string {
 }
 
 func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (bool, string, error) {
-	reviewPrompt := fmt.Sprintf("You are a strict reviewer. Review the proposed plan found in the local Action State for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nDoes this plan satisfy the step's goal and schema?", step.CustomInstructions, step.ExpectedSchema)
-
-	actionDef := &pb.ActionDefinition{
-		Name:                  "Review Plan",
-		OrchestratorPrimitive: "REVIEW_PRIMITIVE",
-		Prompt:                reviewPrompt,
-		ExpectedOutputSchema:  ReviewSchema,
-	}
-
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to review plan: %w", err)
-	}
-
-	var result struct {
-		Approved bool   `json:"approved"`
-		Reason   string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &result); err != nil {
-		return false, "", fmt.Errorf("failed to parse review result: %w", err)
-	}
-
-	mergeIntoActionState(state, resp.GetActionResultJson())
-
-	return result.Approved, result.Reason, nil
+	// Bypass AI review since the plan is statically injected and always valid
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Auto-approving statically injected Cache Lifecycle plan.", state.JobId, step.Id)
+	
+	resultJson := `{"approved": true, "reason": "Static Cache Lifecycle plan auto-approved"}`
+	mergeIntoActionState(state, resultJson)
+	
+	return true, "Static Cache Lifecycle plan auto-approved", nil
 }
 
 func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error) {
@@ -222,7 +198,7 @@ func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowConte
 		Prompt:                assemblyPrompt,
 		ExpectedOutputSchema:  step.ExpectedSchema,
 	}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
 	if err != nil {
 		return "", fmt.Errorf("failed to assemble step output: %w", err)
 	}
@@ -238,7 +214,7 @@ func (e *Engine) validateStepOutput(ctx context.Context, state *pb.WorkflowConte
 		Prompt:                validationPrompt,
 		ExpectedOutputSchema:  ValidationSchema,
 	}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput)
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, "", pb.ModelChoice_MODEL_CHOICE_CLASSIFICATION)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to validate step: %w", err)
 	}
@@ -352,6 +328,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				ExpectedSchema:     action.ExpectedOutputSchema,
 				ContextInput:       step.ContextInput,
 				UseCache:           step.UseCache,
+				CacheKeyInput:      step.CacheKeyInput,
 			}
 
 			resJson, err := handler(ctx, state, actionStep)
@@ -496,7 +473,7 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 	// The AI service natively extracts the schema and instructions from the ActionDefinition,
 	// and automatically appends the GlobalState and ActionState from the workflowCtx.
 	// We only need to pass the raw context input as the document text.
-	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, req.ContextInput)
+	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, req.ContextInput, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
 	if err != nil {
 		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service failed for step %s: %v", state.JobId, req.Id, actionName, req.StepName, err)
 		return "", fmt.Errorf("failed to process step %s: %w", req.StepName, err)
@@ -525,12 +502,47 @@ func (e *Engine) executeSemanticCacheCheck(ctx context.Context, state *pb.Workfl
 	var resp *pb.CheckCacheResponse
 	if req.UseCache {
 		var err error
-		resp, err = e.cacheClient.CheckCache(ctx, req.ContextInput, state.Metadata, threshold)
+		cacheInput := req.ContextInput
+		if req.CacheKeyInput != "" {
+			cacheInput = req.CacheKeyInput
+		}
+
+		hashBytes := sha256.Sum256([]byte(cacheInput))
+		hashKey := hex.EncodeToString(hashBytes[:])
+
+		if ch, loaded := e.pendingCacheJobs.Load(hashKey); loaded {
+			log.Printf("INFO: [Engine] [JobID: %s] CACHE STAMPEDE DELAY! Waiting for identical job to finish inference...", state.JobId)
+			select {
+			case <-ch.(chan struct{}):
+				log.Printf("INFO: [Engine] [JobID: %s] Stampede lock released, proceeding...", state.JobId)
+			case <-time.After(30 * time.Second):
+				log.Printf("WARN: [Engine] [JobID: %s] Stampede delay timeout reached, proceeding...", state.JobId)
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+
+		resp, err = e.cacheClient.CheckCache(ctx, cacheInput, state.Metadata, threshold)
 		if err != nil {
 			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
 			// Graceful degradation: If cache fails, treat as a cache miss instead of failing the workflow!
 			resp = &pb.CheckCacheResponse{Hit: false}
 		}
+
+		if !resp.Hit {
+			ch := make(chan struct{})
+			_, loaded := e.pendingCacheJobs.LoadOrStore(hashKey, ch)
+			if !loaded {
+				// We claimed the lock. Set a safety timeout to clear it just in case AI step crashes.
+				go func() {
+					time.Sleep(60 * time.Second)
+					if ch, loaded := e.pendingCacheJobs.LoadAndDelete(hashKey); loaded {
+						close(ch.(chan struct{}))
+					}
+				}()
+			}
+		}
+
 	} else {
 		resp = &pb.CheckCacheResponse{Hit: false}
 	}
@@ -574,10 +586,27 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 	}
 
 	if req.UseCache {
-		err := e.cacheClient.StoreExtraction(ctx, req.ContextInput, state.Metadata, payload)
+		cacheInput := req.ContextInput
+		if req.CacheKeyInput != "" {
+			cacheInput = req.CacheKeyInput
+		}
+		err := e.cacheClient.StoreExtraction(ctx, cacheInput, state.Metadata, payload)
 		if err != nil {
 			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
 			// We don't fail the workflow if caching fails, we gracefully degrade.
+		}
+	}
+
+	// Clear the stampede lock so waiting jobs can hit the cache!
+	if req.UseCache {
+		cacheInput := req.ContextInput
+		if req.CacheKeyInput != "" {
+			cacheInput = req.CacheKeyInput
+		}
+		hashBytes := sha256.Sum256([]byte(cacheInput))
+		hashKey := hex.EncodeToString(hashBytes[:])
+		if ch, loaded := e.pendingCacheJobs.LoadAndDelete(hashKey); loaded {
+			close(ch.(chan struct{}))
 		}
 	}
 

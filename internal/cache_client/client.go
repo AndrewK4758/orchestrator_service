@@ -82,7 +82,7 @@ func (c *grpcClient) StoreExtraction(ctx context.Context, text string, metadata 
 
 	resp, err := c.client.StoreExtraction(ctx, req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to store extraction in cache service: %w", err)
 	}
 	if !resp.Success {
 		return fmt.Errorf("cache service returned success=false")

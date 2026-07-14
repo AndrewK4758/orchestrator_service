@@ -92,13 +92,13 @@ func (c *Client) Close() error {
 }
 
 // PerformAction publishes a request to the AI service via JetStream and waits for a response on a Core NATS reply subject.
-func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowContext, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string) (*aipb.PerformActionResponse, error) {
+func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowContext, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string, modelChoice aipb.ModelChoice) (*aipb.PerformActionResponse, error) {
 	req := &aipb.PerformActionRequest{
 		InputBytes:    inputBytes,
 		InputText:     inputText,
 		Context:       workflowCtx,
 		CurrentAction: currentAction,
-		ModelChoice:   aipb.ModelChoice_MODEL_CHOICE_LOCAL,
+		ModelChoice:   modelChoice,
 	}
 
 	reqBytes, err := proto.Marshal(req)
@@ -122,7 +122,14 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 		jobID = workflowCtx.JobId
 	}
 
-	subject := fmt.Sprintf("ai.action.%s.%s.%s", appID, tenantID, jobID)
+	modelStr := "UNSPECIFIED"
+	switch req.ModelChoice {
+	case aipb.ModelChoice_MODEL_CHOICE_EXTRACTION:
+		modelStr = "EXTRACTION"
+	case aipb.ModelChoice_MODEL_CHOICE_CLASSIFICATION:
+		modelStr = "CLASSIFICATION"
+	}
+	subject := fmt.Sprintf("ai.action.%s.%s.%s.%s", modelStr, appID, tenantID, jobID)
 	// Incorporate the orchestrator clientID so the multiplexed subscriber catches it
 	replySubject := fmt.Sprintf("ai.response.%s.%s.%s.%s.%d", c.clientID, appID, tenantID, jobID, time.Now().UnixNano())
 

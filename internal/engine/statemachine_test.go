@@ -14,12 +14,12 @@ import (
 )
 
 type MockAIClient struct {
-	PerformActionFunc func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error)
+	PerformActionFunc func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
 }
 
-func (m *MockAIClient) PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+func (m *MockAIClient) PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 	if m.PerformActionFunc != nil {
-		return m.PerformActionFunc(ctx, workflowCtx, currentAction, inputBytes, inputText)
+		return m.PerformActionFunc(ctx, workflowCtx, currentAction, inputBytes, inputText, modelChoice)
 	}
 	return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
 }
@@ -52,10 +52,11 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 		StepName:           "Fuzzed Step",
 		CustomInstructions: "Do nothing but return the JSON",
 		ExpectedSchema:     `{"type": "object"}`,
+		UseCache:           true,
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Plan") {
@@ -73,7 +74,8 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, nil, mockPub)
+	mockCache := &MockCacheClient{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err != nil {
@@ -103,7 +105,7 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Assemble") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"extracted_data": "success"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Validate") {
@@ -120,7 +122,8 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, nil, mockPub)
+	mockCache := &MockCacheClient{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err != nil {
@@ -158,13 +161,14 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	expectedErr := errors.New("ai service unavailable")
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			return nil, expectedErr
 		},
 	}
 
 	mockPub := &MockTracePublisher{}
-	eng := NewEngine(mockAI, nil, mockPub)
+	mockCache := &MockCacheClient{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err == nil {
@@ -210,7 +214,7 @@ func TestExecuteWorkflow_SemanticCacheCheck_Hit(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Plan") {
@@ -266,7 +270,7 @@ func TestExecuteWorkflow_SemanticCacheStore_Resiliency(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Plan") {
