@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pb "github.com/AndrewK4758/shared_protos"
+	"google.golang.org/grpc"
 )
 
 func TestExecuteWorkflow_CacheStampede(t *testing.T) {
@@ -30,12 +31,12 @@ func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 	}
 
 	mockCache := &MockCacheClient{
-		CheckCacheFunc: func(ctx context.Context, text string, metadata map[string]string, threshold float32) (*pb.CheckCacheResponse, error) {
+		CheckCacheFunc: func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
 			// Always return miss for this test to force stampede behavior
 			return &pb.CheckCacheResponse{Hit: false}, nil
 		},
-		StoreExtractionFunc: func(ctx context.Context, text string, metadata map[string]string, payload string) error {
-			return nil
+		StoreExtractionFunc: func(ctx context.Context, req *pb.StoreExtractionRequest, opts ...grpc.CallOption) (*pb.StoreExtractionResponse, error) {
+			return &pb.StoreExtractionResponse{Success: true}, nil
 		},
 	}
 	mockPub := &MockTracePublisher{}

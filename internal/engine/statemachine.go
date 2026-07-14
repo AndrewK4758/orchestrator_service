@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
@@ -76,6 +77,7 @@ type ActionPlan struct {
 
 type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
+	PublishCacheStore(ctx context.Context, data []byte) error
 }
 
 type AIClient interface {
@@ -98,12 +100,12 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 		cacheClient: cacheClient,
 		pub:         pub,
 	}
-	e.primitiveHandlers = map[string]ActionFunc{
-		"PRIMITIVE_AI_STEP":              e.executeAIStep,
-		"PRIMITIVE_HUMAN_STEP":           e.executeHumanValidationStep,
-		"PRIMITIVE_SEMANTIC_CACHE_STORE": e.executeSemanticCacheStore,
-		"PRIMITIVE_ZERO_SHOT_CLASSIFICATION": e.executeZeroShotClassification,
-	}
+	e.primitiveHandlers = make(map[string]ActionFunc)
+	e.primitiveHandlers["PRIMITIVE_AI_STEP"] = e.executeAIStep
+	e.primitiveHandlers["PRIMITIVE_HUMAN_STEP"] = e.executeHumanValidationStep
+	e.primitiveHandlers["PRIMITIVE_ZERO_SHOT_CLASSIFICATION"] = e.executeZeroShotClassification
+	e.primitiveHandlers["PRIMITIVE_SEMANTIC_CACHE_STORE"] = e.executeSemanticCacheStore
+
 	return e
 }
 
@@ -371,6 +373,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				ContextInput:       step.ContextInput,
 				UseCache:           step.UseCache,
 				CacheKeyInput:      step.CacheKeyInput,
+				CacheConfig:        step.CacheConfig,
 			}
 
 			resJson, err := handler(ctx, state, actionStep)
@@ -512,8 +515,8 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Store Step: %s", state.JobId, req.Id, req.StepName)
 
-	if e.cacheClient == nil {
-		return "", fmt.Errorf("cache client is not configured")
+	if e.pub == nil {
+		return "", fmt.Errorf("publisher is not configured")
 	}
 
 	if state.ActionState != nil {
@@ -532,11 +535,22 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		payload = string(bytes)
 	}
 
-	if req.UseCache {
-		cacheInput := req.ContextInput
-		if req.CacheKeyInput != "" {
-			cacheInput = req.CacheKeyInput
+	useCache := req.UseCache
+	cacheInput := req.ContextInput
+	if req.CacheKeyInput != "" {
+		cacheInput = req.CacheKeyInput
+	}
+	collectionName := "default_collection"
+
+	if req.CacheConfig != nil {
+		useCache = req.CacheConfig.UseCache
+		cacheInput = req.CacheConfig.CacheInput
+		if req.CacheConfig.CollectionName != "" {
+			collectionName = req.CacheConfig.CollectionName
 		}
+	}
+
+	if useCache {
 		metadataStruct, _ := structpb.NewStruct(make(map[string]interface{}))
 		// We'd map state.Metadata to structpb.Struct here if needed, but for now just pass empty Struct
 		// or whatever we have. To be perfectly compliant with the new proto:
@@ -545,25 +559,32 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		}
 
 		reqStore := &pb.StoreExtractionRequest{
-			CollectionName:   "default_collection",
+			CollectionName:   collectionName,
 			Text:             cacheInput,
 			Metadata:         metadataStruct,
 			ExtractedPayload: payload,
 		}
 
-		_, err := e.cacheClient.StoreExtraction(ctx, reqStore)
+		correlationID := fmt.Sprintf("%s_%s", state.JobId, req.Id)
+		
+		msg := &pb.CacheStoreMessage{
+			CorrelationId: correlationID,
+			Request:       reqStore,
+		}
+
+		bytes, err := protojson.Marshal(msg)
 		if err != nil {
-			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
-			// We don't fail the workflow if caching fails, we gracefully degrade.
+			log.Printf("ERROR: [Engine] [JobID: %s] Failed to marshal cache store msg: %v", state.JobId, err)
+		} else {
+			err = e.pub.PublishCacheStore(ctx, bytes)
+			if err != nil {
+				log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store publish failed: %v", state.JobId, req.Id, err)
+			}
 		}
 	}
 
-	// Clear the stampede lock so waiting jobs can hit the cache!
-	if req.UseCache {
-		cacheInput := req.ContextInput
-		if req.CacheKeyInput != "" {
-			cacheInput = req.CacheKeyInput
-		}
+	// Clear the stampede lock immediately!
+	if useCache {
 		hashBytes := sha256.Sum256([]byte(cacheInput))
 		hashKey := hex.EncodeToString(hashBytes[:])
 		if ch, loaded := e.pendingCacheJobs.LoadAndDelete(hashKey); loaded {
@@ -726,16 +747,28 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		return "", fmt.Errorf("cache client is not configured")
 	}
 
+	var resp *pb.CheckCacheResponse
+	useCache := req.UseCache
+	cacheInput := req.CacheKeyInput
 	threshold := float32(0.99)
-	if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
+	collectionName := "default_collection"
+
+	if req.CacheConfig != nil {
+		useCache = req.CacheConfig.UseCache
+		cacheInput = req.CacheConfig.CacheInput
+		if req.CacheConfig.Threshold > 0 {
+			threshold = req.CacheConfig.Threshold
+		}
+		if req.CacheConfig.CollectionName != "" {
+			collectionName = req.CacheConfig.CollectionName
+		}
+	} else if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
 		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
 			threshold = float32(parsed)
 		}
 	}
 
-	var resp *pb.CheckCacheResponse
-	if req.UseCache {
-		cacheInput := req.CacheKeyInput
+	if useCache {
 
 		hashBytes := sha256.Sum256([]byte(cacheInput))
 		hashKey := hex.EncodeToString(hashBytes[:])
@@ -757,7 +790,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		}
 		
 		reqCheck := &pb.CheckCacheRequest{
-			CollectionName: "default_collection",
+			CollectionName: collectionName,
 			Text:           cacheInput,
 			Metadata:       metadataStruct,
 			Threshold:      threshold,

@@ -26,9 +26,9 @@ If provided, the Orchestrator will:
 3. Automatically execute the heavy `PARSE` stage using those dynamic rules without requiring the client to send the PDF again.
 
 ## 💾 Semantic Cache Integration
-The Orchestrator natively connects to the `semantic_cache_service` via gRPC. This allows the external client to sequence generic Cache lookups and storage steps natively within its LangGraph workflows by evaluating the `PRIMITIVE_SEMANTIC_CACHE_CHECK` and `PRIMITIVE_SEMANTIC_CACHE_STORE` execution handlers.
-
-This allows massive PDFs to be processed in a single multi-step workflow without bouncing the heavy payload back and forth across the network.
+The Orchestrator interacts with the `semantic_cache_service` using a **Hybrid Architecture** for maximum resilience and throughput:
+1. **Reads (gRPC)**: Cache lookups are evaluated synchronously via gRPC under the `PRIMITIVE_ZERO_SHOT_CLASSIFICATION` execution handler. If a document chunk mathematically matches a prior index, the Orchestrator instantly terminates the AI step and merges the cached JSON payload directly into the client's global state.
+2. **Writes (JetStream)**: Successful AI data extractions are sequenced dynamically via the `PRIMITIVE_SEMANTIC_CACHE_STORE` execution handler. The Orchestrator fires an asynchronous, durable event to the `CACHE_REQUESTS` stream via NATS JetStream and immediately continues processing without waiting for the vector DB to index the payload, completely removing latency bottlenecks and stampedes.
 
 ---
 

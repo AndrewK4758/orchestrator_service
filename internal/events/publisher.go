@@ -116,6 +116,16 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, payload []byte) erro
 	return nil
 }
 
+
+func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
+	subject := "cache.requests.store"
+	_, err := p.js.Publish(ctx, subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish cache store to jetstream: %w", err)
+	}
+	return nil
+}
+
 // LogQueueSizeAsync asynchronously queries JetStream for queue depths to provide non-blocking observability.
 func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
 	go func() {

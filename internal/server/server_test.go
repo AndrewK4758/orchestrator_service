@@ -40,6 +40,10 @@ func (m *MockJobPublisher) ConsumeJobs(ctx context.Context, handler func(ctx con
 	return nil
 }
 
+func (m *MockJobPublisher) PublishCacheStore(ctx context.Context, data []byte) error {
+	return nil
+}
+
 func TestServerRouting(t *testing.T) {
 	tests := []struct {
 		name                string
