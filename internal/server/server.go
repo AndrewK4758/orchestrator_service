@@ -53,6 +53,7 @@ type OrchestratorServer struct {
 	activeJobs map[string]*JobTracker
 
 	traceClient pb.TraceabilityQueryClient
+	cacheClient pb.SemanticCacheServiceClient
 }
 
 type JobPublisher interface {
@@ -63,7 +64,7 @@ type JobPublisher interface {
 }
 
 func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
-	cacheClient, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
+	cacheClient, _, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
 	if err != nil {
 		log.Printf("Warning: failed to connect to cache service, cache will be disabled: %v", err)
 	}
@@ -76,6 +77,7 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 		pub:         pub,
 		activeJobs:  make(map[string]*JobTracker),
 		traceClient: traceClient,
+		cacheClient: cacheClient,
 	}
 
 	// Load pending jobs from Traceability Service
@@ -416,6 +418,29 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	}
 	if req.ExpectedSchema != "" {
 		activeStepCopy.ExpectedSchema = req.ExpectedSchema
+	}
+
+	// ZERO-SHOT CACHE BYPASS
+	if req.CacheConfig != nil && req.CacheConfig.UseCache && s.cacheClient != nil {
+		log.Printf("INFO: [JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", req.JobId, req.StepId, req.CacheConfig.CollectionName)
+		ctxCache, cancelCache := context.WithTimeout(ctx, 10*time.Second)
+		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
+			CollectionName: req.CacheConfig.CollectionName,
+			Text:           req.CacheConfig.CacheInput,
+			Metadata:       req.CacheConfig.Metadata,
+			Threshold:      req.CacheConfig.Threshold,
+		})
+		cancelCache()
+
+		if err != nil {
+			log.Printf("WARN: [JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
+		} else if cacheResp.Hit {
+			log.Printf("SUCCESS: [JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f. Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence)
+			s.fireCallback(tracker, state, req, cacheResp.ExtractedPayload, "", req.StepId)
+			return nil
+		} else {
+			log.Printf("INFO: [JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
+		}
 	}
 
 	log.Printf("Executing step %s for job %s", activeStepCopy.StepName, state.JobId)

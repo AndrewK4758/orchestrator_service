@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -87,13 +86,13 @@ type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, step *pb.St
 
 type Engine struct {
 	aiClient          AIClient
-	cacheClient       cache_client.Client
+	cacheClient       pb.SemanticCacheServiceClient
 	pub               TracePublisher
 	primitiveHandlers map[string]ActionFunc
 	pendingCacheJobs  sync.Map
 }
 
-func NewEngine(aiClient AIClient, cacheClient cache_client.Client, pub TracePublisher) *Engine {
+func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher) *Engine {
 	e := &Engine{
 		aiClient:    aiClient,
 		cacheClient: cacheClient,
@@ -538,7 +537,21 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		if req.CacheKeyInput != "" {
 			cacheInput = req.CacheKeyInput
 		}
-		err := e.cacheClient.StoreExtraction(ctx, cacheInput, state.Metadata, payload)
+		metadataStruct, _ := structpb.NewStruct(make(map[string]interface{}))
+		// We'd map state.Metadata to structpb.Struct here if needed, but for now just pass empty Struct
+		// or whatever we have. To be perfectly compliant with the new proto:
+		for k, v := range state.Metadata {
+			metadataStruct.Fields[k] = structpb.NewStringValue(v)
+		}
+
+		reqStore := &pb.StoreExtractionRequest{
+			CollectionName:   "default_collection",
+			Text:             cacheInput,
+			Metadata:         metadataStruct,
+			ExtractedPayload: payload,
+		}
+
+		_, err := e.cacheClient.StoreExtraction(ctx, reqStore)
 		if err != nil {
 			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store failed: %v", state.JobId, req.Id, err)
 			// We don't fail the workflow if caching fails, we gracefully degrade.
@@ -738,7 +751,19 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		}
 
 		var err error
-		resp, err = e.cacheClient.CheckCache(ctx, cacheInput, state.Metadata, threshold)
+		metadataStruct, _ := structpb.NewStruct(make(map[string]interface{}))
+		for k, v := range state.Metadata {
+			metadataStruct.Fields[k] = structpb.NewStringValue(v)
+		}
+		
+		reqCheck := &pb.CheckCacheRequest{
+			CollectionName: "default_collection",
+			Text:           cacheInput,
+			Metadata:       metadataStruct,
+			Threshold:      threshold,
+		}
+
+		resp, err = e.cacheClient.CheckCache(ctx, reqCheck)
 		if err != nil {
 			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
 			resp = &pb.CheckCacheResponse{Hit: false}
