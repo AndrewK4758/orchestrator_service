@@ -2,8 +2,6 @@ package engine
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -97,7 +95,7 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
+			} else if strings.Contains(currentAction.Name, "Generate Plan") {
 				planJSON := `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`
 				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
@@ -152,7 +150,7 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 				return &pb.PerformActionResponse{ActionResultJson: `{"result": "success"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
+			} else if strings.Contains(currentAction.Name, "Generate Plan") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`}, nil
 			}
 			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
@@ -219,29 +217,31 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 }
 
 
-func TestExecuteWorkflow_SemanticCacheCheck_Hit(t *testing.T) {
-	// Proves that when Cache Check hits, the response is accurately merged into State.
+func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
 	state := &pb.WorkflowContext{
-		JobId:       "cache_hit_job",
+		JobId:       "override_ai_job",
 		GlobalState: statePayload,
 	}
+
 	step := &pb.StepDefinition{
-		Id:                 "step-cache-1",
-		StepName:           "Cache Step",
-		CustomInstructions: "Check cache",
+		Id:                 "step-ai-override",
+		StepName:           "AI Override Step",
+		CustomInstructions: "Run AI directly",
 		ExpectedSchema:     `{"type": "object"}`,
+		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
 	}
 
+	planCalled := false
 	mockAI := &MockAIClient{
 		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			if strings.Contains(currentAction.Name, "Review") {
+			if strings.Contains(currentAction.Name, "Generate Plan") {
+				planCalled = true
+				return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+			} else if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
-				planJSON := `{"actions": [{"action_type": "PRIMITIVE_ZERO_SHOT_CLASSIFICATION", "prompt": "test", "schema": {}}]}`
-				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"cache_hit": true, "confidence_score": 0.99, "extracted_payload": {"cached": "data"}}`}, nil
+				return &pb.PerformActionResponse{ActionResultJson: `{"ai_ran": true}`}, nil
 			} else if strings.Contains(currentAction.Name, "Validate") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
 			}
@@ -249,201 +249,108 @@ func TestExecuteWorkflow_SemanticCacheCheck_Hit(t *testing.T) {
 		},
 	}
 
-	mockCache := &MockCacheClient{
-		CheckCacheFunc: func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
-			return &pb.CheckCacheResponse{
-				Hit:              true,
-				Confidence:       0.99,
-				ExtractedPayload: `{"cached": "data"}`,
-			}, nil
-		},
-	}
-
+	mockCache := &MockCacheClient{}
 	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
 	if err != nil {
-		t.Fatalf("Engine failed to process cache hit state: %v", err)
+		t.Fatalf("Engine failed processing step: %v", err)
 	}
 
-	if !strings.Contains(resultJson, "cache_hit\":true") && !strings.Contains(resultJson, "cache_hit\": true") {
-		t.Errorf("Expected result JSON to contain cache_hit, got: %s", resultJson)
+	if planCalled {
+		t.Fatalf("Expected AI Planner to be completely bypassed, but PerformAction(Plan) was called.")
 	}
-	if !strings.Contains(resultJson, "cached\":\"data") && !strings.Contains(resultJson, "cached\": \"data") {
-		t.Errorf("Expected result JSON to contain cached: data, got: %s", resultJson)
+
+	if !strings.Contains(resultJson, "ai_ran") {
+		t.Errorf("Expected result JSON to contain 'ai_ran', got: %s", resultJson)
 	}
 }
 
-func TestExecuteWorkflow_SemanticCacheStore_Resiliency(t *testing.T) {
-	// Proves that when Cache Store throws an error (JetStream down), the Orchestrator degrades gracefully and does NOT fail the job.
+func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
 	state := &pb.WorkflowContext{
-		JobId:       "cache_store_fail_job",
+		JobId:       "override_human_job",
 		GlobalState: statePayload,
 	}
+
 	step := &pb.StepDefinition{
-		Id:                 "step-cache-store-1",
-		StepName:           "Cache Store Step",
-		CustomInstructions: "Store cache",
+		Id:                 "step-human-override",
+		StepName:           "Human Override Step",
+		CustomInstructions: "Run Human directly",
 		ExpectedSchema:     `{"type": "object"}`,
-		UseCache:           true,
+		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP,
 	}
 
+	planCalled := false
 	mockAI := &MockAIClient{
 		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			if strings.Contains(currentAction.Name, "Review") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
-				planJSON := `{"actions": [{"action_type": "PRIMITIVE_SEMANTIC_CACHE_STORE", "prompt": "test", "schema": {}}]}`
-				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
-			} else if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"cache_stored": true}`}, nil
-			} else if strings.Contains(currentAction.Name, "Validate") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			if strings.Contains(currentAction.Name, "Generate Plan") {
+				planCalled = true
 			}
-			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+			// Just pass dummy responses
+			return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "approved": true, "human_ran": true}`}, nil
 		},
 	}
 
 	mockCache := &MockCacheClient{}
-
-	mockPub := &MockTracePublisher{
-		PublishCacheStoreFunc: func(ctx context.Context, data []byte) error {
-			return errors.New("jetstream timeout")
-		},
-	}
+	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
-
-	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
-	if err != nil {
-		t.Fatalf("Engine failed the job because of a cache publish failure, expected graceful degradation! err: %v", err)
-	}
-	if !strings.Contains(resultJson, "cache_stored") {
-		t.Errorf("Expected result JSON to contain cache_stored, got: %s", resultJson)
-	}
-}
-
-func TestExecuteWorkflow_SemanticCacheStore_FireAndForget(t *testing.T) {
-	// Happy path for Cache Writes. Ensure PublishCacheStore is called and it continues instantly.
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
-	state := &pb.WorkflowContext{
-		JobId:       "cache_store_happy_job",
-		GlobalState: statePayload,
-	}
-	step := &pb.StepDefinition{
-		Id:                 "step-cache-store-2",
-		StepName:           "Cache Store Step Happy",
-		CustomInstructions: "Store cache",
-		ExpectedSchema:     `{"type": "object"}`,
-		UseCache:           true,
-	}
-
-	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			if strings.Contains(currentAction.Name, "Review") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
-				planJSON := `{"actions": [{"action_type": "PRIMITIVE_SEMANTIC_CACHE_STORE", "prompt": "test", "schema": {}}]}`
-				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
-			} else if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"cache_stored": true}`}, nil
-			} else if strings.Contains(currentAction.Name, "Validate") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
-			}
-			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
-		},
-	}
-
-	mockCache := &MockCacheClient{}
-
-	publishCalled := false
-	mockPub := &MockTracePublisher{
-		PublishCacheStoreFunc: func(ctx context.Context, data []byte) error {
-			publishCalled = true
-			return nil
-		},
-	}
-	eng := NewEngine(mockAI, mockCache, mockPub)
-
-	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
-	if err != nil {
-		t.Fatalf("Engine failed the job during cache publish: %v", err)
-	}
-	if !publishCalled {
-		t.Errorf("Expected PublishCacheStore to be called, but it was not")
-	}
-	if !strings.Contains(resultJson, "cache_stored") {
-		t.Errorf("Expected result JSON to contain cache_stored, got: %s", resultJson)
-	}
-}
-
-func TestExecuteWorkflow_StampedeLock_Release(t *testing.T) {
-	// Idempotency / Concurrency validation.
-	// Ensure that the Orchestrator successfully drops the pendingCacheJobs lock exactly after the JetStream publish step.
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
-	state := &pb.WorkflowContext{
-		JobId:       "cache_store_stampede_job",
-		GlobalState: statePayload,
-	}
-	step := &pb.StepDefinition{
-		Id:                 "step-cache-store-3",
-		StepName:           "Cache Store Step Stampede",
-		CustomInstructions: "Store cache",
-		ExpectedSchema:     `{"type": "object"}`,
-		UseCache:           true,
-		CacheKeyInput:      "some_identical_hash_input",
-	}
-
-	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			if strings.Contains(currentAction.Name, "Review") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Plan") {
-				planJSON := `{"actions": [{"action_type": "PRIMITIVE_SEMANTIC_CACHE_STORE", "prompt": "test", "schema": {}}]}`
-				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
-			} else if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"cache_stored": true}`}, nil
-			} else if strings.Contains(currentAction.Name, "Validate") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
-			}
-			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
-		},
-	}
-
-	mockCache := &MockCacheClient{}
-
-	mockPub := &MockTracePublisher{
-		PublishCacheStoreFunc: func(ctx context.Context, data []byte) error {
-			return nil
-		},
-	}
-	eng := NewEngine(mockAI, mockCache, mockPub)
-
-	// Pre-load a lock to simulate another job currently reading/checking
-	// The store should clear it.
-	hashBytes := sha256.Sum256([]byte("some_identical_hash_input"))
-	hashKey := hex.EncodeToString(hashBytes[:])
-	
-	lockCh := make(chan struct{})
-	eng.pendingCacheJobs.Store(hashKey, lockCh)
 
 	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
-	if err != nil {
-		t.Fatalf("Engine failed the job: %v", err)
+	if err == nil {
+		t.Fatalf("Expected Engine to fail processing step with human validation error, got nil")
 	}
 
-	// Lock should be deleted!
-	_, loaded := eng.pendingCacheJobs.Load(hashKey)
-	if loaded {
-		t.Errorf("Expected stampede lock to be released from pendingCacheJobs map, but it was still loaded")
+	if !errors.Is(err, ErrPendingHumanValidation) {
+		t.Fatalf("Expected ErrPendingHumanValidation, got: %v", err)
 	}
 
-	// The channel should also be closed, we can test this by selecting from it.
-	select {
-	case <-lockCh:
-		// Success, channel is closed
-	default:
-		t.Errorf("Expected lock channel to be closed by executeSemanticCacheStore")
+	if planCalled {
+		t.Fatalf("Expected AI Planner to be completely bypassed, but PerformAction(Plan) was called.")
+	}
+}
+
+func TestExecuteWorkflow_LegacyRequireHumanReview(t *testing.T) {
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "legacy_human_job",
+		GlobalState: statePayload,
+	}
+
+	step := &pb.StepDefinition{
+		Id:                 "step-legacy-human",
+		StepName:           "Legacy Human Step",
+		CustomInstructions: "Legacy flag",
+		ExpectedSchema:     `{"type": "object"}`,
+		RequireHumanReview: true, // Legacy flag
+		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
+	}
+
+	planCalled := false
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Generate Plan") {
+				planCalled = true
+			}
+			return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "approved": true, "legacy_human_ran": true}`}, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{}
+	mockPub := &MockTracePublisher{}
+	eng := NewEngine(mockAI, mockCache, mockPub)
+
+	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	if err == nil {
+		t.Fatalf("Expected Engine to fail processing step with human validation error, got nil")
+	}
+
+	if !errors.Is(err, ErrPendingHumanValidation) {
+		t.Fatalf("Expected ErrPendingHumanValidation, got: %v", err)
+	}
+
+	if planCalled {
+		t.Fatalf("Expected AI Planner to be bypassed because RequireHumanReview was true.")
 	}
 }

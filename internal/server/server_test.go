@@ -16,6 +16,7 @@ import (
 type MockJobPublisher struct {
 	PublishJobFunc         func(ctx context.Context, payload []byte) error
 	PublishPriorityJobFunc func(ctx context.Context, payload []byte) error
+	PurgeQueuesFunc        func(ctx context.Context) error
 }
 
 func (m *MockJobPublisher) PublishTrace(ctx context.Context, event events.TraceabilityEvent) error {
@@ -41,6 +42,13 @@ func (m *MockJobPublisher) ConsumeJobs(ctx context.Context, handler func(ctx con
 }
 
 func (m *MockJobPublisher) PublishCacheStore(ctx context.Context, data []byte) error {
+	return nil
+}
+
+func (m *MockJobPublisher) PurgeQueues(ctx context.Context) error {
+	if m.PurgeQueuesFunc != nil {
+		return m.PurgeQueuesFunc(ctx)
+	}
 	return nil
 }
 
@@ -215,5 +223,135 @@ func TestArbitraryStateParsing(t *testing.T) {
 
 	if tracker.State.GlobalState.Fields["fuzzed_key2"].GetNumberValue() != 12345 {
 		t.Fatalf("Arbitrary state was dropped or corrupted!")
+	}
+}
+
+func TestPurgeSystemState(t *testing.T) {
+	pub := &MockJobPublisher{
+		PurgeQueuesFunc: func(ctx context.Context) error {
+			return nil
+		},
+	}
+	srv := NewServer(&ai_client.Client{}, pub, nil)
+
+	// Inject active jobs
+	cancelCalled1 := false
+	cancelCalled2 := false
+	cancelCalled3 := false
+
+	srv.activeJobs["job_artemis_1"] = &JobTracker{
+		State: &pb.WorkflowContext{
+			JobId:    "job_artemis_1",
+			Metadata: map[string]string{"app_id": "Artemis"},
+		},
+		Cancel: func() { cancelCalled1 = true },
+	}
+	srv.activeJobs["job_artemis_2"] = &JobTracker{
+		State: &pb.WorkflowContext{
+			JobId:    "job_artemis_2",
+			Metadata: map[string]string{"app_id": "Artemis"},
+		},
+		Cancel: func() { cancelCalled2 = true },
+	}
+	srv.activeJobs["job_other_1"] = &JobTracker{
+		State: &pb.WorkflowContext{
+			JobId:    "job_other_1",
+			Metadata: map[string]string{"app_id": "OtherApp"},
+		},
+		Cancel: func() { cancelCalled3 = true },
+	}
+
+	// 1. Happy Path: Purge Artemis jobs
+	req := &pb.PurgeSystemStateRequest{
+		AppId:       "Artemis",
+		PurgeQueues: true,
+	}
+	resp, err := srv.PurgeSystemState(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if resp.JobsCancelled != 2 {
+		t.Errorf("Expected 2 jobs cancelled, got %d", resp.JobsCancelled)
+	}
+	if resp.QueuesPurged != 3 {
+		t.Errorf("Expected 3 queues purged, got %d", resp.QueuesPurged)
+	}
+	if !cancelCalled1 || !cancelCalled2 {
+		t.Errorf("Expected Cancel() to be invoked on Artemis jobs")
+	}
+	if cancelCalled3 {
+		t.Errorf("Expected Cancel() NOT to be invoked on OtherApp jobs")
+	}
+
+	// Ensure jobs were removed
+	if _, ok := srv.activeJobs["job_artemis_1"]; ok {
+		t.Errorf("Artemis job 1 was not removed from map")
+	}
+	if _, ok := srv.activeJobs["job_other_1"]; !ok {
+		t.Errorf("OtherApp job 1 was mistakenly removed from map")
+	}
+
+	// 2. Edge Case: Unknown AppId
+	req2 := &pb.PurgeSystemStateRequest{
+		AppId:       "UnknownApp",
+		PurgeQueues: false,
+	}
+	resp2, err := srv.PurgeSystemState(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if resp2.JobsCancelled != 0 {
+		t.Errorf("Expected 0 jobs cancelled for unknown app, got %d", resp2.JobsCancelled)
+	}
+
+	// 3. Validation Error
+	req3 := &pb.PurgeSystemStateRequest{AppId: ""}
+	_, err = srv.PurgeSystemState(context.Background(), req3)
+	if err == nil {
+		t.Errorf("Expected validation error for missing app_id")
+	}
+}
+
+func TestUpdateExecutionAndMarshal(t *testing.T) {
+	srv := &OrchestratorServer{}
+	tracker := &JobTracker{
+		State: &pb.WorkflowContext{
+			JobId: "test_job_123",
+		},
+		CallbackAddress: "http://localhost:5000",
+	}
+
+	stepReq := &pb.SubmitStepRequest{
+		JobId:  "test_job_123",
+		StepId: "step_456",
+	}
+
+	payloadBytes, err := srv.updateExecutionAndMarshal(tracker, stepReq)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if payloadBytes == nil || len(payloadBytes) == 0 {
+		t.Fatalf("Expected non-empty payload")
+	}
+
+	if tracker.State.ActiveExecution == nil {
+		t.Fatalf("ActiveExecution should have been created")
+	}
+	if tracker.State.ActiveExecution.JobId != "test_job_123" {
+		t.Errorf("Expected JobId test_job_123, got %s", tracker.State.ActiveExecution.JobId)
+	}
+	if tracker.State.ActiveExecution.CurrentStepId != "step_456" {
+		t.Errorf("Expected CurrentStepId step_456, got %s", tracker.State.ActiveExecution.CurrentStepId)
+	}
+	if tracker.StepReq != stepReq {
+		t.Errorf("Expected tracker to store the stepReq")
+	}
+
+	// Check if JSON unmarshals
+	payloadStr := string(payloadBytes)
+	if !strings.Contains(payloadStr, "state_bytes") || !strings.Contains(payloadStr, "step_req_bytes") || !strings.Contains(payloadStr, "callback_address") {
+		t.Errorf("Payload missing expected JSON keys: %s", payloadStr)
 	}
 }

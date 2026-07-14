@@ -30,6 +30,7 @@ type JobTracker struct {
 	JobGraph        []*pb.JobWorkflowEdge
 	StepReq         *pb.SubmitStepRequest
 	CallbackAddress string
+	Cancel          context.CancelFunc
 	mu              sync.Mutex
 }
 
@@ -61,6 +62,7 @@ type JobPublisher interface {
 	PublishJob(ctx context.Context, payload []byte) error
 	PublishPriorityJob(ctx context.Context, payload []byte) error
 	ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
+	PurgeQueues(ctx context.Context) error
 }
 
 func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
@@ -199,41 +201,15 @@ func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobReque
 
 	log.Printf("Received StartJob for JobID: %s, Initial StepID: %s", jobID, stepID)
 
-	tracker.Lock()
-	// We don't check CurrentStepId != "" here anymore, because the client might
-	// pre-populate the ActiveExecution state when submitting a new job.
-
 	stepReq := &pb.SubmitStepRequest{
 		JobId:       jobID,
 		StepId:      stepID,
 		CompleteJob: false,
 	}
-	tracker.StepReq = stepReq
 
-	if tracker.State.ActiveExecution == nil {
-		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
-	}
-	tracker.State.ActiveExecution.CurrentStepId = stepID
-	tracker.Unlock()
-
-	type Payload struct {
-		StateBytes      []byte `json:"state_bytes"`
-		StepReqBytes    []byte `json:"step_req_bytes"`
-		CallbackAddress string `json:"callback_address"`
-	}
-
-	stateBytes, err := proto.Marshal(tracker.State)
+	payloadBytes, err := s.updateExecutionAndMarshal(tracker, stepReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %w", err)
-	}
-	stepReqBytes, err := proto.Marshal(stepReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %w", err)
-	}
-
-	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %w", err)
+		return nil, err
 	}
 
 	log.Printf("DEBUG: Publishing payload of size %d to NATS...", len(payloadBytes))
@@ -272,32 +248,9 @@ func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepR
 
 	log.Printf("Received SubmitStep for JobID: %s, StepID: %s", jobID, stepID)
 
-	tracker.Lock()
-	tracker.StepReq = req
-	if tracker.State.ActiveExecution == nil {
-		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: jobID}
-	}
-	tracker.State.ActiveExecution.CurrentStepId = stepID
-	tracker.Unlock()
-
-	type Payload struct {
-		StateBytes      []byte `json:"state_bytes"`
-		StepReqBytes    []byte `json:"step_req_bytes"`
-		CallbackAddress string `json:"callback_address"`
-	}
-
-	stateBytes, err := proto.Marshal(tracker.State)
+	payloadBytes, err := s.updateExecutionAndMarshal(tracker, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %w", err)
-	}
-	stepReqBytes, err := proto.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %w", err)
-	}
-
-	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %w", err)
+		return nil, err
 	}
 
 	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
@@ -338,6 +291,9 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	s.mu.RLock()
 	tracker, exists := s.activeJobs[req.JobId]
 	s.mu.RUnlock()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	if !exists {
 		log.Printf("INFO: Job %s not found in cache. Attempting state recovery.", req.JobId)
@@ -400,6 +356,10 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			return nil
 		}
 	}
+
+	tracker.Lock()
+	tracker.Cancel = cancel
+	tracker.Unlock()
 
 	var activeStep *pb.StepDefinition
 	for _, st := range tracker.FullSteps {
@@ -572,24 +532,9 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	log.Printf("INFO: Resuming job %s after human correction", jobID)
 
-	type Payload struct {
-		StateBytes      []byte `json:"state_bytes"`
-		StepReqBytes    []byte `json:"step_req_bytes"`
-		CallbackAddress string `json:"callback_address"`
-	}
-
-	stateBytes, err := proto.Marshal(tracker.State)
+	payloadBytes, err := s.updateExecutionAndMarshal(tracker, stepReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %w", err)
-	}
-	stepReqBytes, err := proto.Marshal(stepReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %w", err)
-	}
-
-	payloadBytes, err := json.Marshal(Payload{StateBytes: stateBytes, StepReqBytes: stepReqBytes, CallbackAddress: tracker.CallbackAddress})
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %w", err)
+		return nil, err
 	}
 
 	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
@@ -625,4 +570,85 @@ func (s *OrchestratorServer) handleCallbackError(errMsg string, state *pb.Workfl
 		}()
 	}
 	return
+}
+
+func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.PurgeSystemStateRequest) (*pb.PurgeSystemStateResponse, error) {
+	if req.GetAppId() == "" {
+		return nil, fmt.Errorf("app_id is required")
+	}
+
+	log.Printf("INFO: Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetAppId(), req.GetPurgeQueues())
+
+	s.mu.Lock()
+	var jobsToCancel []string
+	for jobID, tracker := range s.activeJobs {
+		if tracker.State != nil && tracker.State.Metadata != nil {
+			if tracker.State.Metadata["app_id"] == req.GetAppId() {
+				jobsToCancel = append(jobsToCancel, jobID)
+				if tracker.Cancel != nil {
+					tracker.Cancel()
+				}
+			}
+		}
+	}
+	// Remove cancelled jobs from tracking
+	for _, jobID := range jobsToCancel {
+		delete(s.activeJobs, jobID)
+	}
+	s.mu.Unlock()
+
+	queuesPurged := 0
+	if req.GetPurgeQueues() {
+		err := s.pub.PurgeQueues(ctx)
+		if err != nil {
+			log.Printf("ERROR: Failed to purge queues: %v", err)
+		} else {
+			queuesPurged = 3 // JOBS, TRACE_EVENTS, CACHE_REQUESTS
+		}
+	}
+
+	log.Printf("WARN: [Engine] [AppID: %s] System state purge commanded by client. Cancelled %d jobs, purged %d queues.", req.GetAppId(), len(jobsToCancel), queuesPurged)
+
+	return &pb.PurgeSystemStateResponse{
+		Success:       true,
+		JobsCancelled: int32(len(jobsToCancel)),
+		QueuesPurged:  int32(queuesPurged),
+	}, nil
+}
+
+// updateExecutionAndMarshal locks the tracker, updates the ActiveExecution state, and serializes the JetStream payload.
+func (s *OrchestratorServer) updateExecutionAndMarshal(tracker *JobTracker, stepReq *pb.SubmitStepRequest) ([]byte, error) {
+	tracker.Lock()
+	tracker.StepReq = stepReq
+	if tracker.State.ActiveExecution == nil {
+		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: stepReq.JobId}
+	}
+	tracker.State.ActiveExecution.CurrentStepId = stepReq.StepId
+	tracker.Unlock()
+
+	type Payload struct {
+		StateBytes      []byte `json:"state_bytes"`
+		StepReqBytes    []byte `json:"step_req_bytes"`
+		CallbackAddress string `json:"callback_address"`
+	}
+
+	stateBytes, err := proto.Marshal(tracker.State)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize state: %w", err)
+	}
+	stepReqBytes, err := proto.Marshal(stepReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize step request: %w", err)
+	}
+
+	payloadBytes, err := json.Marshal(Payload{
+		StateBytes:      stateBytes,
+		StepReqBytes:    stepReqBytes,
+		CallbackAddress: tracker.CallbackAddress,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
+	}
+
+	return payloadBytes, nil
 }

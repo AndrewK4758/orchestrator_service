@@ -143,6 +143,20 @@ func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
 	}()
 }
 
+func (p *Publisher) PurgeQueues(ctx context.Context) error {
+	log.Println("INFO: [Publisher] Purging all relevant JetStream queues...")
+
+	streams := []string{"JOBS", "TRACE_EVENTS", "CACHE_REQUESTS"}
+	for _, streamName := range streams {
+		stream, err := p.js.Stream(ctx, streamName)
+		if err == nil {
+			_ = stream.Purge(ctx)
+			log.Printf("INFO: [Publisher] Purged stream %s", streamName)
+		}
+	}
+	return nil
+}
+
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
 	normalAckPending := 100
 	priorityAckPending := 100

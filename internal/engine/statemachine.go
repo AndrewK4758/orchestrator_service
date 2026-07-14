@@ -34,7 +34,7 @@ const PlannerSchema = `{
       "items": {
         "type": "object",
         "properties": {
-          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP", "PRIMITIVE_SEMANTIC_CACHE_STORE", "PRIMITIVE_ZERO_SHOT_CLASSIFICATION"] },
+          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP"] },
           "prompt": { "type": "string" },
           "schema": { "type": "object" },
           "rules": { "type": "array", "items": { "type": "string" } }
@@ -121,6 +121,27 @@ func (e *Engine) executeHumanValidationStep(ctx context.Context, state *pb.Workf
 func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (*ActionPlan, error) {
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, step.Id, step.StepName)
 
+	if step.StepPrimitive != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED {
+		primitiveStr := ""
+		if step.StepPrimitive == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP {
+			primitiveStr = "PRIMITIVE_AI_STEP"
+		} else if step.StepPrimitive == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP {
+			primitiveStr = "PRIMITIVE_HUMAN_STEP"
+		}
+		if primitiveStr != "" {
+			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Client explicitly defined primitive %s. Bypassing AI Planner.", state.JobId, step.Id, primitiveStr)
+			return &ActionPlan{
+				Actions: []ActionItem{
+					{
+						ActionType: primitiveStr,
+						Prompt:     step.CustomInstructions,
+						Schema:     []byte(step.ExpectedSchema),
+					},
+				},
+			}, nil
+		}
+	}
+
 	if step.RequireHumanReview {
 		log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Step requires explicit human review. Bypassing AI Planner.", state.JobId, step.Id)
 		return &ActionPlan{
@@ -139,9 +160,7 @@ Step Instructions: %s
 Expected Schema: %s
 
 Available Primitives:
-- PRIMITIVE_ZERO_SHOT_CLASSIFICATION: Use this FIRST if the step involves checking a document against known templates in a cache. If this cache hits, the step will terminate early and succeed.
-- PRIMITIVE_AI_STEP: Use this for AI inference. If used after PRIMITIVE_ZERO_SHOT_CLASSIFICATION, it will act as a fallback in case the cache misses.
-- PRIMITIVE_SEMANTIC_CACHE_STORE: Use this to store successful extractions in the cache.
+- PRIMITIVE_AI_STEP: Use this for AI inference.
 - PRIMITIVE_HUMAN_STEP: Use this if human validation is explicitly requested.
 
 Return a JSON array of actions matching the PlannerSchema.`, step.CustomInstructions, step.ExpectedSchema)
@@ -340,10 +359,18 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 			var pbActions []*pb.ActionDefinition
 			for i, action := range plan.Actions {
+				primitiveType := pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED
+				if action.ActionType == "PRIMITIVE_AI_STEP" {
+					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP
+				} else if action.ActionType == "PRIMITIVE_HUMAN_STEP" {
+					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP
+				}
+
 				pbActions = append(pbActions, &pb.ActionDefinition{
 					Id:                    fmt.Sprintf("act_%s_%d", step.Id, i),
 					Name:                  action.ActionType,
 					OrchestratorPrimitive: action.ActionType,
+					PrimitiveType:         primitiveType,
 					Prompt:                action.Prompt,
 					ExpectedOutputSchema:  string(action.Schema),
 					Rules:                 action.Rules,
