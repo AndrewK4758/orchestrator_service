@@ -134,22 +134,18 @@ func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
 }
 
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
-	totalWorkers := 50
-	normalAckPending := 10
-	priorityAckPending := 40
+	normalAckPending := 100
+	priorityAckPending := 100
 
-	if envMax := os.Getenv("MAX_ACK_PENDING"); envMax != "" {
-		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
-			totalWorkers = m
-			// 80/20 split
-			priorityAckPending = int(float64(totalWorkers) * 0.8)
-			if priorityAckPending == 0 {
-				priorityAckPending = 1
-			}
-			normalAckPending = totalWorkers - priorityAckPending
-			if normalAckPending == 0 {
-				normalAckPending = 1
-			}
+	if envVal := os.Getenv("NORMAL_MAX_ACK_PENDING"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+			normalAckPending = parsed
+		}
+	}
+
+	if envVal := os.Getenv("PRIORITY_MAX_ACK_PENDING"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+			priorityAckPending = parsed
 		}
 	}
 
