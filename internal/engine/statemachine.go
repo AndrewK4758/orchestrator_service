@@ -34,7 +34,7 @@ const PlannerSchema = `{
       "items": {
         "type": "object",
         "properties": {
-          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP", "PRIMITIVE_SEMANTIC_CACHE_CHECK", "PRIMITIVE_SEMANTIC_CACHE_STORE"] },
+          "action_type": { "type": "string", "enum": ["PRIMITIVE_AI_STEP", "PRIMITIVE_HUMAN_STEP", "PRIMITIVE_SEMANTIC_CACHE_STORE", "PRIMITIVE_ZERO_SHOT_CLASSIFICATION"] },
           "prompt": { "type": "string" },
           "schema": { "type": "object" },
           "rules": { "type": "array", "items": { "type": "string" } }
@@ -102,8 +102,8 @@ func NewEngine(aiClient AIClient, cacheClient cache_client.Client, pub TracePubl
 	e.primitiveHandlers = map[string]ActionFunc{
 		"PRIMITIVE_AI_STEP":              e.executeAIStep,
 		"PRIMITIVE_HUMAN_STEP":           e.executeHumanValidationStep,
-		"PRIMITIVE_SEMANTIC_CACHE_CHECK": e.executeSemanticCacheCheck,
 		"PRIMITIVE_SEMANTIC_CACHE_STORE": e.executeSemanticCacheStore,
+		"PRIMITIVE_ZERO_SHOT_CLASSIFICATION": e.executeZeroShotClassification,
 	}
 	return e
 }
@@ -133,36 +133,41 @@ func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, st
 		}, nil
 	}
 
-	// Bypass the AI Planner to statically inject the Cache Lifecycle for all steps.
-	// This eliminates a massive bottleneck (5s per step per job) and allows the Orchestrator
-	// to dynamically sequence caching without hitting the LLM API.
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Bypassing AI Planner to statically inject Cache Lifecycle.", state.JobId, step.Id)
-	
-	plan := &ActionPlan{
-		Actions: []ActionItem{
-			{
-				ActionType: "PRIMITIVE_SEMANTIC_CACHE_CHECK",
-				Prompt:     step.CustomInstructions,
-				Schema:     []byte(step.ExpectedSchema),
-			},
-			{
-				ActionType: "PRIMITIVE_AI_STEP",
-				Prompt:     step.CustomInstructions,
-				Schema:     []byte(step.ExpectedSchema),
-			},
-			{
-				ActionType: "PRIMITIVE_SEMANTIC_CACHE_STORE",
-				Prompt:     step.CustomInstructions,
-				Schema:     []byte(step.ExpectedSchema),
-			},
-		},
+	planningPrompt := fmt.Sprintf(`You are the Orchestrator AI Planner. Your job is to sequence the workflow for this step.
+Step Instructions: %s
+Expected Schema: %s
+
+Available Primitives:
+- PRIMITIVE_ZERO_SHOT_CLASSIFICATION: Use this FIRST if the step involves checking a document against known templates in a cache. If this cache hits, the step will terminate early and succeed.
+- PRIMITIVE_AI_STEP: Use this for AI inference. If used after PRIMITIVE_ZERO_SHOT_CLASSIFICATION, it will act as a fallback in case the cache misses.
+- PRIMITIVE_SEMANTIC_CACHE_STORE: Use this to store successful extractions in the cache.
+- PRIMITIVE_HUMAN_STEP: Use this if human validation is explicitly requested.
+
+Return a JSON array of actions matching the PlannerSchema.`, step.CustomInstructions, step.ExpectedSchema)
+
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Generate Plan",
+		OrchestratorPrimitive: "PLANNING_PRIMITIVE",
+		Prompt:                planningPrompt,
+		ExpectedOutputSchema:  PlannerSchema,
 	}
+
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, "", pb.ModelChoice_MODEL_CHOICE_PLANNING)
+	if err != nil {
+		return nil, fmt.Errorf("action failed for job %s: failed to generate plan: %w", state.JobId, err)
+	}
+
+	rawJson := cleanJSON(resp.GetActionResultJson())
 	
 	// We still merge the plan into ActionState as if it was returned by the AI, for consistency
-	rawJson, _ := json.Marshal(plan)
-	mergeIntoActionState(state, string(rawJson))
-	
-	return plan, nil
+	mergeIntoActionState(state, rawJson)
+
+	var plan ActionPlan
+	if err := json.Unmarshal([]byte(rawJson), &plan); err != nil {
+		return nil, fmt.Errorf("action failed for job %s: failed to parse plan: %w", state.JobId, err)
+	}
+
+	return &plan, nil
 }
 
 // cleanJSON removes common markdown wrappers if the AI hallucinated them.
@@ -179,14 +184,52 @@ func cleanJSON(input string) string {
 	return strings.TrimSpace(cleaned)
 }
 
-func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (bool, string, error) {
-	// Bypass AI review since the plan is statically injected and always valid
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Auto-approving statically injected Cache Lifecycle plan.", state.JobId, step.Id)
-	
-	resultJson := `{"approved": true, "reason": "Static Cache Lifecycle plan auto-approved"}`
-	mergeIntoActionState(state, resultJson)
-	
-	return true, "Static Cache Lifecycle plan auto-approved", nil
+func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, plan *ActionPlan) (bool, string, error) {
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Reviewing plan dynamically.", state.JobId, step.Id)
+
+	var actionsStr string
+	if plan != nil && len(plan.Actions) > 0 {
+		for i, a := range plan.Actions {
+			actionsStr += fmt.Sprintf("Action %d: %s\n", i, a.ActionType)
+		}
+	} else {
+		actionsStr = "No actions proposed."
+	}
+
+	reviewPrompt := fmt.Sprintf(`You are the Orchestrator AI Reviewer. Your job is to review the proposed plan to ensure it is logical and satisfies the step instructions.
+Step Instructions: %s
+Expected Schema: %s
+
+Proposed Actions:
+%s
+
+Review the actions. If they form a valid plan to achieve the instructions, approve it. If not, reject it with a reason.
+Return a JSON object matching the expected schema.`, step.CustomInstructions, step.ExpectedSchema, actionsStr)
+
+	actionDef := &pb.ActionDefinition{
+		Name:                  "Review Plan",
+		OrchestratorPrimitive: "REVIEW_PRIMITIVE",
+		Prompt:                reviewPrompt,
+		ExpectedOutputSchema:  ReviewSchema,
+	}
+
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, "", pb.ModelChoice_MODEL_CHOICE_CLASSIFICATION)
+	if err != nil {
+		return false, "", fmt.Errorf("action failed for job %s: failed to review plan: %w", state.JobId, err)
+	}
+
+	rawJson := cleanJSON(resp.GetActionResultJson())
+	mergeIntoActionState(state, rawJson)
+
+	var result struct {
+		Approved bool   `json:"approved"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(rawJson), &result); err != nil {
+		return false, "", fmt.Errorf("action failed for job %s: failed to parse review result: %w", state.JobId, err)
+	}
+
+	return result.Approved, result.Reason, nil
 }
 
 func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error) {
@@ -269,7 +312,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 			}
 
 			// 2. Review Phase
-			approved, reviewReason, err := e.reviewPlan(ctx, state, step)
+			approved, reviewReason, err := e.reviewPlan(ctx, state, step, plan)
 			if err != nil {
 				log.Printf("WARN: [Engine] [JobID: %s | StepID: %s] Review plan failed: %v", state.JobId, step.Id, err)
 				if attempt == maxRetries {
@@ -395,26 +438,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 		// 7. Success! Commit strictly to the Global State via a direct top-level merge.
 		// If WritesToStateKey is provided, nest the output safely.
-		if assembledJson != "" {
-			var parsed map[string]interface{}
-			if err := json.Unmarshal([]byte(assembledJson), &parsed); err == nil {
-				if state.GlobalState == nil {
-					state.GlobalState, _ = structpb.NewStruct(make(map[string]interface{}))
-				}
-
-				m := state.GlobalState.AsMap()
-				if step.WritesToStateKey != "" {
-					m[step.WritesToStateKey] = parsed
-				} else {
-					for k, v := range parsed {
-						m[k] = v
-					}
-				}
-
-				newState, _ := structpb.NewStruct(m)
-				state.GlobalState = newState
-			}
-		}
+		mergeIntoGlobalState(state, assembledJson, step.WritesToStateKey)
 
 		stepSuccess = true
 		finalAssembledJson = assembledJson
@@ -485,82 +509,6 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 	return rawJson, nil
 }
 
-func (e *Engine) executeSemanticCacheCheck(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Check Step: %s", state.JobId, req.Id, req.StepName)
-
-	if e.cacheClient == nil {
-		return "", fmt.Errorf("cache client is not configured")
-	}
-
-	threshold := float32(0.99) // Updated per design doc
-	if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
-		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
-			threshold = float32(parsed)
-		}
-	}
-
-	var resp *pb.CheckCacheResponse
-	if req.UseCache {
-		var err error
-		cacheInput := req.ContextInput
-		if req.CacheKeyInput != "" {
-			cacheInput = req.CacheKeyInput
-		}
-
-		hashBytes := sha256.Sum256([]byte(cacheInput))
-		hashKey := hex.EncodeToString(hashBytes[:])
-
-		if ch, loaded := e.pendingCacheJobs.Load(hashKey); loaded {
-			log.Printf("INFO: [Engine] [JobID: %s] CACHE STAMPEDE DELAY! Waiting for identical job to finish inference...", state.JobId)
-			select {
-			case <-ch.(chan struct{}):
-				log.Printf("INFO: [Engine] [JobID: %s] Stampede lock released, proceeding...", state.JobId)
-			case <-time.After(30 * time.Second):
-				log.Printf("WARN: [Engine] [JobID: %s] Stampede delay timeout reached, proceeding...", state.JobId)
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
-		}
-
-		resp, err = e.cacheClient.CheckCache(ctx, cacheInput, state.Metadata, threshold)
-		if err != nil {
-			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
-			// Graceful degradation: If cache fails, treat as a cache miss instead of failing the workflow!
-			resp = &pb.CheckCacheResponse{Hit: false}
-		}
-
-		if !resp.Hit {
-			ch := make(chan struct{})
-			_, loaded := e.pendingCacheJobs.LoadOrStore(hashKey, ch)
-			if !loaded {
-				// We claimed the lock. Set a safety timeout to clear it just in case AI step crashes.
-				go func() {
-					time.Sleep(60 * time.Second)
-					if ch, loaded := e.pendingCacheJobs.LoadAndDelete(hashKey); loaded {
-						close(ch.(chan struct{}))
-					}
-				}()
-			}
-		}
-
-	} else {
-		resp = &pb.CheckCacheResponse{Hit: false}
-	}
-
-	resultMap := map[string]interface{}{
-		"cache_hit":        resp.Hit,
-		"confidence_score": resp.Confidence,
-	}
-	if resp.Hit && resp.ExtractedPayload != "" {
-		var payload map[string]interface{}
-		if err := json.Unmarshal([]byte(resp.ExtractedPayload), &payload); err == nil {
-			resultMap["extracted_payload"] = payload
-		}
-	}
-
-	bytes, _ := json.Marshal(resultMap)
-	return string(bytes), nil
-}
 
 func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
 	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Store Step: %s", state.JobId, req.Id, req.StepName)
@@ -730,4 +678,99 @@ func mergeIntoActionState(state *pb.WorkflowContext, jsonStr string) {
 	}
 	newState, _ := structpb.NewStruct(currentMap)
 	state.ActionState = newState
+}
+
+func mergeIntoGlobalState(state *pb.WorkflowContext, jsonStr string, targetKey string) {
+	if jsonStr == "" {
+		return
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		return
+	}
+
+	if state.GlobalState == nil {
+		state.GlobalState, _ = structpb.NewStruct(make(map[string]interface{}))
+	}
+
+	m := state.GlobalState.AsMap()
+	if targetKey != "" {
+		m[targetKey] = parsed
+	} else {
+		for k, v := range parsed {
+			m[k] = v
+		}
+	}
+
+	newState, _ := structpb.NewStruct(m)
+	state.GlobalState = newState
+}
+
+func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
+	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Zero Shot Classification Step: %s", state.JobId, req.Id, req.StepName)
+
+	if e.cacheClient == nil {
+		return "", fmt.Errorf("cache client is not configured")
+	}
+
+	threshold := float32(0.99)
+	if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
+		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
+			threshold = float32(parsed)
+		}
+	}
+
+	var resp *pb.CheckCacheResponse
+	if req.UseCache {
+		cacheInput := req.CacheKeyInput
+
+		hashBytes := sha256.Sum256([]byte(cacheInput))
+		hashKey := hex.EncodeToString(hashBytes[:])
+
+		if ch, loaded := e.pendingCacheJobs.Load(hashKey); loaded {
+			log.Printf("INFO: [Engine] [JobID: %s] CACHE STAMPEDE DELAY! Waiting for identical job...", state.JobId)
+			select {
+			case <-ch.(chan struct{}):
+			case <-time.After(30 * time.Second):
+			case <-ctx.Done():
+				return "", fmt.Errorf("action failed for job %s: context cancelled while waiting for stampede lock: %w", state.JobId, ctx.Err())
+			}
+		}
+
+		var err error
+		resp, err = e.cacheClient.CheckCache(ctx, cacheInput, state.Metadata, threshold)
+		if err != nil {
+			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
+			resp = &pb.CheckCacheResponse{Hit: false}
+		}
+
+		if !resp.Hit {
+			ch := make(chan struct{})
+			_, loaded := e.pendingCacheJobs.LoadOrStore(hashKey, ch)
+			if !loaded {
+				go func() {
+					time.Sleep(60 * time.Second)
+					if ch, loaded := e.pendingCacheJobs.LoadAndDelete(hashKey); loaded {
+						close(ch.(chan struct{}))
+					}
+				}()
+			}
+		}
+	} else {
+		resp = &pb.CheckCacheResponse{Hit: false}
+	}
+
+	if resp.Hit && resp.ExtractedPayload != "" {
+		log.Printf("INFO: [Engine] [JobID: %s] Zero-Shot Cache hit! Returning payload immediately.", state.JobId)
+		
+		mergeIntoGlobalState(state, resp.ExtractedPayload, req.WritesToStateKey)
+
+		// Fast-fail the remaining actions in the plan to simulate immediate step completion!
+		state.PendingActions = nil
+		state.CurrentActionIndex = 0
+
+		return `{"cache_hit": true, "early_termination": true}`, nil
+	}
+
+	return `{"cache_hit": false}`, nil
 }
