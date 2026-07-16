@@ -17,21 +17,20 @@ import (
 	pb "github.com/AndrewK4758/shared_protos"
 )
 
-// ArtemisCallbackServer simulates the Client's webhook/gRPC server
 type ArtemisCallbackServer struct {
 	pb.UnimplementedOrchestratorCallbackServiceServer
 	ResultChan chan string
 }
 
-func (s *ArtemisCallbackServer) OnStepComplete(ctx context.Context, req *pb.StepCompleteRequest) (*pb.StepCompleteResponse, error) {
+func (s *ArtemisCallbackServer) OnNodeExecutionComplete(ctx context.Context, req *pb.NodeExecutionCompleteRequest) (*pb.NodeExecutionCompleteResponse, error) {
 	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, req.JobId)
 
 	bytes, _ := req.GlobalState.MarshalJSON()
-	outBytes, _ := req.StepOutput.MarshalJSON()
+	outBytes, _ := req.NodeOutput.MarshalJSON()
 	fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", req.JobId, string(outBytes), string(bytes))
 	s.ResultChan <- string(bytes)
 
-	return &pb.StepCompleteResponse{Success: true}, nil
+	return &pb.NodeExecutionCompleteResponse{Success: true}, nil
 }
 
 func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
@@ -48,7 +47,6 @@ func main() {
 	}
 	inputPath := os.Args[1]
 
-	// 1. Start Local Callback Server
 	lis, err := net.Listen("tcp", ":50055")
 	if err != nil {
 		log.Fatalf("Failed to listen for callbacks: %v", err)
@@ -66,10 +64,8 @@ func main() {
 		}
 	}()
 
-	// Wait a moment for server to start
 	time.Sleep(1 * time.Second)
 
-	// 2. Connect to Orchestrator
 	conn, err := grpc.NewClient("localhost:50052", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Failed to connect to orchestrator: %v", err)
@@ -77,7 +73,6 @@ func main() {
 	defer conn.Close()
 	client := pb.NewOrchestratorServiceClient(conn)
 
-	// Determine file to process
 	info, err := os.Stat(inputPath)
 	if err != nil {
 		log.Fatalf("Failed to stat input path: %v", err)
@@ -118,52 +113,32 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		"document_b64": b64Doc,
 	})
 
-	jobReq := &pb.SubmitJobRequest{
-		Context: &pb.WorkflowContext{
-			Metadata: map[string]string{
-				"app_id":    "CLI_TEST_APP",
-				"tenant_id": "TEST_TENANT",
-			},
-			GlobalState: initialState,
+	nodeReq := &pb.ExecuteWorkflowNodeRequest{
+		JobId: "job_test_123",
+		StepId: "step_1",
+		GlobalState: initialState,
+		Metadata: map[string]string{
+			"app_id":    "CLI_TEST_APP",
+			"tenant_id": "TEST_TENANT",
 		},
 		CallbackAddress: "localhost:50055",
-		Steps: []*pb.StepDefinition{
-			{
-				Id:                 "step_1",
-				StepName:           "Extract Invoice Data",
-				CustomInstructions: "Extract the invoice number and total amount.",
-				ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
-				WritesToStateKey:   "invoice_data",
-			},
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: "Extract Invoice Data",
+			SystemInstructions: "Extract the invoice number and total amount.",
+			ExpectedSchema: `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
 		},
 	}
 
-	docRes, err := client.SubmitJob(context.Background(), jobReq)
+	nodeRes, err := client.ExecuteWorkflowNode(context.Background(), nodeReq)
 	if err != nil {
 		log.Printf("Failed to submit document: %v", err)
 		return
 	}
-	jobID := docRes.GetJobId()
-	fmt.Printf("✅ Document Cached! Job ID: %s\n", jobID)
-
-	// ReAct Loop Simulation
-	fmt.Printf("\n[%s] PHASE 2: Submitting First ReAct Step (Extraction)...\n", jobID)
-
-	// Submit a generic step using the new generic StepDefinition
-	stepReq := &pb.SubmitStepRequest{
-		JobId:  jobID,
-		StepId: "step_1",
-	}
-
-	_, err = client.SubmitStep(context.Background(), stepReq)
-	if err != nil {
-		log.Printf("Failed to submit step: %v", err)
-		return
-	}
+	jobID := "job_test_123"
+	fmt.Printf("✅ Document Cached! Job ID: %s, Message: %s\n", jobID, nodeRes.Message)
 
 	fmt.Printf("⏳ [%s] Waiting for Orchestrator Callback...\n", jobID)
 
-	// Wait for Phase 3 (The Callback)
 	result := <-artemis.ResultChan
 
 	fmt.Printf("\n[%s] PHASE 4: ReAct Decision (Evaluating Output)\n", jobID)

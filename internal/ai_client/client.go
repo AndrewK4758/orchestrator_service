@@ -3,7 +3,7 @@ package ai_client
 import (
 	"context"
 	"fmt"
-	"log"
+	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
 	"sync"
@@ -27,7 +27,7 @@ type Client struct {
 
 // NewClient connects to the NATS server.
 func NewClient(natsURL string) (*Client, error) {
-	log.Printf("Connecting to NATS at %s for AI Service...", natsURL)
+	logger.Info("System", "Connecting to NATS at %s for AI Service...", natsURL)
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
@@ -49,9 +49,9 @@ func NewClient(natsURL string) (*Client, error) {
 			Subjects: []string{"ai.response.>"},
 		})
 		if err != nil {
-			log.Printf("Warning: failed to create AI_RESPONSES stream (might already exist): %v", err)
+			logger.Warn("System", "failed to create AI_RESPONSES stream (might already exist): %v", err)
 		} else {
-			log.Printf("Successfully created JetStream stream: %s", streamName)
+			logger.Info("System", "Successfully created JetStream stream: %s", streamName)
 		}
 	}
 
@@ -170,7 +170,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowCo
 
 	// Acknowledge the JetStream message
 	if err := respMsg.Ack(); err != nil {
-		log.Printf("Warning: failed to ack AI response message: %v", err)
+		logger.Warn("System", "failed to ack AI response message: %v", err)
 	}
 
 	resp := &aipb.PerformActionResponse{}

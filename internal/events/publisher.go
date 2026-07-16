@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
 	"time"
@@ -52,7 +53,7 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 	}
 
 	if os.Getenv("PURGE_QUEUE_ON_STARTUP") == "true" {
-		log.Println("DEVELOPMENT MODE: Purging JOBS and TRACE_EVENTS streams on startup...")
+		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS and TRACE_EVENTS streams on startup...")
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
 	}
@@ -65,25 +66,25 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 
 // PublishTrace sends an event securely to JetStream so the .NET Traceability Service can record it.
 func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) error {
-	log.Printf("INFO: [Publisher] Preparing to publish trace event: %+v", event)
+	logger.Info("Publisher", "Preparing to publish trace event: %+v", event)
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
-		log.Printf("ERROR: [Publisher] Failed to marshal event: %v", err)
+		logger.Error("Publisher", "Failed to marshal event: %v", err)
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
 	// Publish to a specific subject, e.g., "trace.job.started"
 	subject := fmt.Sprintf("trace.%s", event.EventType)
-	log.Printf("INFO: [Publisher] Publishing to NATS subject: '%s'", subject)
+	logger.Info("Publisher", "Publishing to NATS subject: '%s'", subject)
 
 	// Use JetStream publish for guaranteed delivery
 	_, err = p.js.Publish(ctx, subject, eventBytes)
 	if err != nil {
-		log.Printf("ERROR: [Publisher] Failed to publish trace event to NATS subject '%s': %v", subject, err)
+		logger.Error("Publisher", "Failed to publish trace event to NATS subject '%s': %v", subject, err)
 		return fmt.Errorf("failed to publish trace event to jetstream: %w", err)
 	}
 
-	log.Printf("INFO: [Publisher] Successfully published to NATS subject: '%s'", subject)
+	logger.Info("Publisher", "Successfully published to NATS subject: '%s'", subject)
 	return nil
 }
 
@@ -116,7 +117,6 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, payload []byte) erro
 	return nil
 }
 
-
 func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
 	subject := "cache.requests.store"
 	_, err := p.js.Publish(ctx, subject, data)
@@ -144,14 +144,14 @@ func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
 }
 
 func (p *Publisher) PurgeQueues(ctx context.Context) error {
-	log.Println("INFO: [Publisher] Purging all relevant JetStream queues...")
+	logger.Info("Publisher", "Purging all relevant JetStream queues...")
 
 	streams := []string{"JOBS", "TRACE_EVENTS", "CACHE_REQUESTS"}
 	for _, streamName := range streams {
 		stream, err := p.js.Stream(ctx, streamName)
 		if err == nil {
 			_ = stream.Purge(ctx)
-			log.Printf("INFO: [Publisher] Purged stream %s", streamName)
+			logger.Info("Publisher", "Purged stream %s", streamName)
 		}
 	}
 	return nil
@@ -206,7 +206,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		return fmt.Errorf("failed to create normal consumer: %w", err)
 	}
 
-	log.Printf("DEBUG: Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
+	logger.Debug("System", "Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
 	createProcessMsg := func(consumerName string) func(msg jetstream.Msg) {
 		return func(msg jetstream.Msg) {
 			p.LogQueueSizeAsync("Dequeue", consumerName)
@@ -230,7 +230,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 				close(done) // Signal heartbeat to stop
 
 				if err != nil {
-					log.Printf("ERROR: Failed to process job msg: %v", err)
+					logger.Error("System", "Failed to process job msg: %v", err)
 					_ = m.Nak()
 				} else {
 					_ = m.Ack()

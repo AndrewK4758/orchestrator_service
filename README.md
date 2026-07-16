@@ -4,31 +4,47 @@ The Orchestrator Service acts as the "Manager" in a microservice architecture de
 
 This service is explicitly decoupled from the core `ai_service` to adhere to the Single Responsibility Principle.
 
-## 🏗 Architecture & The State Machine
+## 🏗 The LangGraph State Architecture
 
-Processing a 100-page scanned PDF in a single LLM call is prone to timeouts and "attention fatigue" (the model forgetting things in the middle of the document). This service solves that using a **Hybrid Async/Sync State Machine**.
+The Orchestrator acts strictly as a "brawn" execution engine and defers all business logic back to the client apps. It is **100% application-agnostic** and operates on a pure LangGraph-style state machine model.
 
-1. **Client Submission (Async):** A client submits a large PDF and immediately receives a `JobID` back to prevent HTTP/gRPC timeouts. The client then opens a **gRPC Server Stream** to listen for live progress.
-2. **Chunking Engine:** The Orchestrator safely splits the massive PDF into batches of 20 pages using `pdfcpu`.
-3. **Parallel Execution (Sync):** The Engine spawns parallel Goroutines. Each Goroutine makes a lightning-fast, blocking (synchronous) gRPC call to the underlying `ai_service` to extract bounding data and classifications.
-4. **Idempotency & Resiliency:** All steps strictly check context deadlines. If a single chunk fails, the job fails gracefully, and can be retried safely.
+1. **Client Node Sequencing:** Client applications (e.g., Artemis) define their workflows in their own SQL databases. The Orchestrator does not know the graph up front.
+2. **ExecuteWorkflowNode (gRPC):** The Client submits a single `ExecuteWorkflowNodeRequest` containing the current JSON `GlobalState` and the specific instructions for the current node (Step).
+3. **Internal Execution (ReAct):** The Orchestrator's internal engine (Planner & Reviewer) evaluates the node instructions and executes internal primitives (e.g., `PRIMITIVE_AI_STEP`, `PRIMITIVE_HUMAN_STEP`, `PRIMITIVE_ZERO_SHOT_CLASSIFICATION`).
+4. **Webhook Callback:** Once the node is completed, the Orchestrator fires a webhook back to the Client containing the dynamically mutated `GlobalState`. The Client evaluates the output against its dynamic rules and submits the next Node in the graph.
 
----
+## 🛠 Using the ExecuteWorkflowNode Interface
 
-## 🔗 App-Agnostic Webhooks (Callback Client)
+The `ExecuteWorkflowNodeRequest` is the single entry point to the Orchestrator. The most important fields are:
+- `JobId` (string): Unique identifier for the job (e.g., `AppId_UnixNano`).
+- `StepId` (string): The ID of the specific node/step currently being executed.
+- `GlobalState` (google.protobuf.Struct): The complete JSON state object built up by prior steps.
+- `NodeConfig` (NodeConfiguration): The instructions that dictate what the Orchestrator should do on this specific step.
 
-The Orchestrator acts strictly as a "brawn" execution engine and defers business logic back to the client apps. It is **100% application-agnostic** and can serve multiple different tenant apps simultaneously.
+### Routing via OrchestratorPrimitive
+The `NodeConfig.PrimitiveType` enum explicitly routes the Orchestrator's execution engine to specific downstream services:
 
-When submitting a document with `Action = "CLASSIFY"`, clients can optionally pass a `callback_address` (or rely on the `DEFAULT_CALLBACK_ADDRESS` environment variable). 
-If provided, the Orchestrator will:
-1. Dynamically connect back to the specified client's `SchemaRegistryService` via gRPC.
-2. Fetch the specific parsing schema and rules for the classified document type.
-3. Automatically execute the heavy `PARSE` stage using those dynamic rules without requiring the client to send the PDF again.
+1. **`PRIMITIVE_AI_STEP` (AI Data Extraction)**
+   - **Triggers**: Connects to the `ai_service` (Processor) via gRPC.
+   - **Usage**: Used for heavy LLM data extraction and validation. Provide `SystemInstructions` and an `ExpectedSchema` (JSON Schema) inside `NodeConfig`. The LLM's structured output will be dynamically merged back into `GlobalState`.
+
+2. **`PRIMITIVE_ZERO_SHOT_CLASSIFICATION` (Semantic Cache Lookup)**
+   - **Triggers**: Connects synchronously to the `semantic_cache_service`.
+   - **Usage**: Use this to quickly query the vector database before falling back to heavy AI extraction. The Orchestrator hashes the input from `NodeConfig.CacheKeyInput` against the existing embeddings. On a cache hit, it instantly returns the cached JSON; on a miss, it can dynamically trigger an AI fallback or notify the client.
+
+3. **`PRIMITIVE_SEMANTIC_CACHE_STORE` (Semantic Cache Write)**
+   - **Triggers**: Fires an asynchronous, durable event to the `CACHE_REQUESTS` stream via NATS JetStream.
+   - **Usage**: Used at the end of an AI extraction step to persist the successful JSON results into the vector database (Qdrant). Does not block client response times.
+
+4. **`PRIMITIVE_HUMAN_STEP` (Human In The Loop)**
+   - **Triggers**: Connects to the `human_validation_service`.
+   - **Usage**: Used when the AI lacks confidence or encounters a fatal schema exception. The Orchestrator suspends the graph execution and queues a task for human operators. Once the human manually corrects the JSON state, the Orchestrator resumes the graph by sending the callback to the client.
 
 ## 💾 Semantic Cache Integration
 The Orchestrator interacts with the `semantic_cache_service` using a **Hybrid Architecture** for maximum resilience and throughput:
 1. **Reads (gRPC)**: Cache lookups are evaluated synchronously via gRPC under the `PRIMITIVE_ZERO_SHOT_CLASSIFICATION` execution handler. If a document chunk mathematically matches a prior index, the Orchestrator instantly terminates the AI step and merges the cached JSON payload directly into the client's global state.
 2. **Writes (JetStream)**: Successful AI data extractions are sequenced dynamically via the `PRIMITIVE_SEMANTIC_CACHE_STORE` execution handler. The Orchestrator fires an asynchronous, durable event to the `CACHE_REQUESTS` stream via NATS JetStream and immediately continues processing without waiting for the vector DB to index the payload, completely removing latency bottlenecks and stampedes.
+3. **Observability**: Cache operations feature a dedicated `CACHE` log level. The Orchestrator prints the exact client metadata used for partitioning, the resulting cosine similarity score, and the explicitly extracted cache payload directly to the console for complete visibility.
 
 ---
 
@@ -81,35 +97,37 @@ go run cmd\server\main.go
 
 ## 🧪 Testing with the Dummy Client
 
-This repository includes a test script that mimics the C# Dotnet Client application. It demonstrates the multi-turn **CLASSIFY -> PARSE** workflow on a single document.
+This repository includes a test script that mimics the C# Dotnet Client application. It demonstrates the multi-node LangGraph execution workflow.
 
 ```bash
 cd /home/ak/projects/doc_processor_service/orchestrator_service
-go run scripts/test_client/main.go /path/to/any/dummy.pdf
+go run scripts/test_client/main.go
 ```
 
 ### Expected Output:
 ```text
 ==================================================
-🚀 STARTING C#-STYLE WORKFLOW SIMULATION
+🚀 STARTING C#-STYLE WORKFLOW SIMULATION (LangGraph Mode)
 ==================================================
 
-[STEP 1] 🧠 Sending 'dummy.pdf' for CLASSIFICATION...
-   -> [Classification] Job job_17000000000 assigned. Waiting for completion...
-      - STARTING: Initializing workflow
+[NODE 1] 🧠 Submitting ExecuteWorkflowNodeRequest (Node: AI Data Extraction)...
+   -> [Orchestrator] Executing primitive PRIMITIVE_AI_STEP...
+   -> [Orchestrator] State mutated successfully. Firing webhook.
 
-📋 CLASSIFICATION RESULT: 
-[{"document_type": "Legal Disclaimer", ...}]
+[WEBHOOK] ⚙️ C# Client received mutated GlobalState...
+   - Evaluating dynamic rules on Node 1 output...
+   - Determining next Node...
 
-[STEP 2] ⚙️ C# Client Business Logic triggered...
-   - Switch statement activated based on classification
-   - Database queried for required schema fields
-   - Selected Schema for Parsing: {...}
+[NODE 2] 🔍 Submitting ExecuteWorkflowNodeRequest (Node: Human Review)...
+   -> [Orchestrator] Executing primitive PRIMITIVE_HUMAN_STEP...
+   -> [Orchestrator] State mutated successfully. Firing webhook.
 
-[STEP 3] 🔍 Sending 'dummy.pdf' for FULL PARSING...
-   -> [Parsing] Job job_17000000001 assigned. Waiting for completion...
-      - STARTING: Initializing workflow
-
-✅ FINAL PARSED DATA (Ready for C# Persistence): 
-[{"BorrowerName": "John Doe", "DocumentState": "NEW YORK"}]
+✅ FINAL GLOBAL STATE (Ready for persistence): 
+{
+  "extracted_data": {
+     "BorrowerName": "John Doe", 
+     "DocumentState": "NEW YORK"
+  },
+  "review_status": "APPROVED"
+}
 ```

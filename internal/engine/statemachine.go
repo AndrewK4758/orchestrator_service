@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"orchestrator_service/internal/events"
@@ -20,8 +20,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
@@ -84,7 +84,7 @@ type AIClient interface {
 	PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
 }
 
-type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error)
+type ActionFunc func(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (string, error)
 
 type Engine struct {
 	aiClient          AIClient
@@ -109,47 +109,49 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 	return e
 }
 
-func (e *Engine) executeHumanValidationStep(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error) {
-	taskID, err := e.triggerHumanValidation(ctx, state, step, step.ContextInput, "Client triggered manual validation")
+func (e *Engine) executeHumanValidationStep(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
+	taskID, err := e.triggerHumanValidation(ctx, state, req, "", "Client triggered manual validation")
 	if err != nil {
 		return "", fmt.Errorf("failed to create human validation task: %w", err)
 	}
-	log.Printf("INFO: [Engine] Successfully registered human validation task: %s for Job: %s", taskID, state.JobId)
+	logger.Info("Engine", "Successfully registered human validation task: %s for Job: %s", taskID, state.JobId)
 	return "", ErrPendingHumanValidation
 }
 
-func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (*ActionPlan, error) {
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, step.Id, step.StepName)
+func (e *Engine) generatePlan(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (*ActionPlan, error) {
+	logger.Info("Engine", "[JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, req.StepId, req.NodeConfig.NodeName)
 
-	if step.StepPrimitive != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED {
+	if req.NodeConfig.PrimitiveType != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED {
 		primitiveStr := ""
-		if step.StepPrimitive == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP {
+		if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP {
 			primitiveStr = "PRIMITIVE_AI_STEP"
-		} else if step.StepPrimitive == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP {
+		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP {
 			primitiveStr = "PRIMITIVE_HUMAN_STEP"
+		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION {
+			primitiveStr = "PRIMITIVE_ZERO_SHOT_CLASSIFICATION"
 		}
 		if primitiveStr != "" {
-			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Client explicitly defined primitive %s. Bypassing AI Planner.", state.JobId, step.Id, primitiveStr)
+			logger.Info("Engine", "[JobID: %s | StepID: %s] Client explicitly defined primitive %s. Bypassing AI Planner.", state.JobId, req.StepId, primitiveStr)
 			return &ActionPlan{
 				Actions: []ActionItem{
 					{
 						ActionType: primitiveStr,
-						Prompt:     step.CustomInstructions,
-						Schema:     []byte(step.ExpectedSchema),
+						Prompt:     req.NodeConfig.SystemInstructions,
+						Schema:     []byte(req.NodeConfig.ExpectedSchema),
 					},
 				},
 			}, nil
 		}
 	}
 
-	if step.RequireHumanReview {
-		log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Step requires explicit human review. Bypassing AI Planner.", state.JobId, step.Id)
+	if req.NodeConfig.HumanValidation != nil && req.NodeConfig.HumanValidation.Required {
+		logger.Info("Engine", "[JobID: %s | StepID: %s] Step requires explicit human review. Bypassing AI Planner.", state.JobId, req.StepId)
 		return &ActionPlan{
 			Actions: []ActionItem{
 				{
 					ActionType: "PRIMITIVE_HUMAN_STEP",
-					Prompt:     step.CustomInstructions,
-					Schema:     []byte(step.ExpectedSchema),
+					Prompt:     req.NodeConfig.SystemInstructions,
+					Schema:     []byte(req.NodeConfig.ExpectedSchema),
 				},
 			},
 		}, nil
@@ -163,7 +165,7 @@ Available Primitives:
 - PRIMITIVE_AI_STEP: Use this for AI inference.
 - PRIMITIVE_HUMAN_STEP: Use this if human validation is explicitly requested.
 
-Return a JSON array of actions matching the PlannerSchema.`, step.CustomInstructions, step.ExpectedSchema)
+Return a JSON array of actions matching the PlannerSchema.`, req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Generate Plan",
@@ -178,9 +180,11 @@ Return a JSON array of actions matching the PlannerSchema.`, step.CustomInstruct
 	}
 
 	rawJson := cleanJSON(resp.GetActionResultJson())
-	
+
 	// We still merge the plan into ActionState as if it was returned by the AI, for consistency
-	mergeIntoActionState(state, rawJson)
+	if err := mergeIntoActionState(state, rawJson); err != nil {
+		return nil, fmt.Errorf("action failed for job %s: failed to merge plan state: %w", state.JobId, err)
+	}
 
 	var plan ActionPlan
 	if err := json.Unmarshal([]byte(rawJson), &plan); err != nil {
@@ -204,8 +208,8 @@ func cleanJSON(input string) string {
 	return strings.TrimSpace(cleaned)
 }
 
-func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, plan *ActionPlan) (bool, string, error) {
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Reviewing plan dynamically.", state.JobId, step.Id)
+func (e *Engine) reviewPlan(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest, plan *ActionPlan) (bool, string, error) {
+	logger.Info("Engine", "[JobID: %s | StepID: %s] Reviewing plan dynamically.", state.JobId, req.StepId)
 
 	var actionsStr string
 	if plan != nil && len(plan.Actions) > 0 {
@@ -224,7 +228,7 @@ Proposed Actions:
 %s
 
 Review the actions. If they form a valid plan to achieve the instructions, approve it. If not, reject it with a reason.
-Return a JSON object matching the expected schema.`, step.CustomInstructions, step.ExpectedSchema, actionsStr)
+Return a JSON object matching the expected schema.`, req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema, actionsStr)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Review Plan",
@@ -239,7 +243,9 @@ Return a JSON object matching the expected schema.`, step.CustomInstructions, st
 	}
 
 	rawJson := cleanJSON(resp.GetActionResultJson())
-	mergeIntoActionState(state, rawJson)
+	if err := mergeIntoActionState(state, rawJson); err != nil {
+		return false, "", fmt.Errorf("action failed for job %s: failed to merge review state: %w", state.JobId, err)
+	}
 
 	var result struct {
 		Approved bool   `json:"approved"`
@@ -252,24 +258,24 @@ Return a JSON object matching the expected schema.`, step.CustomInstructions, st
 	return result.Approved, result.Reason, nil
 }
 
-func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, error) {
-	assemblyPrompt := fmt.Sprintf("You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nReturn ONLY the JSON object.", step.CustomInstructions, step.ExpectedSchema)
+func (e *Engine) assembleStepOutput(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
+	assemblyPrompt := fmt.Sprintf("You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nReturn ONLY the JSON object.", req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Assemble Output",
 		OrchestratorPrimitive: "ASSEMBLY_PRIMITIVE",
 		Prompt:                assemblyPrompt,
-		ExpectedOutputSchema:  step.ExpectedSchema,
+		ExpectedOutputSchema:  req.NodeConfig.ExpectedSchema,
 	}
-	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, step.ContextInput, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
+	resp, err := e.aiClient.PerformAction(ctx, state, actionDef, nil, "", pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
 	if err != nil {
 		return "", fmt.Errorf("failed to assemble step output: %w", err)
 	}
 	return resp.GetActionResultJson(), nil
 }
 
-func (e *Engine) validateStepOutput(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, assembledJson string) (bool, string, error) {
-	validationPrompt := fmt.Sprintf("You are a strict validator. Validate that the assembled output strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nAssembled Output:\n%s\n\nDoes the output satisfy the expected schema?", step.CustomInstructions, step.ExpectedSchema, assembledJson)
+func (e *Engine) validateStepOutput(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest, assembledJson string) (bool, string, error) {
+	validationPrompt := fmt.Sprintf("You are a strict validator. Validate that the assembled output strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nAssembled Output:\n%s\n\nDoes the output satisfy the expected schema?", req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema, assembledJson)
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Validate Output",
@@ -293,19 +299,31 @@ func (e *Engine) validateStepOutput(ctx context.Context, state *pb.WorkflowConte
 	return result.Valid, result.Reason, nil
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition) (string, string, string, string, error) {
+func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (string, string, string, string, error) {
+	state := &pb.WorkflowContext{
+		JobId: req.JobId,
+		Metadata: req.Metadata,
+		GlobalState: req.GlobalState,
+		ActiveExecution: &pb.ActiveJobExecution{
+			JobId: req.JobId,
+			CurrentStepId: req.StepId,
+		},
+	}
+
 	var lastStepName string
 	lastStepId := ""
 	if state.ActiveExecution != nil {
 		lastStepId = state.ActiveExecution.CurrentStepId
 	}
 
-	lastStepName = step.StepName
-	lastStepId = step.Id
+	lastStepName = req.NodeConfig.NodeName
+	lastStepId = req.StepId
 
-	if step.CustomInstructions == "" || step.ExpectedSchema == "" {
-		return "", "", lastStepName, lastStepId, fmt.Errorf("step %s is missing required CustomInstructions or ExpectedSchema", step.StepName)
+	if req.NodeConfig.SystemInstructions == "" || req.NodeConfig.ExpectedSchema == "" {
+		return "", "", lastStepName, lastStepId, fmt.Errorf("step %s is missing required CustomInstructions or ExpectedSchema", req.NodeConfig.NodeName)
 	}
+
+	logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> STARTING WORKFLOW EXECUTION: %s", state.JobId, req.StepId, req.NodeConfig.NodeName)
 
 	maxRetries := 3
 	stepSuccess := false
@@ -321,41 +339,44 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 		// PLANNING AND REVIEW LOOP
 		if len(state.PendingActions) == 0 {
 			// 1. Planning Phase
-			plan, err := e.generatePlan(ctx, state, step)
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: GENERATE PLAN", state.JobId, req.StepId)
+			plan, err := e.generatePlan(ctx, state, req)
 			if err != nil {
-				log.Printf("WARN: [Engine] [JobID: %s | StepID: %s] Generate plan failed: %v", state.JobId, step.Id, err)
+				logger.Warn("Engine", "[JobID: %s | StepID: %s] Generate plan failed: %v", state.JobId, req.StepId, err)
 				if attempt == maxRetries {
 					return "", "", lastStepName, lastStepId, err
 				}
-				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, step.StepName, fmt.Sprintf("Plan generation failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
+				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Plan generation failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
 				continue
 			}
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: PLAN GENERATED SUCCESSFULLY", state.JobId, req.StepId)
 
 			// 2. Review Phase
-			approved, reviewReason, err := e.reviewPlan(ctx, state, step, plan)
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: REVIEW PLAN", state.JobId, req.StepId)
+			approved, reviewReason, err := e.reviewPlan(ctx, state, req, plan)
 			if err != nil {
-				log.Printf("WARN: [Engine] [JobID: %s | StepID: %s] Review plan failed: %v", state.JobId, step.Id, err)
+				logger.Warn("Engine", "[JobID: %s | StepID: %s] Review plan failed: %v", state.JobId, req.StepId, err)
 				if attempt == maxRetries {
 					return "", "", lastStepName, lastStepId, err
 				}
-				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, step.StepName, fmt.Sprintf("Plan review failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
+				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Plan review failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
 				continue
 			}
 
 			if !approved {
-				log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Plan rejected during Review Phase: %s", state.JobId, step.Id, reviewReason)
+				logger.Info("Engine", "[JobID: %s | StepID: %s] Plan rejected during Review Phase: %s", state.JobId, req.StepId, reviewReason)
 				if attempt == maxRetries {
-					e.publishEvent(ctx, state, events.EventJobStepFailed, step.StepName, "Review rejected plan after retries", reviewReason)
-					taskID, _ := e.triggerHumanValidation(ctx, state, step, "Plan Rejected: "+reviewReason, "Please correct the instructions or schema.")
+					e.publishEvent(ctx, state, events.EventJobStepFailed, req.NodeConfig.NodeName, "Review rejected plan after retries", reviewReason)
+					taskID, _ := e.triggerHumanValidation(ctx, state, req, "Plan Rejected: "+reviewReason, "Please correct the instructions or schema.")
 					return "", "", lastStepName, lastStepId, fmt.Errorf("%w: %s", ErrPendingHumanValidation, taskID)
 				}
 
-				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, step.StepName, fmt.Sprintf("Plan rejected, retrying (%d/%d): %s", attempt+1, maxRetries, reviewReason), "")
+				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Plan rejected, retrying (%d/%d): %s", attempt+1, maxRetries, reviewReason), "")
 				continue // Retry Planning!
 			}
 
 			// 3. Record Phase
-			e.publishEvent(ctx, state, events.EventPlanApproved, step.StepName, "Plan Approved", reviewReason)
+			e.publishEvent(ctx, state, events.EventPlanApproved, req.NodeConfig.NodeName, "Plan Approved", reviewReason)
 
 			var pbActions []*pb.ActionDefinition
 			for i, action := range plan.Actions {
@@ -367,7 +388,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				}
 
 				pbActions = append(pbActions, &pb.ActionDefinition{
-					Id:                    fmt.Sprintf("act_%s_%d", step.Id, i),
+					Id:                    fmt.Sprintf("act_%s_%d", req.StepId, i),
 					Name:                  action.ActionType,
 					OrchestratorPrimitive: action.ActionType,
 					PrimitiveType:         primitiveType,
@@ -390,20 +411,22 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 				return "", "", lastStepName, lastStepId, fmt.Errorf("unknown action type from planner: %s", action.OrchestratorPrimitive)
 			}
 
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> EXECUTING ACTION: %s", state.JobId, req.StepId, action.Name)
 			e.publishEvent(ctx, state, events.EventActionStarted, action.Id, fmt.Sprintf("Started Action: %s", action.Name), "")
 
-			actionStep := &pb.StepDefinition{
-				Id:                 step.Id,
-				StepName:           fmt.Sprintf("%s - %s", step.StepName, action.OrchestratorPrimitive),
-				CustomInstructions: action.Prompt,
-				ExpectedSchema:     action.ExpectedOutputSchema,
-				ContextInput:       step.ContextInput,
-				UseCache:           step.UseCache,
-				CacheKeyInput:      step.CacheKeyInput,
-				CacheConfig:        step.CacheConfig,
+			actionReq := &pb.ExecuteWorkflowNodeRequest{
+				JobId: req.JobId,
+				StepId: req.StepId,
+				GlobalState: req.GlobalState,
+				Metadata: req.Metadata,
+				NodeConfig: &pb.NodeConfiguration{
+					NodeName: fmt.Sprintf("%s - %s", req.NodeConfig.NodeName, action.OrchestratorPrimitive),
+					SystemInstructions: action.Prompt,
+					ExpectedSchema: action.ExpectedOutputSchema,
+				},
 			}
 
-			resJson, err := handler(ctx, state, actionStep)
+			resJson, err := handler(ctx, state, actionReq)
 			if err != nil {
 				actionError = err
 				break // Break execution loop
@@ -411,7 +434,10 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 			// The AI handler produces mutated JSON reflecting the new ActionState
 			if resJson != "" {
-				mergeIntoActionState(state, resJson)
+				if err := mergeIntoActionState(state, resJson); err != nil {
+					actionError = fmt.Errorf("failed to merge action state: %w", err)
+					break // Break execution loop
+				}
 			}
 
 			e.publishEvent(ctx, state, events.EventActionCompleted, action.Id, "Action Completed", "")
@@ -437,37 +463,58 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 			continue
 		}
 
-		// 5. Assembly Phase
-		assembledJson, err := e.assembleStepOutput(ctx, state, step)
-		if err != nil {
-			return "", "", lastStepName, lastStepId, err
+		var assembledJson string
+		var earlyTerminated bool
+		
+		if state.ActionState != nil {
+			actionMap := state.ActionState.AsMap()
+			if term, ok := actionMap["early_termination"].(bool); ok && term {
+				if ploadStr, ok := actionMap["extracted_payload"].(string); ok {
+					assembledJson = ploadStr
+					earlyTerminated = true
+					logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: EARLY TERMINATION DETECTED. SKIPPING ASSEMBLY AND VALIDATION.", state.JobId, req.StepId)
+				}
+			}
 		}
 
-		// 6. Validation Phase
-		valid, valReason, err := e.validateStepOutput(ctx, state, step, assembledJson)
-		if err != nil {
-			return "", "", lastStepName, lastStepId, err
-		}
-
-		if !valid {
-			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Step Validation Failed: %s", state.JobId, step.Id, valReason)
-			if attempt == maxRetries {
-				e.publishEvent(ctx, state, events.EventStepValidationFailed, step.StepName, "Step Validation Failed after retries", valReason)
-				taskID, _ := e.triggerHumanValidation(ctx, state, step, "Validation Failed: "+valReason, "The final output did not match the expected schema.")
-				return "", "", lastStepName, lastStepId, fmt.Errorf("%w: %s", ErrPendingHumanValidation, taskID)
+		if !earlyTerminated {
+			// 5. Assembly Phase
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: ASSEMBLE OUTPUT", state.JobId, req.StepId)
+			var err error
+			assembledJson, err = e.assembleStepOutput(ctx, state, req)
+			if err != nil {
+				return "", "", lastStepName, lastStepId, err
 			}
 
-			e.publishEvent(ctx, state, events.EventStepValidationFailedRetry, step.StepName, fmt.Sprintf("Validation failed, retrying (%d/%d): %s", attempt+1, maxRetries, valReason), "")
+			// 6. Validation Phase
+			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: VALIDATE OUTPUT", state.JobId, req.StepId)
+			valid, valReason, err := e.validateStepOutput(ctx, state, req, assembledJson)
+			if err != nil {
+				return "", "", lastStepName, lastStepId, err
+			}
 
-			// Force full Re-plan!
-			state.PendingActions = nil
-			state.CurrentActionIndex = 0
-			continue
+			if !valid {
+				logger.Info("Engine", "[JobID: %s | StepID: %s] Step Validation Failed: %s", state.JobId, req.StepId, valReason)
+				if attempt == maxRetries {
+					e.publishEvent(ctx, state, events.EventStepValidationFailed, req.NodeConfig.NodeName, "Step Validation Failed after retries", valReason)
+					taskID, _ := e.triggerHumanValidation(ctx, state, req, "Validation Failed: "+valReason, "The final output did not match the expected schema.")
+					return "", "", lastStepName, lastStepId, fmt.Errorf("%w: %s", ErrPendingHumanValidation, taskID)
+				}
+
+				e.publishEvent(ctx, state, events.EventStepValidationFailedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Validation failed, retrying (%d/%d): %s", attempt+1, maxRetries, valReason), "")
+
+				// Force full Re-plan!
+				state.PendingActions = nil
+				state.CurrentActionIndex = 0
+				continue
+			}
 		}
 
 		// 7. Success! Commit strictly to the Global State via a direct top-level merge.
 		// If WritesToStateKey is provided, nest the output safely.
-		mergeIntoGlobalState(state, assembledJson, step.WritesToStateKey)
+		if err := mergeIntoGlobalState(state, assembledJson, ""); err != nil {
+			return "", "", lastStepName, lastStepId, fmt.Errorf("failed to merge global state: %w", err)
+		}
 
 		stepSuccess = true
 		finalAssembledJson = assembledJson
@@ -476,7 +523,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 
 	if !stepSuccess {
 		// Redundant catch-all in case the loop exits without success and without a return
-		return "", "", lastStepName, lastStepId, fmt.Errorf("step %s failed after %d retries", step.StepName, maxRetries)
+		return "", "", lastStepName, lastStepId, fmt.Errorf("step %s failed after %d retries", req.NodeConfig.NodeName, maxRetries)
 	}
 
 	// Cleanup inner scope tracking
@@ -492,10 +539,12 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, state *pb.WorkflowContext,
 		finalJSON = []byte("{}")
 	}
 
+	logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> WORKFLOW EXECUTION SUCCESS: %s", state.JobId, req.StepId, req.NodeConfig.NodeName)
+	req.GlobalState = state.GlobalState
 	return string(finalJSON), finalAssembledJson, lastStepName, lastStepId, nil
 }
 
-func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
+func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
 	var currentAction *pb.ActionDefinition
 	var actionName string
 	if state.PendingActions != nil && len(state.PendingActions) > int(state.CurrentActionIndex) {
@@ -503,10 +552,10 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 		actionName = currentAction.Name
 	}
 
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s | Action: %s] Executing AI step: %s", state.JobId, req.Id, actionName, req.StepName)
-	prompt := req.CustomInstructions
+	logger.Info("Engine", "[JobID: %s | StepID: %s | Action: %s] Executing AI step: %s", state.JobId, req.StepId, actionName, req.NodeConfig.NodeName)
+	prompt := req.NodeConfig.SystemInstructions
 
-	if prompt == "" || req.ExpectedSchema == "" {
+	if prompt == "" || req.NodeConfig.ExpectedSchema == "" {
 		return "", fmt.Errorf("prompt and schema must be provided for AI step")
 	}
 
@@ -514,33 +563,32 @@ func (e *Engine) executeAIStep(ctx context.Context, state *pb.WorkflowContext, r
 		actionStateMap := state.ActionState.AsMap()
 		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
 			if payload, ok := actionStateMap["extracted_payload"]; ok {
-				log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.Id)
+				logger.Info("Engine", "[JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.StepId)
 				bytes, _ := json.Marshal(payload)
 				return string(bytes), nil
 			}
 		}
 	}
 
-	log.Printf("DEBUG: [Engine] [JobID: %s | StepID: %s | Action: %s] AI Step Prompt: %s\n", state.JobId, req.Id, actionName, prompt)
+	logger.Debug("Engine", "[JobID: %s | StepID: %s | Action: %s] AI Step Prompt: %s\n", state.JobId, req.StepId, actionName, prompt)
 
 	// The AI service natively extracts the schema and instructions from the ActionDefinition,
 	// and automatically appends the GlobalState and ActionState from the workflowCtx.
 	// We only need to pass the raw context input as the document text.
-	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, req.ContextInput, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
+	resp, err := e.aiClient.PerformAction(ctx, state, currentAction, nil, "", pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
 	if err != nil {
-		log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service failed for step %s: %v", state.JobId, req.Id, actionName, req.StepName, err)
-		return "", fmt.Errorf("failed to process step %s: %w", req.StepName, err)
+		logger.Error("Engine", "[JobID: %s | StepID: %s | Action: %s] AI service failed for step %s: %v", state.JobId, req.StepId, actionName, req.NodeConfig.NodeName, err)
+		return "", fmt.Errorf("failed to process step %s: %w", req.NodeConfig.NodeName, err)
 	}
 
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s | Action: %s] AI service completed for step %s", state.JobId, req.Id, actionName, req.StepName)
+	logger.Info("Engine", "[JobID: %s | StepID: %s | Action: %s] AI service completed for step %s", state.JobId, req.StepId, actionName, req.NodeConfig.NodeName)
 
 	rawJson := cleanJSON(resp.GetActionResultJson())
 	return rawJson, nil
 }
 
-
-func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Cache Store Step: %s", state.JobId, req.Id, req.StepName)
+func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
+	logger.Cache("Engine", "[JobID: %s | StepID: %s] Executing Cache Store Step: %s", state.JobId, req.StepId, req.NodeConfig.NodeName)
 
 	if e.pub == nil {
 		return "", fmt.Errorf("publisher is not configured")
@@ -549,7 +597,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 	if state.ActionState != nil {
 		actionStateMap := state.ActionState.AsMap()
 		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
-			log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Cache hit was detected previously. Skipping Store.", state.JobId, req.Id)
+			logger.Cache("Engine", "[JobID: %s | StepID: %s] Cache hit was detected previously. Skipping Store.", state.JobId, req.StepId)
 			return "{}", nil
 		}
 	}
@@ -562,18 +610,16 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 		payload = string(bytes)
 	}
 
-	useCache := req.UseCache
-	cacheInput := req.ContextInput
-	if req.CacheKeyInput != "" {
-		cacheInput = req.CacheKeyInput
-	}
+	useCache := false
+	if req.NodeConfig != nil && req.NodeConfig.Cache != nil { useCache = req.NodeConfig.Cache.Enabled }
+	cacheInput := ""
+	
 	collectionName := "default_collection"
 
-	if req.CacheConfig != nil {
-		useCache = req.CacheConfig.UseCache
-		cacheInput = req.CacheConfig.CacheInput
-		if req.CacheConfig.CollectionName != "" {
-			collectionName = req.CacheConfig.CollectionName
+	if req.NodeConfig != nil && req.NodeConfig.Cache != nil {
+		cacheInput = req.NodeConfig.Cache.LookupInput
+		if req.NodeConfig.Cache.CollectionName != "" {
+			collectionName = req.NodeConfig.Cache.CollectionName
 		}
 	}
 
@@ -592,8 +638,8 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 			ExtractedPayload: payload,
 		}
 
-		correlationID := fmt.Sprintf("%s_%s", state.JobId, req.Id)
-		
+		correlationID := fmt.Sprintf("%s_%s", state.JobId, req.StepId)
+
 		msg := &pb.CacheStoreMessage{
 			CorrelationId: correlationID,
 			Request:       reqStore,
@@ -601,11 +647,11 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 
 		bytes, err := protojson.Marshal(msg)
 		if err != nil {
-			log.Printf("ERROR: [Engine] [JobID: %s] Failed to marshal cache store msg: %v", state.JobId, err)
+			logger.Error("Engine", "[JobID: %s] Failed to marshal cache store msg: %v", state.JobId, err)
 		} else {
 			err = e.pub.PublishCacheStore(ctx, bytes)
 			if err != nil {
-				log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache store publish failed: %v", state.JobId, req.Id, err)
+				logger.Error("Engine", "[JobID: %s | StepID: %s] Cache store publish failed: %v", state.JobId, req.StepId, err)
 			}
 		}
 	}
@@ -622,7 +668,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *pb.Workfl
 	return "{\"cache_stored\": true}", nil
 }
 
-func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowContext, step *pb.StepDefinition, failedOutput string, errMsg string) (string, error) {
+func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest, failedOutput string, errMsg string) (string, error) {
 	addr := os.Getenv("HUMAN_VALIDATION_SERVICE_ADDRESS")
 	if addr == "" {
 		addr = "localhost:50054"
@@ -656,15 +702,15 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *pb.WorkflowC
 
 	createReq := &pb.CreateTaskRequest{
 		JobId:              state.JobId,
-		StepName:           step.StepName,
+		StepName:           req.NodeConfig.NodeName,
 		FailedAiOutput:     failedOutput,
-		ExpectedSchema:     step.ExpectedSchema,
-		PromptInstructions: step.CustomInstructions,
+		ExpectedSchema:     req.NodeConfig.ExpectedSchema,
+		PromptInstructions: req.NodeConfig.SystemInstructions,
 		ErrorMessage:       errMsg,
 		GlobalStateJson:    globalStateJSON,
 		JobName:            jobName,
-		StepId:             step.Id,
-		StepContextInput:   step.ContextInput,
+		StepId:             req.StepId,
+		StepContextInput:   "",
 	}
 
 	timeoutSecs := 10
@@ -719,35 +765,57 @@ func (e *Engine) publishEvent(ctx context.Context, state *pb.WorkflowContext, ev
 	}
 }
 
-func mergeIntoActionState(state *pb.WorkflowContext, jsonStr string) {
+func deepMerge(dst map[string]interface{}, src map[string]interface{}) {
+	for k, vSrc := range src {
+		vDst, exists := dst[k]
+		if exists {
+			mapDst, okDst := vDst.(map[string]interface{})
+			mapSrc, okSrc := vSrc.(map[string]interface{})
+			if okDst && okSrc {
+				deepMerge(mapDst, mapSrc)
+				continue
+			}
+		}
+		dst[k] = vSrc
+	}
+}
+
+func mergeIntoActionState(state *pb.WorkflowContext, jsonStr string) error {
 	if jsonStr == "" {
-		return
+		return nil
 	}
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return
+		return fmt.Errorf("malformed JSON in action state merge: %w", err)
 	}
 
 	if state.ActionState == nil {
-		state.ActionState, _ = structpb.NewStruct(parsed)
-		return
+		newState, err := structpb.NewStruct(parsed)
+		if err != nil {
+			return fmt.Errorf("failed to create new struct for action state: %w", err)
+		}
+		state.ActionState = newState
+		return nil
 	}
 
 	currentMap := state.ActionState.AsMap()
-	for k, v := range parsed {
-		currentMap[k] = v
+	deepMerge(currentMap, parsed)
+	
+	newState, err := structpb.NewStruct(currentMap)
+	if err != nil {
+		return fmt.Errorf("failed to update struct for action state: %w", err)
 	}
-	newState, _ := structpb.NewStruct(currentMap)
 	state.ActionState = newState
+	return nil
 }
 
-func mergeIntoGlobalState(state *pb.WorkflowContext, jsonStr string, targetKey string) {
+func mergeIntoGlobalState(state *pb.WorkflowContext, jsonStr string, targetKey string) error {
 	if jsonStr == "" {
-		return
+		return nil
 	}
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return
+		return fmt.Errorf("malformed JSON in global state merge: %w", err)
 	}
 
 	if state.GlobalState == nil {
@@ -756,39 +824,54 @@ func mergeIntoGlobalState(state *pb.WorkflowContext, jsonStr string, targetKey s
 
 	m := state.GlobalState.AsMap()
 	if targetKey != "" {
-		m[targetKey] = parsed
-	} else {
-		for k, v := range parsed {
-			m[k] = v
+		if existing, ok := m[targetKey].(map[string]interface{}); ok {
+			deepMerge(existing, parsed)
+			m[targetKey] = existing
+		} else {
+			m[targetKey] = parsed
 		}
+	} else {
+		deepMerge(m, parsed)
 	}
 
-	newState, _ := structpb.NewStruct(m)
+	
+	newState, err := structpb.NewStruct(m)
+	if err != nil {
+		return fmt.Errorf("failed to update struct for global state: %w", err)
+	}
+	
 	state.GlobalState = newState
+	return nil
 }
 
-func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.WorkflowContext, req *pb.StepDefinition) (string, error) {
-	log.Printf("INFO: [Engine] [JobID: %s | StepID: %s] Executing Zero Shot Classification Step: %s", state.JobId, req.Id, req.StepName)
+func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.WorkflowContext, req *pb.ExecuteWorkflowNodeRequest) (respStr string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Engine", "[JobID: %s | StepID: %s] Cache check PANICKED: %v. Falling back to AI execution.", state.JobId, req.StepId, r)
+			respStr = `{"cache_hit": false}`
+			err = nil
+		}
+	}()
+
+	logger.Cache("Engine", "[JobID: %s | StepID: %s] Executing Zero Shot Classification Step: %s", state.JobId, req.StepId, req.NodeConfig.NodeName)
 
 	if e.cacheClient == nil {
 		return "", fmt.Errorf("cache client is not configured")
 	}
 
 	var resp *pb.CheckCacheResponse
-	useCache := req.UseCache
-	cacheInput := req.CacheKeyInput
+	useCache := false
+	if req.NodeConfig != nil && req.NodeConfig.Cache != nil { useCache = req.NodeConfig.Cache.Enabled }
+	cacheInput := ""
 	threshold := float32(0.99)
 	collectionName := "default_collection"
 
-	if req.CacheConfig != nil {
-		useCache = req.CacheConfig.UseCache
-		cacheInput = req.CacheConfig.CacheInput
-		if req.CacheConfig.Threshold > 0 {
-			threshold = req.CacheConfig.Threshold
+	if req.NodeConfig != nil && req.NodeConfig.Cache != nil {
+		cacheInput = req.NodeConfig.Cache.LookupInput
+		if req.NodeConfig.Cache.CollectionName != "" {
+			collectionName = req.NodeConfig.Cache.CollectionName
 		}
-		if req.CacheConfig.CollectionName != "" {
-			collectionName = req.CacheConfig.CollectionName
-		}
+		threshold = req.NodeConfig.Cache.ConfidenceThreshold
 	} else if envVal := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); envVal != "" {
 		if parsed, err := strconv.ParseFloat(envVal, 32); err == nil {
 			threshold = float32(parsed)
@@ -801,7 +884,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		hashKey := hex.EncodeToString(hashBytes[:])
 
 		if ch, loaded := e.pendingCacheJobs.Load(hashKey); loaded {
-			log.Printf("INFO: [Engine] [JobID: %s] CACHE STAMPEDE DELAY! Waiting for identical job...", state.JobId)
+			logger.Cache("Engine", "[JobID: %s] CACHE STAMPEDE DELAY! Waiting for identical job...", state.JobId)
 			select {
 			case <-ch.(chan struct{}):
 			case <-time.After(30 * time.Second):
@@ -815,7 +898,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		for k, v := range state.Metadata {
 			metadataStruct.Fields[k] = structpb.NewStringValue(v)
 		}
-		
+
 		reqCheck := &pb.CheckCacheRequest{
 			CollectionName: collectionName,
 			Text:           cacheInput,
@@ -825,9 +908,18 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 
 		resp, err = e.cacheClient.CheckCache(ctx, reqCheck)
 		if err != nil {
-			log.Printf("ERROR: [Engine] [JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.Id, err)
+			logger.Error("Engine", "[JobID: %s | StepID: %s] Cache check failed: %v", state.JobId, req.StepId, err)
 			resp = &pb.CheckCacheResponse{Hit: false}
 		}
+
+		logText := cacheInput
+		if len(logText) > 100 {
+			logText = logText[:100] + "..."
+		}
+		
+		metaBytes, _ := json.Marshal(state.Metadata)
+		logger.Cache("Engine", "ZERO-SHOT CACHE EVALUATION [JOBID: %s] - STATE SUBMITTED: [TEXT: %s | METADATA: %s] | OUTCOME (HIT): %t | COSINE SIMILARITY SCORE: %f", state.JobId, logText, string(metaBytes), resp.Hit, resp.Confidence)
+		logger.Debug("Engine", "FULL ZERO-SHOT CACHE INPUT TEXT [JOBID: %s]:\n%s\n", state.JobId, cacheInput)
 
 		if !resp.Hit {
 			ch := make(chan struct{})
@@ -846,15 +938,14 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 	}
 
 	if resp.Hit && resp.ExtractedPayload != "" {
-		log.Printf("INFO: [Engine] [JobID: %s] Zero-Shot Cache hit! Returning payload immediately.", state.JobId)
-		
-		mergeIntoGlobalState(state, resp.ExtractedPayload, req.WritesToStateKey)
+		logger.Cache("Engine", "[JobID: %s] Zero-Shot Cache hit! Extracted Payload: %s", state.JobId, resp.ExtractedPayload)
 
 		// Fast-fail the remaining actions in the plan to simulate immediate step completion!
 		state.PendingActions = nil
 		state.CurrentActionIndex = 0
 
-		return `{"cache_hit": true, "early_termination": true}`, nil
+		payloadEscaped, _ := json.Marshal(resp.ExtractedPayload)
+		return fmt.Sprintf(`{"cache_hit": true, "early_termination": true, "extracted_payload": %s}`, payloadEscaped), nil
 	}
 
 	return `{"cache_hit": false}`, nil

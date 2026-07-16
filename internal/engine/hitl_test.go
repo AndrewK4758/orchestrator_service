@@ -19,7 +19,15 @@ func TestGeneratePlan_RequireHumanReview(t *testing.T) {
 		ExpectedSchema:     `{"type": "object"}`,
 	}
 
-	plan, err := eng.generatePlan(context.Background(), state, step)
+	plan, err := eng.generatePlan(context.Background(), state, &pb.ExecuteWorkflowNodeRequest{
+		NodeConfig: &pb.NodeConfiguration{
+			SystemInstructions: step.CustomInstructions,
+			ExpectedSchema: step.ExpectedSchema,
+			HumanValidation: &pb.HumanValidationConfiguration{
+				Required: step.RequireHumanReview,
+			},
+		},
+	})
 	if err != nil {
 		t.Fatalf("generatePlan failed unexpectedly: %v", err)
 	}

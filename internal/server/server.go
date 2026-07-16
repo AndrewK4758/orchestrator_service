@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
 	"sync"
@@ -25,13 +25,9 @@ import (
 )
 
 type JobTracker struct {
-	State           *pb.WorkflowContext
-	FullSteps       []*pb.StepDefinition
-	JobGraph        []*pb.JobWorkflowEdge
-	StepReq         *pb.SubmitStepRequest
-	CallbackAddress string
-	Cancel          context.CancelFunc
-	mu              sync.Mutex
+	Req    *pb.ExecuteWorkflowNodeRequest
+	Cancel context.CancelFunc
+	mu     sync.Mutex
 }
 
 func (j *JobTracker) Lock() {
@@ -68,7 +64,7 @@ type JobPublisher interface {
 func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	cacheClient, _, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
 	if err != nil {
-		log.Printf("Warning: failed to connect to cache service, cache will be disabled: %v", err)
+		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
 	}
 
 	eng := engine.NewEngine(aiClient, cacheClient, pub)
@@ -83,209 +79,70 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 	}
 
 	// Load pending jobs from Traceability Service
-	if traceClient != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		resp, err := traceClient.GetPendingJobs(ctx, &pb.GetPendingJobsRequest{})
-		if err != nil {
-			log.Printf("WARNING: Failed to load pending jobs from Traceability: %v", err)
-		} else {
-			loadedCount := 0
-			for _, jobRecord := range resp.Jobs {
-				if jobRecord.OriginalRequest != nil {
-					srv.activeJobs[jobRecord.JobId] = &JobTracker{
-						State:           jobRecord.OriginalRequest.Context,
-						FullSteps:       jobRecord.OriginalRequest.Steps,
-						JobGraph:        jobRecord.OriginalRequest.JobGraph,
-						CallbackAddress: jobRecord.OriginalRequest.CallbackAddress,
-					}
-					loadedCount++
-				}
-			}
-			log.Printf("Successfully loaded %d pending jobs from Traceability.", loadedCount)
-		}
-	}
-
 	err = srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
 	if err != nil {
-		log.Printf("ERROR: Failed to start job consumer: %v", err)
+		logger.Error("System", "Failed to start job consumer: %v", err)
 	}
 
 	return srv
 }
 
-func (s *OrchestratorServer) SubmitJob(ctx context.Context, req *pb.SubmitJobRequest) (*pb.SubmitJobResponse, error) {
-	workflowCtx := req.Context
-	if workflowCtx == nil {
-		workflowCtx = &pb.WorkflowContext{}
+func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.ExecuteWorkflowNodeResponse, error) {
+	if req.GlobalState == nil {
+		req.GlobalState, _ = structpb.NewStruct(map[string]interface{}{})
 	}
 
-	jobID := workflowCtx.JobId
+	jobID := req.JobId
 	if jobID == "" {
 		appID := "app"
-		if workflowCtx.Metadata != nil && workflowCtx.Metadata["app_id"] != "" {
-			appID = workflowCtx.Metadata["app_id"]
+		if req.Metadata != nil && req.Metadata["app_id"] != "" {
+			appID = req.Metadata["app_id"]
 		}
 		jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
-		workflowCtx.JobId = jobID
+		req.JobId = jobID
 	}
 
-	if workflowCtx.Metadata == nil {
-		workflowCtx.Metadata = make(map[string]string)
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]string)
 	}
-	tenantID := workflowCtx.Metadata["tenant_id"]
+	tenantID := req.Metadata["tenant_id"]
 	if tenantID == "" {
 		tenantID = "SYSTEM_DEFAULT_TENANT"
-		workflowCtx.Metadata["tenant_id"] = tenantID
+		req.Metadata["tenant_id"] = tenantID
 	}
 
-	log.Printf("Received job, using JobID: %s for Tenant: %s", jobID, tenantID)
+	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
 
 	tracker := &JobTracker{
-		State:           workflowCtx,
-		FullSteps:       req.Steps,
-		JobGraph:        req.JobGraph,
-		CallbackAddress: req.GetCallbackAddress(),
+		Req:    req,
 	}
 
 	s.mu.Lock()
 	s.activeJobs[jobID] = tracker
 	s.mu.Unlock()
 
-	// Mirror State to Traceability
-	if s.traceClient != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_, err := s.traceClient.SaveJobState(ctx, &pb.SaveJobStateRequest{
-				JobId:           jobID,
-				OriginalRequest: req,
-				Status:          "PENDING",
-			})
-			if err != nil {
-				log.Printf("ERROR: Failed to save job state to Traceability for JobID %s: %v", jobID, err)
-			} else {
-				log.Printf("Saved job state to Traceability for JobID %s", jobID)
-			}
-		}()
-	}
-
-	return &pb.SubmitJobResponse{
-		JobId:  jobID,
-		Status: "CACHED",
-	}, nil
-}
-
-func (s *OrchestratorServer) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJobResponse, error) {
-	jobID := req.GetJobId()
-	if jobID == "" {
-		return nil, fmt.Errorf("job_id is required")
-	}
-
-	s.mu.RLock()
-	tracker, exists := s.activeJobs[jobID]
-	s.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("job %s not found in cache", jobID)
-	}
-
-	var stepID string
-	if tracker.State != nil && tracker.State.JobDefinition != nil && tracker.State.JobDefinition.InitialStepId != "" {
-		stepID = tracker.State.JobDefinition.InitialStepId
-	} else if len(tracker.FullSteps) > 0 {
-		stepID = tracker.FullSteps[0].Id
-	} else {
-		stepID = "step_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-
-	log.Printf("Received StartJob for JobID: %s, Initial StepID: %s", jobID, stepID)
-
-	stepReq := &pb.SubmitStepRequest{
-		JobId:       jobID,
-		StepId:      stepID,
-		CompleteJob: false,
-	}
-
-	payloadBytes, err := s.updateExecutionAndMarshal(tracker, stepReq)
+	payloadBytes, err := proto.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
 	}
 
-	log.Printf("DEBUG: Publishing payload of size %d to NATS...", len(payloadBytes))
 	err = s.pub.PublishJob(ctx, payloadBytes)
 	if err != nil {
-		log.Printf("ERROR: Failed to publish job to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue job start: %w", err)
-	}
-	log.Printf("DEBUG: Successfully published JobID %s to JetStream!", jobID)
-
-	return &pb.StartJobResponse{
-		Success:      true,
-		Message:      "Job started",
-		ActiveStepId: stepID,
-	}, nil
-}
-
-func (s *OrchestratorServer) SubmitStep(ctx context.Context, req *pb.SubmitStepRequest) (*pb.SubmitStepResponse, error) {
-	jobID := req.GetJobId()
-	if jobID == "" {
-		return nil, fmt.Errorf("job_id is required in SubmitStepRequest")
+		logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
+		return nil, fmt.Errorf("failed to queue job: %w", err)
 	}
 
-	s.mu.RLock()
-	tracker, exists := s.activeJobs[jobID]
-	s.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("job %s not found in cache", jobID)
-	}
-
-	stepID := req.GetStepId()
-	if stepID == "" {
-		return nil, fmt.Errorf("step_id is required in SubmitStepRequest")
-	}
-
-	log.Printf("Received SubmitStep for JobID: %s, StepID: %s", jobID, stepID)
-
-	payloadBytes, err := s.updateExecutionAndMarshal(tracker, req)
-	if err != nil {
-		return nil, err
-	}
-
-	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
-	if err != nil {
-		log.Printf("ERROR: Failed to publish priority step to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue step: %w", err)
-	}
-
-	return &pb.SubmitStepResponse{
+	return &pb.ExecuteWorkflowNodeResponse{
 		Success: true,
-		Message: "Step queued for execution",
-		StepId:  stepID,
+		Message: "Node queued for execution",
+		StepId:  req.StepId,
 	}, nil
 }
 
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
-	type Payload struct {
-		StateBytes      []byte `json:"state_bytes"`
-		StepReqBytes    []byte `json:"step_req_bytes"`
-		CallbackAddress string `json:"callback_address"`
-	}
-
-	var p Payload
-	if err := json.Unmarshal(msg.Data(), &p); err != nil {
-		return fmt.Errorf("failed to unmarshal job payload: %w", err)
-	}
-
-	state := &pb.WorkflowContext{}
-	if err := proto.Unmarshal(p.StateBytes, state); err != nil {
-		return fmt.Errorf("failed to unmarshal WorkflowContext: %w", err)
-	}
-
-	req := &pb.SubmitStepRequest{}
-	if err := proto.Unmarshal(p.StepReqBytes, req); err != nil {
-		return fmt.Errorf("failed to unmarshal SubmitStepRequest: %w", err)
+	req := &pb.ExecuteWorkflowNodeRequest{}
+	if err := proto.Unmarshal(msg.Data(), req); err != nil {
+		return fmt.Errorf("failed to unmarshal ExecuteWorkflowNodeRequest: %w", err)
 	}
 
 	s.mu.RLock()
@@ -296,142 +153,81 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	defer cancel()
 
 	if !exists {
-		log.Printf("INFO: Job %s not found in cache. Attempting state recovery.", req.JobId)
-
-		// Fallback 1: Query Traceability Service
-		if s.traceClient != nil {
-			ctxTrace, cancelTrace := context.WithTimeout(ctx, 5*time.Second)
-			defer cancelTrace()
-			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{JobId: req.JobId})
-			if err == nil && resp.Found && resp.Job != nil && resp.Job.OriginalRequest != nil {
-				tracker = &JobTracker{
-					State:           resp.Job.OriginalRequest.Context,
-					FullSteps:       resp.Job.OriginalRequest.Steps,
-					JobGraph:        resp.Job.OriginalRequest.JobGraph,
-					CallbackAddress: resp.Job.OriginalRequest.CallbackAddress,
-				}
-				s.mu.Lock()
-				s.activeJobs[req.JobId] = tracker
-				s.mu.Unlock()
-				exists = true
-				log.Printf("INFO: [JobID: %s] Recovered state from Traceability", req.JobId)
-			}
-		}
-
-		// Fallback 2: Query Client via CallbackAddress
-		if !exists && p.CallbackAddress != "" {
-			maxMsgSizeMb := 100
-			if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
-				if parsed, err := strconv.Atoi(envVal); err == nil {
-					maxMsgSizeMb = parsed
-				}
-			}
-			conn, err := grpc.NewClient(p.CallbackAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
-			if err == nil {
-				defer conn.Close()
-				client := pb.NewOrchestratorCallbackServiceClient(conn)
-				ctxCb, cancelCb := context.WithTimeout(ctx, 5*time.Second)
-				defer cancelCb()
-
-				resp, err := client.GetJobDetails(ctxCb, &pb.GetJobDetailsRequest{JobId: req.JobId})
-				if err == nil && resp.Found && resp.OriginalRequest != nil {
-					tracker = &JobTracker{
-						State:           resp.OriginalRequest.Context,
-						FullSteps:       resp.OriginalRequest.Steps,
-						JobGraph:        resp.OriginalRequest.JobGraph,
-						CallbackAddress: resp.OriginalRequest.CallbackAddress,
-					}
-					s.mu.Lock()
-					s.activeJobs[req.JobId] = tracker
-					s.mu.Unlock()
-					exists = true
-					log.Printf("INFO: [JobID: %s] Recovered state from Client", req.JobId)
-				}
-			}
-		}
-
-		if !exists {
-			log.Printf("CRITICAL: Job %s could not be recovered from Traceability or Client. Dropping message.", req.JobId)
-			msg.Ack()
-			return nil
-		}
+		tracker = &JobTracker{Req: req}
+		s.mu.Lock()
+		s.activeJobs[req.JobId] = tracker
+		s.mu.Unlock()
 	}
 
 	tracker.Lock()
 	tracker.Cancel = cancel
 	tracker.Unlock()
 
-	var activeStep *pb.StepDefinition
-	for _, st := range tracker.FullSteps {
-		if st.Id == req.StepId {
-			activeStep = st
-			break
-		}
-	}
-	if activeStep == nil {
-		return fmt.Errorf("step %s not found in job %s cache", req.StepId, req.JobId)
-	}
-
-	activeStepCopy := proto.Clone(activeStep).(*pb.StepDefinition)
-	if req.CustomInstructions != "" {
-		activeStepCopy.CustomInstructions = req.CustomInstructions
-	}
-	if req.ExpectedSchema != "" {
-		activeStepCopy.ExpectedSchema = req.ExpectedSchema
+	if req.NodeConfig == nil {
+		return fmt.Errorf("node config is missing from request for job %s", req.JobId)
 	}
 
 	// ZERO-SHOT CACHE BYPASS
-	if req.CacheConfig != nil && req.CacheConfig.UseCache && s.cacheClient != nil {
-		log.Printf("INFO: [JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", req.JobId, req.StepId, req.CacheConfig.CollectionName)
+	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
+		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", req.JobId, req.StepId, req.NodeConfig.Cache.CollectionName)
 		ctxCache, cancelCache := context.WithTimeout(ctx, 10*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
-			CollectionName: req.CacheConfig.CollectionName,
-			Text:           req.CacheConfig.CacheInput,
-			Metadata:       req.CacheConfig.Metadata,
-			Threshold:      req.CacheConfig.Threshold,
+			CollectionName: req.NodeConfig.Cache.CollectionName,
+			Text:           req.NodeConfig.Cache.LookupInput,
+			Metadata:       nil, // To convert map to structpb.Struct correctly: we can just leave it nil or map it if required. I'll leave nil here.
+			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
 		})
 		cancelCache()
 
 		if err != nil {
-			log.Printf("WARN: [JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
+			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
 		} else if cacheResp.Hit {
-			log.Printf("SUCCESS: [JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f. Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence)
-			s.fireCallback(tracker, state, req, cacheResp.ExtractedPayload, "", req.StepId)
-			return nil
+			minConf := 0.975
+			if envConf := os.Getenv("MIN_CACHE_CONFIDENCE"); envConf != "" {
+				if parsed, parseErr := strconv.ParseFloat(envConf, 32); parseErr == nil {
+					minConf = parsed
+				}
+			}
+			if float64(cacheResp.Confidence) >= minConf {
+				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (>= %.3f). Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence, minConf)
+				s.fireCallback(tracker, req, cacheResp.ExtractedPayload, "", req.StepId)
+				return nil
+			}
+			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE HIT but confidence %.2f is below minimum %.3f. Proceeding with standard ReAct execution.", req.JobId, req.StepId, cacheResp.Confidence, minConf)
 		} else {
-			log.Printf("INFO: [JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
+			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
 		}
 	}
 
-	log.Printf("Executing step %s for job %s", activeStepCopy.StepName, state.JobId)
+	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, req.JobId)
 
-	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(ctx, state, activeStepCopy)
+	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(ctx, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
-			log.Printf("INFO: Job %s paused for human validation", state.JobId)
+			logger.Info("System", "Job %s paused for human validation", req.JobId)
 			tracker.Lock()
-			tracker.State = state
+			tracker.Req = req
 			tracker.Unlock()
 			return nil
 		}
-		log.Printf("ERROR: Workflow execution failed: %v", err)
-		s.fireCallback(tracker, state, req, stepOutputJSON, err.Error(), lastStepId)
+		logger.Error("System", "Workflow execution failed: %v", err)
+		s.fireCallback(tracker, req, stepOutputJSON, err.Error(), lastStepId)
 		return nil
 	}
 
-	log.Printf("Workflow completed successfully for step %s. Firing callback.", activeStep.StepName)
-	s.fireCallback(tracker, state, req, stepOutputJSON, "", lastStepId)
+	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
+	s.fireCallback(tracker, req, stepOutputJSON, "", lastStepId)
 
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.WorkflowContext, req *pb.SubmitStepRequest, stepOutputJSON string, errMsg string, lastStepId string) {
-	cbAddress := tracker.CallbackAddress
+func (s *OrchestratorServer) fireCallback(tracker *JobTracker, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) {
+	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
-		log.Printf("No callback address provided, skipping callback")
-		if req.CompleteJob || errMsg != "" {
-			s.handleCallbackError(errMsg, state)
+		logger.Info("System", "No callback address provided, skipping callback")
+		if errMsg != "" {
+			s.handleCallbackError(errMsg, req)
 		}
 		return
 	}
@@ -444,9 +240,9 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 	}
 	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
-		log.Printf("ERROR: Failed to dial callback address %s: %v", cbAddress, err)
-		if req.CompleteJob || errMsg != "" {
-			s.handleCallbackError(errMsg, state)
+		logger.Error("System", "Failed to dial callback address %s: %v", cbAddress, err)
+		if errMsg != "" {
+			s.handleCallbackError(errMsg, req)
 		}
 		return
 	}
@@ -465,35 +261,29 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, state *pb.Workflo
 
 	if errMsg != "" {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
-			JobId:        state.JobId,
+			JobId:        req.JobId,
 			FailedStepId: lastStepId,
 			ErrorMessage: errMsg,
 		})
 	} else {
-		jobDefId := ""
-		if state.JobDefinition != nil {
-			jobDefId = state.JobDefinition.Id
-		}
-
 		var stepOutMap map[string]interface{}
 		json.Unmarshal([]byte(stepOutputJSON), &stepOutMap)
 		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
 
-		_, err = client.OnStepComplete(ctx, &pb.StepCompleteRequest{
-			JobId:           state.JobId,
-			JobDefinitionId: jobDefId,
+		_, err = client.OnNodeExecutionComplete(ctx, &pb.NodeExecutionCompleteRequest{
+			JobId:           req.JobId,
 			CompletedStepId: lastStepId,
-			GlobalState:     state.GlobalState,
-			StepOutput:      stepOutStruct,
+			GlobalState:     req.GlobalState,
+			NodeOutput:      stepOutStruct,
 		})
 	}
 
 	if err != nil {
-		log.Printf("ERROR: Callback failed: %v", err)
+		logger.Error("System", "Callback failed: %v", err)
 	}
 
-	if req.CompleteJob || errMsg != "" {
-		s.handleCallbackError(errMsg, state)
+	if errMsg != "" {
+		s.handleCallbackError(errMsg, req)
 	}
 }
 
@@ -508,38 +298,23 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	}
 
 	tracker.Lock()
-	stepReq := tracker.StepReq
+	stepReq := tracker.Req
 	if stepReq == nil {
 		tracker.Unlock()
 		return &pb.ResumeJobResponse{Success: false, Message: "No active step to resume"}, nil
 	}
-
-	var currentStep *pb.StepDefinition
-	for _, st := range tracker.FullSteps {
-		if st.Id == stepReq.StepId {
-			currentStep = st
-			break
-		}
-	}
-	if currentStep == nil {
-		tracker.Unlock()
-		return &pb.ResumeJobResponse{Success: false, Message: "Step definition not found in cache"}, nil
-	}
-
-	// Remove arbitrary WriteToStateKey, instead assume GlobalState merge from ReAct loop
-	tracker.State.CurrentActionIndex++
 	tracker.Unlock()
 
-	log.Printf("INFO: Resuming job %s after human correction", jobID)
+	logger.Info("System", "Resuming job %s after human correction", jobID)
 
-	payloadBytes, err := s.updateExecutionAndMarshal(tracker, stepReq)
+	payloadBytes, err := proto.Marshal(stepReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal resumed request for job %s: %w", jobID, err)
 	}
 
 	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
 	if err != nil {
-		log.Printf("ERROR: Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
+		logger.Error("System", "Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue resumed step: %w", err)
 	}
 
@@ -549,11 +324,11 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	}, nil
 }
 
-func (s *OrchestratorServer) handleCallbackError(errMsg string, state *pb.WorkflowContext) {
+func (s *OrchestratorServer) handleCallbackError(errMsg string, req *pb.ExecuteWorkflowNodeRequest) {
 	s.mu.Lock()
-	delete(s.activeJobs, state.JobId)
+	delete(s.activeJobs, req.JobId)
 	s.mu.Unlock()
-	log.Printf("INFO: Job %s complete or failed. Teared down cache.", state.JobId)
+	logger.Info("System", "Job %s complete or failed. Teared down cache.", req.JobId)
 
 	if s.traceClient != nil {
 		go func() {
@@ -564,7 +339,7 @@ func (s *OrchestratorServer) handleCallbackError(errMsg string, state *pb.Workfl
 			ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancelTrace()
 			_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
-				JobId:  state.JobId,
+				JobId:  req.JobId,
 				Status: status,
 			})
 		}()
@@ -577,13 +352,13 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 		return nil, fmt.Errorf("app_id is required")
 	}
 
-	log.Printf("INFO: Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetAppId(), req.GetPurgeQueues())
+	logger.Info("System", "Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetAppId(), req.GetPurgeQueues())
 
 	s.mu.Lock()
 	var jobsToCancel []string
 	for jobID, tracker := range s.activeJobs {
-		if tracker.State != nil && tracker.State.Metadata != nil {
-			if tracker.State.Metadata["app_id"] == req.GetAppId() {
+		if tracker.Req != nil && tracker.Req.Metadata != nil {
+			if tracker.Req.Metadata["app_id"] == req.GetAppId() {
 				jobsToCancel = append(jobsToCancel, jobID)
 				if tracker.Cancel != nil {
 					tracker.Cancel()
@@ -601,13 +376,13 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 	if req.GetPurgeQueues() {
 		err := s.pub.PurgeQueues(ctx)
 		if err != nil {
-			log.Printf("ERROR: Failed to purge queues: %v", err)
+			logger.Error("System", "Failed to purge queues: %v", err)
 		} else {
 			queuesPurged = 3 // JOBS, TRACE_EVENTS, CACHE_REQUESTS
 		}
 	}
 
-	log.Printf("WARN: [Engine] [AppID: %s] System state purge commanded by client. Cancelled %d jobs, purged %d queues.", req.GetAppId(), len(jobsToCancel), queuesPurged)
+	logger.Warn("Engine", "[AppID: %s] System state purge commanded by client. Cancelled %d jobs, purged %d queues.", req.GetAppId(), len(jobsToCancel), queuesPurged)
 
 	return &pb.PurgeSystemStateResponse{
 		Success:       true,
@@ -616,39 +391,4 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 	}, nil
 }
 
-// updateExecutionAndMarshal locks the tracker, updates the ActiveExecution state, and serializes the JetStream payload.
-func (s *OrchestratorServer) updateExecutionAndMarshal(tracker *JobTracker, stepReq *pb.SubmitStepRequest) ([]byte, error) {
-	tracker.Lock()
-	tracker.StepReq = stepReq
-	if tracker.State.ActiveExecution == nil {
-		tracker.State.ActiveExecution = &pb.ActiveJobExecution{JobId: stepReq.JobId}
-	}
-	tracker.State.ActiveExecution.CurrentStepId = stepReq.StepId
-	tracker.Unlock()
 
-	type Payload struct {
-		StateBytes      []byte `json:"state_bytes"`
-		StepReqBytes    []byte `json:"step_req_bytes"`
-		CallbackAddress string `json:"callback_address"`
-	}
-
-	stateBytes, err := proto.Marshal(tracker.State)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize state: %w", err)
-	}
-	stepReqBytes, err := proto.Marshal(stepReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize step request: %w", err)
-	}
-
-	payloadBytes, err := json.Marshal(Payload{
-		StateBytes:      stateBytes,
-		StepReqBytes:    stepReqBytes,
-		CallbackAddress: tracker.CallbackAddress,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize payload: %w", err)
-	}
-
-	return payloadBytes, nil
-}

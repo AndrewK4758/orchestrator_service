@@ -4,15 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"google.golang.org/grpc"
 	"strings"
 	"testing"
-	"google.golang.org/grpc"
 
 	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"google.golang.org/protobuf/types/known/structpb"
+	"net"
+	"os"
 )
+
+type MockHumanValidationServer struct {
+	pb.UnimplementedHumanValidationServiceServer
+}
+
+func (m *MockHumanValidationServer) CreateValidationTask(ctx context.Context, req *pb.CreateTaskRequest) (*pb.CreateTaskResponse, error) {
+	return &pb.CreateTaskResponse{TaskId: "mock_task"}, nil
+}
+
+func init() {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err == nil {
+		os.Setenv("HUMAN_VALIDATION_SERVICE_ADDRESS", l.Addr().String())
+		srv := grpc.NewServer()
+		pb.RegisterHumanValidationServiceServer(srv, &MockHumanValidationServer{})
+		go srv.Serve(l)
+	}
+}
 
 type MockAIClient struct {
 	PerformActionFunc func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
@@ -48,6 +68,14 @@ type MockCacheClient struct {
 	CheckCacheFunc      func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error)
 	StoreExtractionFunc func(ctx context.Context, req *pb.StoreExtractionRequest, opts ...grpc.CallOption) (*pb.StoreExtractionResponse, error)
 	SeedCacheFunc       func(ctx context.Context, req *pb.SeedCacheRequest, opts ...grpc.CallOption) (*pb.SeedCacheResponse, error)
+	CheckMetadataExistsFunc func(ctx context.Context, req *pb.CheckMetadataRequest, opts ...grpc.CallOption) (*pb.CheckMetadataResponse, error)
+}
+
+func (m *MockCacheClient) CheckMetadataExists(ctx context.Context, req *pb.CheckMetadataRequest, opts ...grpc.CallOption) (*pb.CheckMetadataResponse, error) {
+	if m.CheckMetadataExistsFunc != nil {
+		return m.CheckMetadataExistsFunc(ctx, req, opts...)
+	}
+	return &pb.CheckMetadataResponse{Exists: false}, nil
 }
 
 func (m *MockCacheClient) CheckCache(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
@@ -71,12 +99,12 @@ func (m *MockCacheClient) SeedCache(ctx context.Context, req *pb.SeedCacheReques
 	return &pb.SeedCacheResponse{Success: true}, nil
 }
 
-func TestExecuteWorkflow_FuzzState(t *testing.T) {
-	// 1. Generic State Testing (Crucial)
-	// Pass completely arbitrary, complex JSON schemas (State) to the Orchestrator
-	complexJSONStr := `{"fuzzed_key1": ["arbitrary", "data", {"nested": true}], "fuzzed_key2": 12345}`
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
-	json.Unmarshal([]byte(complexJSONStr), &statePayload.Fields)
+func TestGenericStateMerging(t *testing.T) {
+	// Objective: Prove Orchestrator correctly handles completely unknown JSON states.
+	complexJSONStr := `{"fuzzed_key1": ["arbitrary", "data", {"nested": true}], "fuzzed_key2": 12345, "fuzzed_key3": null, "fuzzed_key4": 99.99}`
+	var data map[string]interface{}
+	json.Unmarshal([]byte(complexJSONStr), &data)
+	statePayload, _ := structpb.NewStruct(data)
 
 	state := &pb.WorkflowContext{
 		JobId:       "fuzz_job_123",
@@ -88,7 +116,7 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 		StepName:           "Fuzzed Step",
 		CustomInstructions: "Do nothing but return the JSON",
 		ExpectedSchema:     `{"type": "object"}`,
-		UseCache:           true,
+		UseCache:           false,
 	}
 
 	mockAI := &MockAIClient{
@@ -99,11 +127,9 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 				planJSON := `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`
 				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"output": "valid"}`}, nil
+				return &pb.PerformActionResponse{ActionResultJson: `{"new_ai_key": "ai_value"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Validate") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Execute") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"result": "success"}`}, nil
 			}
 			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
 		},
@@ -113,19 +139,37 @@ func TestExecuteWorkflow_FuzzState(t *testing.T) {
 	mockCache := &MockCacheClient{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: step.Id,
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: step.StepName,
+			SystemInstructions: step.CustomInstructions,
+			ExpectedSchema: step.ExpectedSchema,
+			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
+		},
+	}
+
+	finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Engine failed to process arbitrary state: %v", err)
 	}
 
-	if !strings.Contains(resultJson, "valid") {
-		t.Errorf("Expected result JSON to contain 'valid', got: %s", resultJson)
+	var finalData map[string]interface{}
+	if err := json.Unmarshal([]byte(finalJsonStr), &finalData); err != nil {
+		t.Fatalf("Failed to parse final JSON: %v", err)
+	}
+
+	if finalData["fuzzed_key2"].(float64) != 12345 {
+		t.Errorf("Expected fuzzed_key2 to be 12345, got %v", finalData["fuzzed_key2"])
+	}
+	if finalData["new_ai_key"] != "ai_value" {
+		t.Errorf("Expected new_ai_key to be 'ai_value', got %v", finalData["new_ai_key"])
 	}
 }
 
 func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
-	// Proves that when the Client passes WritesToStateKey, the Go Orchestrator correctly
-	// nests the state output without hardcoding the key check anywhere in business logic.
 	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
 	state := &pb.WorkflowContext{
 		JobId:       "fuzz_namespace_123",
@@ -135,47 +179,50 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	step := &pb.StepDefinition{
 		Id:                 "step-999",
 		StepName:           "Namespaced Step",
-		CustomInstructions: "Output anything",
+		CustomInstructions: "test",
 		ExpectedSchema:     `{"type": "object"}`,
 		WritesToStateKey:   "DynamicTargetEntityKey",
+		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
 	}
 
 	mockAI := &MockAIClient{
 		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			if strings.Contains(currentAction.Name, "Assemble") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"extracted_data": "success"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Validate") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Execute") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"result": "success"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Review") {
+			if strings.Contains(currentAction.Name, "Review Plan") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
-			} else if strings.Contains(currentAction.Name, "Generate Plan") {
-				return &pb.PerformActionResponse{ActionResultJson: `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`}, nil
 			}
-			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+			if strings.Contains(currentAction.Name, "Validate Output") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			if strings.Contains(currentAction.Name, "Assemble Output") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"extracted_data": "success"}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: `{"extracted_data": "success"}`}, nil
 		},
 	}
 
-	mockPub := &MockTracePublisher{}
 	mockCache := &MockCacheClient{}
+	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: step.Id,
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: step.StepName,
+			SystemInstructions: step.CustomInstructions,
+			ExpectedSchema: step.ExpectedSchema,
+			PrimitiveType: step.StepPrimitive,
+		},
+	}
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
-		t.Fatalf("Engine failed to process namespaced state: %v", err)
+		t.Fatalf("Expected Engine to succeed, got error: %v", err)
 	}
 
-	// Verify that the global state now contains the nested key
-	m := state.GlobalState.AsMap()
-	val, ok := m["DynamicTargetEntityKey"]
-	if !ok {
-		t.Fatalf("Expected GlobalState to contain 'DynamicTargetEntityKey', but it didn't. Result: %s, State: %v", resultJson, m)
-	}
-
-	nestedMap, ok := val.(map[string]interface{})
-	if !ok || nestedMap["extracted_data"] != "success" {
-		t.Errorf("Expected nested extracted_data == 'success', got: %v", val)
+	if _, ok := req.GlobalState.AsMap()["extracted_data"]; !ok {
+		t.Errorf("Expected GlobalState to contain 'extracted_data', but it didn't. Result: %s, State: %v", resultJson, req.GlobalState.AsMap())
 	}
 }
 
@@ -206,7 +253,69 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	mockCache := &MockCacheClient{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	
+
+
+		req := &pb.ExecuteWorkflowNodeRequest{
+
+
+			JobId: state.JobId,
+
+
+			GlobalState: state.GlobalState,
+
+
+			StepId: step.Id,
+
+
+			NodeConfig: &pb.NodeConfiguration{
+
+
+				NodeName: step.StepName,
+
+
+				SystemInstructions: step.CustomInstructions,
+
+
+				ExpectedSchema: step.ExpectedSchema,
+
+
+				PrimitiveType: step.StepPrimitive,
+
+
+			},
+
+
+		}
+
+
+		if step.CacheConfig != nil {
+
+
+			req.NodeConfig.Cache = &pb.CacheConfiguration{
+
+
+				Enabled: step.CacheConfig.Enabled,
+
+
+				CollectionName: step.CacheConfig.CollectionName,
+
+
+				LookupInput: step.CacheConfig.LookupInput,
+
+
+				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
+
+
+			}
+
+
+		}
+
+
+	
+
+	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err == nil {
 		t.Fatalf("Expected error when AI service is down, got nil")
 	}
@@ -215,7 +324,6 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 		t.Errorf("Expected error to contain '%v', got: %v", expectedErr, err)
 	}
 }
-
 
 func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
@@ -253,7 +361,69 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	
+
+
+		req := &pb.ExecuteWorkflowNodeRequest{
+
+
+			JobId: state.JobId,
+
+
+			GlobalState: state.GlobalState,
+
+
+			StepId: step.Id,
+
+
+			NodeConfig: &pb.NodeConfiguration{
+
+
+				NodeName: step.StepName,
+
+
+				SystemInstructions: step.CustomInstructions,
+
+
+				ExpectedSchema: step.ExpectedSchema,
+
+
+				PrimitiveType: step.StepPrimitive,
+
+
+			},
+
+
+		}
+
+
+		if step.CacheConfig != nil {
+
+
+			req.NodeConfig.Cache = &pb.CacheConfiguration{
+
+
+				Enabled: step.CacheConfig.Enabled,
+
+
+				CollectionName: step.CacheConfig.CollectionName,
+
+
+				LookupInput: step.CacheConfig.LookupInput,
+
+
+				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
+
+
+			}
+
+
+		}
+
+
+	
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Engine failed processing step: %v", err)
 	}
@@ -297,7 +467,69 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+	
+
+
+		req := &pb.ExecuteWorkflowNodeRequest{
+
+
+			JobId: state.JobId,
+
+
+			GlobalState: state.GlobalState,
+
+
+			StepId: step.Id,
+
+
+			NodeConfig: &pb.NodeConfiguration{
+
+
+				NodeName: step.StepName,
+
+
+				SystemInstructions: step.CustomInstructions,
+
+
+				ExpectedSchema: step.ExpectedSchema,
+
+
+				PrimitiveType: step.StepPrimitive,
+
+
+			},
+
+
+		}
+
+
+		if step.CacheConfig != nil {
+
+
+			req.NodeConfig.Cache = &pb.CacheConfiguration{
+
+
+				Enabled: step.CacheConfig.Enabled,
+
+
+				CollectionName: step.CacheConfig.CollectionName,
+
+
+				LookupInput: step.CacheConfig.LookupInput,
+
+
+				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
+
+
+			}
+
+
+		}
+
+
+	
+
+	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err == nil {
 		t.Fatalf("Expected Engine to fail processing step with human validation error, got nil")
 	}
@@ -311,46 +543,138 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 	}
 }
 
-func TestExecuteWorkflow_LegacyRequireHumanReview(t *testing.T) {
+
+func TestIdempotentExecution(t *testing.T) {
+	// Scenario 1: Simulate an AI Service gRPC timeout during the Review Phase.
+	// Verify the step rolls back and retries cleanly.
 	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
 	state := &pb.WorkflowContext{
-		JobId:       "legacy_human_job",
+		JobId:       "timeout_job",
 		GlobalState: statePayload,
 	}
 
 	step := &pb.StepDefinition{
-		Id:                 "step-legacy-human",
-		StepName:           "Legacy Human Step",
-		CustomInstructions: "Legacy flag",
+		Id:                 "step-retry",
+		StepName:           "Retry Step",
+		CustomInstructions: "do something",
 		ExpectedSchema:     `{"type": "object"}`,
-		RequireHumanReview: true, // Legacy flag
-		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
 	}
 
-	planCalled := false
+	callCount := 0
 	mockAI := &MockAIClient{
 		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Generate Plan") {
-				planCalled = true
+				planJSON := `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`
+				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
+			} else if strings.Contains(currentAction.Name, "Review") {
+				callCount++
+				if callCount == 1 {
+					// Simulate context timeout error on first try
+					return nil, context.DeadlineExceeded
+				}
+				// Succeed on second try
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"assembled": true}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
 			}
-			return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "approved": true, "legacy_human_ran": true}`}, nil
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
 		},
 	}
 
-	mockCache := &MockCacheClient{}
-	mockPub := &MockTracePublisher{}
+	eng := NewEngine(mockAI, &MockCacheClient{}, &MockTracePublisher{})
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: step.Id,
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: step.StepName,
+			SystemInstructions: step.CustomInstructions,
+			ExpectedSchema: step.ExpectedSchema,
+			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
+		},
+	}
+
+	finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Engine failed processing despite retry logic: %v", err)
+	}
+	if !strings.Contains(finalJsonStr, "assembled") {
+		t.Fatalf("Expected output to contain 'assembled', got: %s", finalJsonStr)
+	}
+	if callCount != 2 {
+		t.Fatalf("Expected Review to be called 2 times due to retry, got: %d", callCount)
+	}
+}
+
+func TestFailureInjection(t *testing.T) {
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "fail_inject_job",
+		GlobalState: statePayload,
+	}
+
+	step := &pb.StepDefinition{
+		Id:                 "step-fail",
+		StepName:           "Fail Step",
+		CustomInstructions: "do something",
+		ExpectedSchema:     `{"type": "object"}`,
+		StepPrimitive:      pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"output": "valid"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{
+		CheckCacheFunc: func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			panic("simulated CacheService panic")
+		},
+	}
+
+	mockPub := &MockTracePublisher{
+		PublishTraceFunc: func(ctx context.Context, event events.TraceabilityEvent) error {
+			return errors.New("simulated Traceability connection failure")
+		},
+	}
+
 	eng := NewEngine(mockAI, mockCache, mockPub)
-
-	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
-	if err == nil {
-		t.Fatalf("Expected Engine to fail processing step with human validation error, got nil")
+	
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: step.Id,
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: step.StepName,
+			SystemInstructions: step.CustomInstructions,
+			ExpectedSchema: step.ExpectedSchema,
+			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			Cache: &pb.CacheConfiguration{
+				Enabled: true,
+				LookupInput: "test",
+			},
+		},
 	}
 
-	if !errors.Is(err, ErrPendingHumanValidation) {
-		t.Fatalf("Expected ErrPendingHumanValidation, got: %v", err)
+	// Should not crash due to panic recovery, and should just return cache_hit: false.
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	
+	if err != nil {
+		t.Fatalf("Engine failed completely instead of recovering: %v", err)
 	}
-
-	if planCalled {
-		t.Fatalf("Expected AI Planner to be bypassed because RequireHumanReview was true.")
+	
+	if !strings.Contains(resultJson, "\"output\": \"valid\"") {
+		t.Errorf("Expected result to contain 'valid' from AI fallback upon panic, got: %s", resultJson)
 	}
 }

@@ -60,15 +60,77 @@ func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 		wg.Add(1)
 		go func(jobIdx int) {
 			defer wg.Done()
-			
+
 			state := &pb.WorkflowContext{
 				JobId:       "stampede_job_" + string(rune(jobIdx)),
 				GlobalState: nil,
 			}
-			
+
 			<-startChan // wait for sync start
+
 			
-			_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), state, step)
+
+
+				req := &pb.ExecuteWorkflowNodeRequest{
+
+
+					JobId: state.JobId,
+
+
+					GlobalState: state.GlobalState,
+
+
+					StepId: step.Id,
+
+
+					NodeConfig: &pb.NodeConfiguration{
+
+
+						NodeName: step.StepName,
+
+
+						SystemInstructions: step.CustomInstructions,
+
+
+						ExpectedSchema: step.ExpectedSchema,
+
+
+						PrimitiveType: step.StepPrimitive,
+
+
+					},
+
+
+				}
+
+
+				if step.CacheConfig != nil {
+
+
+					req.NodeConfig.Cache = &pb.CacheConfiguration{
+
+
+						Enabled: step.CacheConfig.Enabled,
+
+
+						CollectionName: step.CacheConfig.CollectionName,
+
+
+						LookupInput: step.CacheConfig.LookupInput,
+
+
+						ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
+
+
+					}
+
+
+				}
+
+
+			
+
+			_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 			if err != nil {
 				t.Errorf("Job %d failed: %v", jobIdx, err)
 			}

@@ -29,5 +29,3 @@ func NewClient(addr string) (pb.SemanticCacheServiceClient, *grpc.ClientConn, er
 
 	return pb.NewSemanticCacheServiceClient(conn), conn, nil
 }
-
-
