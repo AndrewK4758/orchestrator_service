@@ -848,8 +848,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Engine", "[JobID: %s | StepID: %s] Cache check PANICKED: %v. Falling back to AI execution.", state.JobId, req.StepId, r)
-			respStr = `{"cache_hit": false}`
-			err = nil
+			respStr, err = e.executeAIStep(ctx, state, req)
 		}
 	}()
 
@@ -948,5 +947,39 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *pb.Wo
 		return fmt.Sprintf(`{"cache_hit": true, "early_termination": true, "extracted_payload": %s}`, payloadEscaped), nil
 	}
 
-	return `{"cache_hit": false}`, nil
+	logger.Cache("Engine", "[JobID: %s] Cache miss. Falling back to autonomous AI inference execution.", state.JobId)
+
+	aiRespStr, err := e.executeAIStep(ctx, state, req)
+	if err != nil {
+		return "", fmt.Errorf("autonomous fallback to inference failed: %w", err)
+	}
+
+	if useCache && aiRespStr != "" {
+		// Spawn an async routine to populate the cache with the new inferred data
+		go func(bgReq *pb.ExecuteWorkflowNodeRequest, resultStr string) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			
+			metadataStruct, _ := structpb.NewStruct(make(map[string]interface{}))
+			for k, v := range state.Metadata {
+				metadataStruct.Fields[k] = structpb.NewStringValue(v)
+			}
+			
+			storeReq := &pb.StoreExtractionRequest{
+				CollectionName: collectionName,
+				Text:           cacheInput,
+				ExtractedPayload: resultStr,
+				Metadata:       metadataStruct,
+			}
+			
+			_, storeErr := e.cacheClient.StoreExtraction(bgCtx, storeReq)
+			if storeErr != nil {
+				logger.Error("Engine", "[JobID: %s] Async cache store failed: %v", state.JobId, storeErr)
+			} else {
+				logger.Cache("Engine", "[JobID: %s] Successfully upserted inferred data to cache.", state.JobId)
+			}
+		}(req, aiRespStr)
+	}
+
+	return aiRespStr, nil
 }
