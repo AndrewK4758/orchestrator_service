@@ -678,3 +678,110 @@ func TestFailureInjection(t *testing.T) {
 		t.Errorf("Expected result to contain 'valid' from AI fallback upon panic, got: %s", resultJson)
 	}
 }
+
+func TestZeroShotCacheHit(t *testing.T) {
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "cache_hit_job",
+		GlobalState: statePayload,
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"output": "ai_data"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			t.Fatalf("executeAIStep should not be called on cache hit. Called with action: %s", currentAction.Name)
+			return nil, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{
+		CheckCacheFunc: func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			return &pb.CheckCacheResponse{Hit: true, ExtractedPayload: `{"cached": "data"}`}, nil
+		},
+	}
+
+	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: "step-1",
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: "Test Node",
+			SystemInstructions: "instructions",
+			ExpectedSchema: `{"type": "object"}`,
+			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			Cache: &pb.CacheConfiguration{
+				Enabled: true,
+				LookupInput: "test",
+			},
+		},
+	}
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Engine failed on cache hit: %v", err)
+	}
+	if !strings.Contains(resultJson, "cached") {
+		t.Errorf("Expected result to contain cached payload, got: %s", resultJson)
+	}
+}
+
+func TestZeroShotCacheMissFallback(t *testing.T) {
+	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	state := &pb.WorkflowContext{
+		JobId:       "cache_miss_job",
+		GlobalState: statePayload,
+	}
+
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+			if strings.Contains(currentAction.Name, "Review") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Assemble") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"output": "ai_data"}`}, nil
+			} else if strings.Contains(currentAction.Name, "Validate") {
+				return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+			}
+			return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
+		},
+	}
+
+	mockCache := &MockCacheClient{
+		CheckCacheFunc: func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			return &pb.CheckCacheResponse{Hit: false}, nil
+		},
+	}
+
+	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId: state.JobId,
+		GlobalState: state.GlobalState,
+		StepId: "step-1",
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: "Test Node",
+			SystemInstructions: "instructions",
+			ExpectedSchema: `{"type": "object"}`,
+			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			Cache: &pb.CacheConfiguration{
+				Enabled: true,
+				LookupInput: "test",
+			},
+		},
+	}
+
+	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Engine failed on cache miss fallback: %v", err)
+	}
+	if !strings.Contains(resultJson, "ai_data") {
+		t.Errorf("Expected result to contain AI payload, got: %s", resultJson)
+	}
+}
