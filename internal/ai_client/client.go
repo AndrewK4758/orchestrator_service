@@ -92,7 +92,7 @@ func (c *Client) Close() error {
 }
 
 // PerformAction publishes a request to the AI service via JetStream and waits for a response on a Core NATS reply subject.
-func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.WorkflowContext, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string, modelChoice aipb.ModelChoice) (*aipb.PerformActionResponse, error) {
+func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWorkflowNodeRequest, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string, modelChoice aipb.ModelChoice) (*aipb.PerformActionResponse, error) {
 	req := &aipb.PerformActionRequest{
 		InputBytes:    inputBytes,
 		InputText:     inputText,

@@ -1,29 +1,31 @@
 package server
 
 import (
-	"testing"
 	"context"
-	"sync"
 	"net"
+	"sync"
+	"testing"
 	"time"
 
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type mockPublisher struct {
 	publishedMsgs [][]byte
 }
 
-func (m *mockPublisher) PublishTrace(ctx context.Context, event events.TraceabilityEvent) error { return nil }
-func (m *mockPublisher) PublishCacheStore(ctx context.Context, data []byte) error  { return nil }
+func (m *mockPublisher) PublishTrace(ctx context.Context, event events.TraceabilityEvent) error {
+	return nil
+}
+func (m *mockPublisher) PublishCacheStore(ctx context.Context, data []byte) error { return nil }
 func (m *mockPublisher) PublishJob(ctx context.Context, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
@@ -43,7 +45,7 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 
 	t.Run("ExecuteWorkflowNode queues to internal memory cache and NATS", func(t *testing.T) {
 		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId: "job_1",
+			JobId:  "job_1",
 			StepId: "step_1",
 		}
 		res, err := srv.ExecuteWorkflowNode(context.Background(), req)
@@ -63,9 +65,9 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 }
 
 type mockMsg struct {
-		jetstream.Msg
-		data []byte
-	}
+	jetstream.Msg
+	data []byte
+}
 
 func (m mockMsg) Data() []byte {
 	return m.data
@@ -76,7 +78,7 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: "job_concurrent",
+		JobId:  "job_concurrent",
 		StepId: "step_1",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -151,10 +153,10 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	srv.cacheClient = &mockCacheClient{}
 
 	// Create a completely arbitrary generic state
-	stateMap := map[string]interface{}{
-		"NestedObj": map[string]interface{}{
+	stateMap := map[string]any{
+		"NestedObj": map[string]any{
 			"UnknownField": "Value1",
-			"ListField":    []interface{}{1.0, 2.0, 3.0},
+			"ListField":    []any{1.0, 2.0, 3.0},
 		},
 		"TopLevelString": "ArbitraryData",
 	}
@@ -174,10 +176,26 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 			Cache: &pb.CacheConfiguration{
-				Enabled: true,
+				Enabled:        true,
 				CollectionName: "test_cache",
-				LookupInput: "test",
+				LookupInput:    "test",
+				Metadata: map[string]string{
+					"filename": "test.pdf",
+				},
 			},
+		},
+	}
+
+	srv.cacheClient = &mockCacheClient{
+		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			// Validate metadata was forwarded correctly
+			assert.NotNil(t, in.Metadata)
+			assert.Equal(t, "test.pdf", in.Metadata.Fields["filename"].GetStringValue())
+			return &pb.CheckCacheResponse{
+				Hit:              true,
+				Confidence:       1.0,
+				ExtractedPayload: `{"mock": "cache_result"}`,
+			}, nil
 		},
 	}
 
@@ -187,7 +205,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	assert.True(t, res.Success)
 	assert.Equal(t, "FuzzApp", req.Metadata["app_id"]) // Validates the app_id wasn't mutated in a hardcoded way
 
-	// 2. Pass to handleJobMessage. It should fail since there's no actual AI configured, 
+	// 2. Pass to handleJobMessage. It should fail since there's no actual AI configured,
 	// triggering OnJobFailed but WITH the unaltered JobID and proper Traceability.
 	msgBytes, _ := proto.Marshal(req)
 	err = srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
@@ -200,23 +218,27 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 
 	assert.NotNil(t, cbMock.receivedSuccess, "Should have received OnNodeExecutionComplete via cache bypass")
 	assert.Equal(t, "job_fuzz_1", cbMock.receivedSuccess.JobId)
-	
+
 	// Validate the generic state wasn't corrupted in the payload delivered back to the client
 	returnedState := cbMock.receivedSuccess.GlobalState
 	assert.NotNil(t, returnedState)
-	
+
 	nestedObj := returnedState.Fields["NestedObj"].GetStructValue().Fields
 	assert.Equal(t, "Value1", nestedObj["UnknownField"].GetStringValue())
 	assert.Equal(t, "ArbitraryData", returnedState.Fields["TopLevelString"].GetStringValue())
 }
 
 type mockCacheClient struct {
+	checkCacheFn func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error)
 }
 
 func (m *mockCacheClient) CheckCache(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+	if m.checkCacheFn != nil {
+		return m.checkCacheFn(ctx, in, opts...)
+	}
 	return &pb.CheckCacheResponse{
-		Hit: true,
-		Confidence: 1.0,
+		Hit:              true,
+		Confidence:       1.0,
 		ExtractedPayload: `{"mock": "cache_result"}`,
 	}, nil
 }
@@ -247,7 +269,7 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 	}
 
 	msgBytes, _ := proto.Marshal(req)
-	
+
 	// Should attempt to dial 127.0.0.1:9999, fail, and gracefully exit without panicking
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
 	assert.NoError(t, err)

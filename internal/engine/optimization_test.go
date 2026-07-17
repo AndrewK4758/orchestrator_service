@@ -2,6 +2,7 @@ package engine
 
 import (
 	"testing"
+
 	pb "github.com/AndrewK4758/shared_protos"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -10,10 +11,10 @@ import (
 func BenchmarkStateMerge_Allocations(b *testing.B) {
 	b.StopTimer()
 	fields := make(map[string]*structpb.Value)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		fields[string(rune(i))] = structpb.NewStringValue("test_value")
 	}
-	
+
 	globalState := &structpb.Struct{Fields: fields}
 	state := &pb.WorkflowContext{
 		JobId:       "job_test",
@@ -33,9 +34,9 @@ func BenchmarkStateMerge_Allocations(b *testing.B) {
 func TestStateMap_AlgorithmicComplexity(t *testing.T) {
 	fields := make(map[string]*structpb.Value)
 	fields["key_lookup"] = structpb.NewStringValue("lookup_value")
-	
+
 	globalState := &structpb.Struct{Fields: fields}
-	
+
 	allocs := testing.AllocsPerRun(10, func() {
 		// O(1) native map lookup validation
 		val, ok := globalState.Fields["key_lookup"]

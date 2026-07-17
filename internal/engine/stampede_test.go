@@ -13,7 +13,7 @@ import (
 
 func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Plan") {
@@ -56,7 +56,7 @@ func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 	startChan := make(chan struct{})
 
 	// Launch 5 concurrent jobs with the exact same ContextInput
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		wg.Add(1)
 		go func(jobIdx int) {
 			defer wg.Done()
@@ -68,67 +68,40 @@ func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 
 			<-startChan // wait for sync start
 
-			
+			req := &pb.ExecuteWorkflowNodeRequest{
 
+				JobId: state.JobId,
 
-				req := &pb.ExecuteWorkflowNodeRequest{
+				GlobalState: state.GlobalState,
 
+				StepId: step.Id,
 
-					JobId: state.JobId,
+				NodeConfig: &pb.NodeConfiguration{
 
+					NodeName: step.StepName,
 
-					GlobalState: state.GlobalState,
+					SystemInstructions: step.CustomInstructions,
 
+					ExpectedSchema: step.ExpectedSchema,
 
-					StepId: step.Id,
+					PrimitiveType: step.StepPrimitive,
+				},
+			}
 
+			if step.CacheConfig != nil {
 
-					NodeConfig: &pb.NodeConfiguration{
+				req.NodeConfig.Cache = &pb.CacheConfiguration{
 
+					Enabled: step.CacheConfig.Enabled,
 
-						NodeName: step.StepName,
+					CollectionName: step.CacheConfig.CollectionName,
 
+					LookupInput: step.CacheConfig.LookupInput,
 
-						SystemInstructions: step.CustomInstructions,
-
-
-						ExpectedSchema: step.ExpectedSchema,
-
-
-						PrimitiveType: step.StepPrimitive,
-
-
-					},
-
-
+					ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
 				}
 
-
-				if step.CacheConfig != nil {
-
-
-					req.NodeConfig.Cache = &pb.CacheConfiguration{
-
-
-						Enabled: step.CacheConfig.Enabled,
-
-
-						CollectionName: step.CacheConfig.CollectionName,
-
-
-						LookupInput: step.CacheConfig.LookupInput,
-
-
-						ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
-
-
-					}
-
-
-				}
-
-
-			
+			}
 
 			_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 			if err != nil {

@@ -14,7 +14,7 @@ func BenchmarkActiveJobsLockContention(b *testing.B) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	// Pre-fill activeJobs to simulate load
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		jobID := fmt.Sprintf("job_%d", i)
 		srv.activeJobs[jobID] = &JobTracker{Req: &pb.ExecuteWorkflowNodeRequest{JobId: fmt.Sprintf("job_%d", i)}}
 	}

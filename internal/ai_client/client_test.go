@@ -12,16 +12,16 @@ import (
 // (write once, read once, delete once per request) under high concurrency without standard map RWMutex contention.
 func BenchmarkSyncMap_Routing(b *testing.B) {
 	client := &Client{}
-	
+
 	b.RunParallel(func(p *testing.PB) {
 		i := 0
 		for p.Next() {
 			subject := fmt.Sprintf("ai.response.test.%d", i)
 			respCh := make(chan *nats.Msg, 1)
-			
+
 			// Simulate PerformAction registering a channel
 			client.pending.Store(subject, respCh)
-			
+
 			// Simulate multiplexed subscriber receiving the response
 			if ch, ok := client.pending.Load(subject); ok {
 				select {
@@ -29,7 +29,7 @@ func BenchmarkSyncMap_Routing(b *testing.B) {
 				default:
 				}
 			}
-			
+
 			// Simulate PerformAction cleaning up
 			client.pending.Delete(subject)
 			i++
@@ -43,19 +43,19 @@ func TestPendingMap_LeakPrevention(t *testing.T) {
 	client := &Client{}
 
 	// Simulate 1000 timeouts
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		subject := fmt.Sprintf("ai.response.timeout.%d", i)
 		respCh := make(chan *nats.Msg, 1)
-		
+
 		client.pending.Store(subject, respCh)
-		
+
 		// Simulate timeout block returning and triggering defer c.pending.Delete
 		client.pending.Delete(subject)
 	}
 
 	// Iterate sync map to verify size is 0
 	count := 0
-	client.pending.Range(func(key, value interface{}) bool {
+	client.pending.Range(func(key, value any) bool {
 		count++
 		return true
 	})

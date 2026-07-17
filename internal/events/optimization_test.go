@@ -14,7 +14,7 @@ func BenchmarkJSONMarshal_ZeroAlloc(b *testing.B) {
 		CorrelationID: "12345",
 		Timestamp:     time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType:     "Started",
-		Metadata:      map[string]interface{}{"step": "step_1"},
+		Metadata:      map[string]any{"step": "step_1"},
 	}
 
 	b.ResetTimer()
@@ -33,7 +33,7 @@ func TestJSONMarshal_DataLocality(t *testing.T) {
 		CorrelationID: "12345",
 		Timestamp:     time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType:     "Started",
-		Metadata:      map[string]interface{}{"step": "step_1"},
+		Metadata:      map[string]any{"step": "step_1"},
 	}
 
 	allocs := testing.AllocsPerRun(10, func() {

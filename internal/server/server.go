@@ -89,7 +89,7 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 
 func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.ExecuteWorkflowNodeResponse, error) {
 	if req.GlobalState == nil {
-		req.GlobalState, _ = structpb.NewStruct(map[string]interface{}{})
+		req.GlobalState, _ = structpb.NewStruct(map[string]any{})
 	}
 
 	jobID := req.JobId
@@ -114,7 +114,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
 
 	tracker := &JobTracker{
-		Req:    req,
+		Req: req,
 	}
 
 	s.mu.Lock()
@@ -170,11 +170,28 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	// ZERO-SHOT CACHE BYPASS
 	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
 		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", req.JobId, req.StepId, req.NodeConfig.Cache.CollectionName)
-		ctxCache, cancelCache := context.WithTimeout(ctx, 10*time.Second)
+		
+		timeoutSecs := 120
+		if envVal := os.Getenv("CACHE_TIMEOUT_SECONDS"); envVal != "" {
+			if parsed, err := strconv.Atoi(envVal); err == nil {
+				timeoutSecs = parsed
+			}
+		}
+		
+		var cacheMetadata *structpb.Struct
+		if req.NodeConfig.Cache.Metadata != nil {
+			metaMap := make(map[string]any)
+			for k, v := range req.NodeConfig.Cache.Metadata {
+				metaMap[k] = v
+			}
+			cacheMetadata, _ = structpb.NewStruct(metaMap)
+		}
+
+		ctxCache, cancelCache := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
 			CollectionName: req.NodeConfig.Cache.CollectionName,
 			Text:           req.NodeConfig.Cache.LookupInput,
-			Metadata:       nil, // To convert map to structpb.Struct correctly: we can just leave it nil or map it if required. I'll leave nil here.
+			Metadata:       cacheMetadata,
 			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
 		})
 		cancelCache()
@@ -182,18 +199,9 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		if err != nil {
 			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
 		} else if cacheResp.Hit {
-			minConf := 0.975
-			if envConf := os.Getenv("MIN_CACHE_CONFIDENCE"); envConf != "" {
-				if parsed, parseErr := strconv.ParseFloat(envConf, 32); parseErr == nil {
-					minConf = parsed
-				}
-			}
-			if float64(cacheResp.Confidence) >= minConf {
-				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (>= %.3f). Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence, minConf)
-				s.fireCallback(tracker, req, cacheResp.ExtractedPayload, "", req.StepId)
-				return nil
-			}
-			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE HIT but confidence %.2f is below minimum %.3f. Proceeding with standard ReAct execution.", req.JobId, req.StepId, cacheResp.Confidence, minConf)
+			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
+			s.fireCallback(req, cacheResp.ExtractedPayload, "", req.StepId)
+			return nil
 		} else {
 			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
 		}
@@ -212,17 +220,17 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			return nil
 		}
 		logger.Error("System", "Workflow execution failed: %v", err)
-		s.fireCallback(tracker, req, stepOutputJSON, err.Error(), lastStepId)
+		s.fireCallback(req, stepOutputJSON, err.Error(), lastStepId)
 		return nil
 	}
 
 	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
-	s.fireCallback(tracker, req, stepOutputJSON, "", lastStepId)
+	s.fireCallback(req, stepOutputJSON, "", lastStepId)
 
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(tracker *JobTracker, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) {
+func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) {
 	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
 		logger.Info("System", "No callback address provided, skipping callback")
@@ -266,7 +274,7 @@ func (s *OrchestratorServer) fireCallback(tracker *JobTracker, req *pb.ExecuteWo
 			ErrorMessage: errMsg,
 		})
 	} else {
-		var stepOutMap map[string]interface{}
+		var stepOutMap map[string]any
 		json.Unmarshal([]byte(stepOutputJSON), &stepOutMap)
 		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
 
@@ -390,5 +398,3 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 		QueuesPurged:  int32(queuesPurged),
 	}, nil
 }
-
-

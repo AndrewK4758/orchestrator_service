@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"google.golang.org/grpc"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	"orchestrator_service/internal/events"
+
+	"net"
+	"os"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"google.golang.org/protobuf/types/known/structpb"
-	"net"
-	"os"
 )
 
 type MockHumanValidationServer struct {
@@ -35,10 +37,10 @@ func init() {
 }
 
 type MockAIClient struct {
-	PerformActionFunc func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
+	PerformActionFunc func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
 }
 
-func (m *MockAIClient) PerformAction(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+func (m *MockAIClient) PerformAction(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 	if m.PerformActionFunc != nil {
 		return m.PerformActionFunc(ctx, workflowCtx, currentAction, inputBytes, inputText, modelChoice)
 	}
@@ -65,9 +67,9 @@ func (m *MockTracePublisher) PublishCacheStore(ctx context.Context, data []byte)
 }
 
 type MockCacheClient struct {
-	CheckCacheFunc      func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error)
-	StoreExtractionFunc func(ctx context.Context, req *pb.StoreExtractionRequest, opts ...grpc.CallOption) (*pb.StoreExtractionResponse, error)
-	SeedCacheFunc       func(ctx context.Context, req *pb.SeedCacheRequest, opts ...grpc.CallOption) (*pb.SeedCacheResponse, error)
+	CheckCacheFunc          func(ctx context.Context, req *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error)
+	StoreExtractionFunc     func(ctx context.Context, req *pb.StoreExtractionRequest, opts ...grpc.CallOption) (*pb.StoreExtractionResponse, error)
+	SeedCacheFunc           func(ctx context.Context, req *pb.SeedCacheRequest, opts ...grpc.CallOption) (*pb.SeedCacheResponse, error)
 	CheckMetadataExistsFunc func(ctx context.Context, req *pb.CheckMetadataRequest, opts ...grpc.CallOption) (*pb.CheckMetadataResponse, error)
 }
 
@@ -102,7 +104,7 @@ func (m *MockCacheClient) SeedCache(ctx context.Context, req *pb.SeedCacheReques
 func TestGenericStateMerging(t *testing.T) {
 	// Objective: Prove Orchestrator correctly handles completely unknown JSON states.
 	complexJSONStr := `{"fuzzed_key1": ["arbitrary", "data", {"nested": true}], "fuzzed_key2": 12345, "fuzzed_key3": null, "fuzzed_key4": 99.99}`
-	var data map[string]interface{}
+	var data map[string]any
 	json.Unmarshal([]byte(complexJSONStr), &data)
 	statePayload, _ := structpb.NewStruct(data)
 
@@ -120,7 +122,7 @@ func TestGenericStateMerging(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Generate Plan") {
@@ -140,14 +142,14 @@ func TestGenericStateMerging(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: step.Id,
+		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: step.StepName,
+			NodeName:           step.StepName,
 			SystemInstructions: step.CustomInstructions,
-			ExpectedSchema: step.ExpectedSchema,
-			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
+			ExpectedSchema:     step.ExpectedSchema,
+			PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
 		},
 	}
 
@@ -156,7 +158,7 @@ func TestGenericStateMerging(t *testing.T) {
 		t.Fatalf("Engine failed to process arbitrary state: %v", err)
 	}
 
-	var finalData map[string]interface{}
+	var finalData map[string]any
 	if err := json.Unmarshal([]byte(finalJsonStr), &finalData); err != nil {
 		t.Fatalf("Failed to parse final JSON: %v", err)
 	}
@@ -170,7 +172,7 @@ func TestGenericStateMerging(t *testing.T) {
 }
 
 func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "fuzz_namespace_123",
 		GlobalState: statePayload,
@@ -186,7 +188,7 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review Plan") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			}
@@ -205,14 +207,14 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: step.Id,
+		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: step.StepName,
+			NodeName:           step.StepName,
 			SystemInstructions: step.CustomInstructions,
-			ExpectedSchema: step.ExpectedSchema,
-			PrimitiveType: step.StepPrimitive,
+			ExpectedSchema:     step.ExpectedSchema,
+			PrimitiveType:      step.StepPrimitive,
 		},
 	}
 
@@ -244,7 +246,7 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	expectedErr := errors.New("ai service unavailable")
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			return nil, expectedErr
 		},
 	}
@@ -253,67 +255,40 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 	mockCache := &MockCacheClient{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	
+	req := &pb.ExecuteWorkflowNodeRequest{
 
+		JobId: state.JobId,
 
-		req := &pb.ExecuteWorkflowNodeRequest{
+		GlobalState: state.GlobalState,
 
+		StepId: step.Id,
 
-			JobId: state.JobId,
+		NodeConfig: &pb.NodeConfiguration{
 
+			NodeName: step.StepName,
 
-			GlobalState: state.GlobalState,
+			SystemInstructions: step.CustomInstructions,
 
+			ExpectedSchema: step.ExpectedSchema,
 
-			StepId: step.Id,
+			PrimitiveType: step.StepPrimitive,
+		},
+	}
 
+	if step.CacheConfig != nil {
 
-			NodeConfig: &pb.NodeConfiguration{
+		req.NodeConfig.Cache = &pb.CacheConfiguration{
 
+			Enabled: step.CacheConfig.Enabled,
 
-				NodeName: step.StepName,
+			CollectionName: step.CacheConfig.CollectionName,
 
+			LookupInput: step.CacheConfig.LookupInput,
 
-				SystemInstructions: step.CustomInstructions,
-
-
-				ExpectedSchema: step.ExpectedSchema,
-
-
-				PrimitiveType: step.StepPrimitive,
-
-
-			},
-
-
+			ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
 		}
 
-
-		if step.CacheConfig != nil {
-
-
-			req.NodeConfig.Cache = &pb.CacheConfiguration{
-
-
-				Enabled: step.CacheConfig.Enabled,
-
-
-				CollectionName: step.CacheConfig.CollectionName,
-
-
-				LookupInput: step.CacheConfig.LookupInput,
-
-
-				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
-
-
-			}
-
-
-		}
-
-
-	
+	}
 
 	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err == nil {
@@ -326,7 +301,7 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 }
 
 func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "override_ai_job",
 		GlobalState: statePayload,
@@ -342,7 +317,7 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 
 	planCalled := false
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Generate Plan") {
 				planCalled = true
 				return &pb.PerformActionResponse{ActionResultJson: "{}"}, nil
@@ -361,67 +336,40 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	
+	req := &pb.ExecuteWorkflowNodeRequest{
 
+		JobId: state.JobId,
 
-		req := &pb.ExecuteWorkflowNodeRequest{
+		GlobalState: state.GlobalState,
 
+		StepId: step.Id,
 
-			JobId: state.JobId,
+		NodeConfig: &pb.NodeConfiguration{
 
+			NodeName: step.StepName,
 
-			GlobalState: state.GlobalState,
+			SystemInstructions: step.CustomInstructions,
 
+			ExpectedSchema: step.ExpectedSchema,
 
-			StepId: step.Id,
+			PrimitiveType: step.StepPrimitive,
+		},
+	}
 
+	if step.CacheConfig != nil {
 
-			NodeConfig: &pb.NodeConfiguration{
+		req.NodeConfig.Cache = &pb.CacheConfiguration{
 
+			Enabled: step.CacheConfig.Enabled,
 
-				NodeName: step.StepName,
+			CollectionName: step.CacheConfig.CollectionName,
 
+			LookupInput: step.CacheConfig.LookupInput,
 
-				SystemInstructions: step.CustomInstructions,
-
-
-				ExpectedSchema: step.ExpectedSchema,
-
-
-				PrimitiveType: step.StepPrimitive,
-
-
-			},
-
-
+			ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
 		}
 
-
-		if step.CacheConfig != nil {
-
-
-			req.NodeConfig.Cache = &pb.CacheConfiguration{
-
-
-				Enabled: step.CacheConfig.Enabled,
-
-
-				CollectionName: step.CacheConfig.CollectionName,
-
-
-				LookupInput: step.CacheConfig.LookupInput,
-
-
-				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
-
-
-			}
-
-
-		}
-
-
-	
+	}
 
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
@@ -438,7 +386,7 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 }
 
 func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "override_human_job",
 		GlobalState: statePayload,
@@ -454,7 +402,7 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 
 	planCalled := false
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Generate Plan") {
 				planCalled = true
 			}
@@ -467,67 +415,40 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 	mockPub := &MockTracePublisher{}
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
-	
+	req := &pb.ExecuteWorkflowNodeRequest{
 
+		JobId: state.JobId,
 
-		req := &pb.ExecuteWorkflowNodeRequest{
+		GlobalState: state.GlobalState,
 
+		StepId: step.Id,
 
-			JobId: state.JobId,
+		NodeConfig: &pb.NodeConfiguration{
 
+			NodeName: step.StepName,
 
-			GlobalState: state.GlobalState,
+			SystemInstructions: step.CustomInstructions,
 
+			ExpectedSchema: step.ExpectedSchema,
 
-			StepId: step.Id,
+			PrimitiveType: step.StepPrimitive,
+		},
+	}
 
+	if step.CacheConfig != nil {
 
-			NodeConfig: &pb.NodeConfiguration{
+		req.NodeConfig.Cache = &pb.CacheConfiguration{
 
+			Enabled: step.CacheConfig.Enabled,
 
-				NodeName: step.StepName,
+			CollectionName: step.CacheConfig.CollectionName,
 
+			LookupInput: step.CacheConfig.LookupInput,
 
-				SystemInstructions: step.CustomInstructions,
-
-
-				ExpectedSchema: step.ExpectedSchema,
-
-
-				PrimitiveType: step.StepPrimitive,
-
-
-			},
-
-
+			ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
 		}
 
-
-		if step.CacheConfig != nil {
-
-
-			req.NodeConfig.Cache = &pb.CacheConfiguration{
-
-
-				Enabled: step.CacheConfig.Enabled,
-
-
-				CollectionName: step.CacheConfig.CollectionName,
-
-
-				LookupInput: step.CacheConfig.LookupInput,
-
-
-				ConfidenceThreshold: step.CacheConfig.ConfidenceThreshold,
-
-
-			}
-
-
-		}
-
-
-	
+	}
 
 	_, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err == nil {
@@ -543,11 +464,10 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 	}
 }
 
-
 func TestIdempotentExecution(t *testing.T) {
 	// Scenario 1: Simulate an AI Service gRPC timeout during the Review Phase.
 	// Verify the step rolls back and retries cleanly.
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "timeout_job",
 		GlobalState: statePayload,
@@ -562,7 +482,7 @@ func TestIdempotentExecution(t *testing.T) {
 
 	callCount := 0
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Generate Plan") {
 				planJSON := `{"actions": [{"action_type": "PRIMITIVE_AI_STEP", "prompt": "test", "schema": {}}]}`
 				return &pb.PerformActionResponse{ActionResultJson: planJSON}, nil
@@ -586,14 +506,14 @@ func TestIdempotentExecution(t *testing.T) {
 	eng := NewEngine(mockAI, &MockCacheClient{}, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: step.Id,
+		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: step.StepName,
+			NodeName:           step.StepName,
 			SystemInstructions: step.CustomInstructions,
-			ExpectedSchema: step.ExpectedSchema,
-			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
+			ExpectedSchema:     step.ExpectedSchema,
+			PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED,
 		},
 	}
 
@@ -610,7 +530,7 @@ func TestIdempotentExecution(t *testing.T) {
 }
 
 func TestFailureInjection(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "fail_inject_job",
 		GlobalState: statePayload,
@@ -625,7 +545,7 @@ func TestFailureInjection(t *testing.T) {
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
@@ -650,18 +570,18 @@ func TestFailureInjection(t *testing.T) {
 	}
 
 	eng := NewEngine(mockAI, mockCache, mockPub)
-	
+
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: step.Id,
+		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: step.StepName,
+			NodeName:           step.StepName,
 			SystemInstructions: step.CustomInstructions,
-			ExpectedSchema: step.ExpectedSchema,
-			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			ExpectedSchema:     step.ExpectedSchema,
+			PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
 			Cache: &pb.CacheConfiguration{
-				Enabled: true,
+				Enabled:     true,
 				LookupInput: "test",
 			},
 		},
@@ -669,25 +589,25 @@ func TestFailureInjection(t *testing.T) {
 
 	// Should not crash due to panic recovery, and should just return cache_hit: false.
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
-	
+
 	if err != nil {
 		t.Fatalf("Engine failed completely instead of recovering: %v", err)
 	}
-	
+
 	if !strings.Contains(resultJson, "\"output\": \"valid\"") {
 		t.Errorf("Expected result to contain 'valid' from AI fallback upon panic, got: %s", resultJson)
 	}
 }
 
 func TestZeroShotCacheHit(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "cache_hit_job",
 		GlobalState: statePayload,
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
@@ -709,16 +629,16 @@ func TestZeroShotCacheHit(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: "step-1",
+		StepId:      "step-1",
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: "Test Node",
+			NodeName:           "Test Node",
 			SystemInstructions: "instructions",
-			ExpectedSchema: `{"type": "object"}`,
-			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			ExpectedSchema:     `{"type": "object"}`,
+			PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
 			Cache: &pb.CacheConfiguration{
-				Enabled: true,
+				Enabled:     true,
 				LookupInput: "test",
 			},
 		},
@@ -734,14 +654,14 @@ func TestZeroShotCacheHit(t *testing.T) {
 }
 
 func TestZeroShotCacheMissFallback(t *testing.T) {
-	statePayload, _ := structpb.NewStruct(map[string]interface{}{})
+	statePayload, _ := structpb.NewStruct(map[string]any{})
 	state := &pb.WorkflowContext{
 		JobId:       "cache_miss_job",
 		GlobalState: statePayload,
 	}
 
 	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.WorkflowContext, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
 			if strings.Contains(currentAction.Name, "Review") {
 				return &pb.PerformActionResponse{ActionResultJson: `{"approved": true, "reason": "ok"}`}, nil
 			} else if strings.Contains(currentAction.Name, "Assemble") {
@@ -762,16 +682,16 @@ func TestZeroShotCacheMissFallback(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: state.JobId,
+		JobId:       state.JobId,
 		GlobalState: state.GlobalState,
-		StepId: "step-1",
+		StepId:      "step-1",
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: "Test Node",
+			NodeName:           "Test Node",
 			SystemInstructions: "instructions",
-			ExpectedSchema: `{"type": "object"}`,
-			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
+			ExpectedSchema:     `{"type": "object"}`,
+			PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION,
 			Cache: &pb.CacheConfiguration{
-				Enabled: true,
+				Enabled:     true,
 				LookupInput: "test",
 			},
 		},
@@ -784,4 +704,140 @@ func TestZeroShotCacheMissFallback(t *testing.T) {
 	if !strings.Contains(resultJson, "ai_data") {
 		t.Errorf("Expected result to contain AI payload, got: %s", resultJson)
 	}
+}
+
+func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
+	// Setup generic engine components
+	mockAI := &MockAIClient{
+		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
+			return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
+		},
+	}
+	eng := NewEngine(mockAI, &MockCacheClient{}, &MockTracePublisher{})
+
+	t.Run("Happy Path - Populated Metadata", func(t *testing.T) {
+		req := &pb.ExecuteWorkflowNodeRequest{
+			JobId:       "job_123",
+			StepId:      "step_abc",
+			GlobalState: nil, // Will be initialized by the engine
+			Metadata: map[string]string{
+				"TenantId":      "ClientA",
+				"CorrelationId": "corr-001",
+			},
+			NodeConfig: &pb.NodeConfiguration{
+				NodeName:           "Envelope Test Step",
+				SystemInstructions: "test instructions",
+				ExpectedSchema:     "{}",
+				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP, // Bypass AI Planner/Reviewer
+			},
+		}
+
+		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Engine failed processing step: %v", err)
+		}
+
+		var finalData map[string]any
+		if err := json.Unmarshal([]byte(finalJsonStr), &finalData); err != nil {
+			t.Fatalf("Failed to parse final JSON: %v", err)
+		}
+
+		contextMap, ok := finalData["Context"].(map[string]any)
+		if !ok {
+			t.Fatalf("Expected 'Context' root object, but it was missing or not a map.")
+		}
+
+		if contextMap["JobId"] != "job_123" {
+			t.Errorf("Expected Context.JobId = 'job_123', got %v", contextMap["JobId"])
+		}
+		if contextMap["CompletedStepId"] != "step_abc" {
+			t.Errorf("Expected Context.CompletedStepId = 'step_abc', got %v", contextMap["CompletedStepId"])
+		}
+		if contextMap["TenantId"] != "ClientA" {
+			t.Errorf("Expected Context.TenantId = 'ClientA', got %v", contextMap["TenantId"])
+		}
+	})
+
+	t.Run("Edge Case - Nil Metadata", func(t *testing.T) {
+		req := &pb.ExecuteWorkflowNodeRequest{
+			JobId:       "job_nil_meta",
+			StepId:      "step_nil",
+			GlobalState: nil,
+			Metadata:    nil,
+			NodeConfig: &pb.NodeConfiguration{
+				NodeName:           "Nil Meta Test",
+				SystemInstructions: "test instructions",
+				ExpectedSchema:     "{}",
+				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
+			},
+		}
+
+		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Engine failed processing step: %v", err)
+		}
+
+		var finalData map[string]any
+		json.Unmarshal([]byte(finalJsonStr), &finalData)
+		contextMap, ok := finalData["Context"].(map[string]any)
+		if !ok {
+			t.Fatalf("Expected 'Context' root object even with nil metadata.")
+		}
+
+		if contextMap["JobId"] != "job_nil_meta" || contextMap["CompletedStepId"] != "step_nil" {
+			t.Errorf("Expected Context to contain JobId and StepId, got %v", contextMap)
+		}
+	})
+
+	t.Run("Idempotency - Existing Context Preservation", func(t *testing.T) {
+		// Create a GlobalState that already has a Context key populated
+		existingStateMap := map[string]any{
+			"Context": map[string]any{
+				"ExistingData": true,
+				"TenantId":     "OldTenant", // This should be overwritten by req.Metadata
+			},
+			"Data": map[string]any{
+				"PriorOutput": 123,
+			},
+		}
+		statePayload, _ := structpb.NewStruct(existingStateMap)
+
+		req := &pb.ExecuteWorkflowNodeRequest{
+			JobId:       "job_idem",
+			StepId:      "step_idem",
+			GlobalState: statePayload,
+			Metadata: map[string]string{
+				"TenantId": "NewTenant",
+			},
+			NodeConfig: &pb.NodeConfiguration{
+				NodeName:           "Idempotency Test",
+				SystemInstructions: "test instructions",
+				ExpectedSchema:     "{}",
+				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
+			},
+		}
+
+		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Engine failed processing step: %v", err)
+		}
+
+		var finalData map[string]any
+		json.Unmarshal([]byte(finalJsonStr), &finalData)
+
+		// Verify existing Data block was not destroyed
+		dataMap, ok := finalData["Data"].(map[string]any)
+		if !ok || dataMap["PriorOutput"].(float64) != 123 {
+			t.Errorf("Expected existing Data block to be preserved. Got: %v", finalData["Data"])
+		}
+
+		// Verify Context block mapping
+		contextMap := finalData["Context"].(map[string]any)
+		if contextMap["ExistingData"] != true {
+			t.Errorf("Expected Context.ExistingData to be preserved as true. Got: %v", contextMap["ExistingData"])
+		}
+		if contextMap["TenantId"] != "NewTenant" {
+			t.Errorf("Expected Context.TenantId to be overwritten by new metadata. Got: %v", contextMap["TenantId"])
+		}
+	})
 }

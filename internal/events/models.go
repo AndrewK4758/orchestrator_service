@@ -49,10 +49,10 @@ type TraceabilityEvent struct {
 	JobAction string `json:"job_action,omitempty"`
 
 	// Specific Payload Details (Optional based on EventType)
-	ChunkID       string                 `json:"chunk_id,omitempty"`
-	ChunkIndex    int                    `json:"chunk_index,omitempty"`
-	Message       string                 `json:"message,omitempty"`
-	Error         string                 `json:"error,omitempty"`
-	Metadata      map[string]interface{} `json:"metadata,omitempty"`
-	ExtractedData string                 `json:"extracted_data,omitempty"` // Only populated on completion if needed
+	ChunkID       string         `json:"chunk_id,omitempty"`
+	ChunkIndex    int            `json:"chunk_index,omitempty"`
+	Message       string         `json:"message,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	ExtractedData string         `json:"extracted_data,omitempty"` // Only populated on completion if needed
 }

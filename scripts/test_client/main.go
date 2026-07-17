@@ -109,13 +109,13 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Println("\n[test_client] PHASE 1: Submitting Initial State...")
 
 	b64Doc := base64.StdEncoding.EncodeToString(pdfBytes)
-	initialState, _ := structpb.NewStruct(map[string]interface{}{
+	initialState, _ := structpb.NewStruct(map[string]any{
 		"document_b64": b64Doc,
 	})
 
 	nodeReq := &pb.ExecuteWorkflowNodeRequest{
-		JobId: "job_test_123",
-		StepId: "step_1",
+		JobId:       "job_test_123",
+		StepId:      "step_1",
 		GlobalState: initialState,
 		Metadata: map[string]string{
 			"app_id":    "CLI_TEST_APP",
@@ -123,9 +123,9 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		},
 		CallbackAddress: "localhost:50055",
 		NodeConfig: &pb.NodeConfiguration{
-			NodeName: "Extract Invoice Data",
+			NodeName:           "Extract Invoice Data",
 			SystemInstructions: "Extract the invoice number and total amount.",
-			ExpectedSchema: `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
+			ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
 		},
 	}
 

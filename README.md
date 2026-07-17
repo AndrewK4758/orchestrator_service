@@ -40,6 +40,23 @@ The `NodeConfig.PrimitiveType` enum explicitly routes the Orchestrator's executi
    - **Triggers**: Connects to the `human_validation_service`.
    - **Usage**: Used when the AI lacks confidence or encounters a fatal schema exception. The Orchestrator suspends the graph execution and queues a task for human operators. Once the human manually corrects the JSON state, the Orchestrator resumes the graph by sending the callback to the client.
 
+## ✉️ The Standard Callback Envelope Pattern
+
+To provide seamless, strongly-typed parsing inside the `.NET Client` (without resorting to fragile dynamic dictionary lookups), the Orchestrator strictly enforces the **Context Envelope Pattern** on the final mutated `GlobalState` before firing the webhook callback.
+
+Whenever a workflow step succeeds, the Orchestrator will automatically create (or augment) a top-level `"Context"` key inside the `GlobalState` JSON and dynamically inject the `Metadata` map originally provided in the `ExecuteWorkflowNodeRequest`, alongside the `JobId` and `CompletedStepId`.
+
+This guarantees that the C# client can utilize a generic utility wrapper:
+```csharp
+public class StepCallbackEnvelope<TState, TOutput> {
+    public StepContext Context { get; set; }
+    public TState Data { get; set; } // The heavily mutated business logic
+}
+```
+This entirely removes hardcoded conditional logic and allows the `.NET` application to cleanly deserialize `google.protobuf.Struct` into `TState`!
+
+---
+
 ## 💾 Semantic Cache Integration
 The Orchestrator interacts with the `semantic_cache_service` using a **Hybrid Architecture** for maximum resilience and throughput:
 1. **Reads (gRPC)**: Cache lookups are evaluated synchronously via gRPC under the `PRIMITIVE_ZERO_SHOT_CLASSIFICATION` execution handler. If a document chunk mathematically matches a prior index, the Orchestrator instantly terminates the AI step and merges the cached JSON payload directly into the client's global state.
