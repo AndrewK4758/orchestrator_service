@@ -18,6 +18,7 @@ import (
 
 	pb "github.com/AndrewK4758/shared_protos"
 
+	"github.com/xeipuuv/gojsonschema"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -53,15 +54,6 @@ const ReviewSchema = `{
     "reason": { "type": "string" }
   },
   "required": ["approved", "reason"]
-}`
-
-const ValidationSchema = `{
-  "type": "object",
-  "properties": {
-    "valid": { "type": "boolean" },
-    "reason": { "type": "string" }
-  },
-  "required": ["valid", "reason"]
 }`
 
 type ActionItem struct {
@@ -267,7 +259,15 @@ Return a JSON object matching the expected schema.`, req.NodeConfig.SystemInstru
 }
 
 func (e *Engine) assembleStepOutput(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
-	assemblyPrompt := fmt.Sprintf("You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nReturn ONLY the JSON object.", req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema)
+	actionStateJson := "{}"
+	if state.ActionState != nil {
+		bytes, err := state.ActionState.MarshalJSON()
+		if err == nil {
+			actionStateJson = string(bytes)
+		}
+	}
+
+	assemblyPrompt := "You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nReturn ONLY the JSON object."
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Assemble Output",
@@ -275,7 +275,10 @@ func (e *Engine) assembleStepOutput(ctx context.Context, state *EngineState, req
 		Prompt:                assemblyPrompt,
 		ExpectedOutputSchema:  req.NodeConfig.ExpectedSchema,
 	}
-	resp, err := e.aiClient.PerformAction(ctx, req, actionDef, nil, assemblyPrompt, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
+
+	inputText := fmt.Sprintf("Action State to Assemble:\n%s", actionStateJson)
+
+	resp, err := e.aiClient.PerformAction(ctx, req, actionDef, nil, inputText, pb.ModelChoice_MODEL_CHOICE_EXTRACTION)
 	if err != nil {
 		return "", fmt.Errorf("failed to assemble step output: %w", err)
 	}
@@ -283,28 +286,30 @@ func (e *Engine) assembleStepOutput(ctx context.Context, state *EngineState, req
 }
 
 func (e *Engine) validateStepOutput(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest, assembledJson string) (bool, string, error) {
-	validationPrompt := fmt.Sprintf("You are a strict validator. Validate that the assembled output strictly matches the expected schema for the step.\n\nStep Instructions: %s\nExpected Output Schema: %s\n\nAssembled Output:\n%s\n\nDoes the output satisfy the expected schema?", req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema, assembledJson)
+	logger.Info("Engine", "[JobID: %s | StepID: %s] Validating assembled output deterministically against JSON schema", state.JobId, req.StepId)
+	logger.Info("Engine", "[JobID: %s | StepID: %s] RAW AI OUTPUT:\n%s", state.JobId, req.StepId, assembledJson)
 
-	actionDef := &pb.ActionDefinition{
-		Name:                  "Validate Output",
-		OrchestratorPrimitive: "VALIDATION_PRIMITIVE",
-		Prompt:                validationPrompt,
-		ExpectedOutputSchema:  ValidationSchema,
-	}
-	resp, err := e.aiClient.PerformAction(ctx, req, actionDef, nil, "", pb.ModelChoice_MODEL_CHOICE_CLASSIFICATION)
+	schemaLoader := gojsonschema.NewStringLoader(req.NodeConfig.ExpectedSchema)
+	documentLoader := gojsonschema.NewStringLoader(assembledJson)
+
+	result, err := gojsonschema.Validate(schemaLoader, documentLoader)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to validate step: %w", err)
+		logger.Warn("Engine", "[JobID: %s | StepID: %s] JSON parsing failed during validation: %v", state.JobId, req.StepId, err)
+		return false, fmt.Sprintf("The generated output is not valid JSON. Parse error: %v", err), nil
 	}
 
-	var result struct {
-		Valid  bool   `json:"valid"`
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(resp.GetActionResultJson()), &result); err != nil {
-		return false, "", fmt.Errorf("failed to parse validation result: %w", err)
+	if result.Valid() {
+		return true, "", nil
 	}
 
-	return result.Valid, result.Reason, nil
+	var errorMsgs []string
+	for _, desc := range result.Errors() {
+		errorMsgs = append(errorMsgs, desc.String())
+	}
+
+	reason := fmt.Sprintf("The output does not satisfy the expected schema. Please fix the following errors:\n- %s", strings.Join(errorMsgs, "\n- "))
+
+	return false, reason, nil
 }
 
 func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (string, string, string, string, error) {
@@ -528,11 +533,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			}
 		}
 
-		// 7. Success! Commit strictly to the Global State via a direct top-level merge.
-		// If WritesToStateKey is provided, nest the output safely.
-		if err := mergeIntoGlobalState(state, assembledJson, ""); err != nil {
-			return "", "", lastStepName, lastStepId, fmt.Errorf("failed to merge global state: %w", err)
-		}
+		// We now rely on server.go to merge the final assembled output into the GlobalState
+		// and apply the envelope pattern via MergeStateContext.
 
 		stepSuccess = true
 		finalAssembledJson = assembledJson
@@ -548,32 +550,6 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 	state.PendingActions = nil
 	state.CurrentActionIndex = 0
 	state.ActionState = nil
-
-	// Enforce the Standard Envelope Pattern (Sync Metadata -> Context)
-	if req.GlobalState == nil {
-		req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
-	}
-	
-	m := req.GlobalState.AsMap()
-	var ctxMap map[string]any
-	if existing, ok := m["Context"].(map[string]any); ok {
-		ctxMap = existing
-	} else {
-		ctxMap = make(map[string]any)
-	}
-
-	if req.Metadata != nil {
-		for k, v := range req.Metadata {
-			ctxMap[k] = v
-		}
-	}
-	ctxMap["JobId"] = state.JobId
-	ctxMap["CompletedStepId"] = req.StepId
-	m["Context"] = ctxMap
-
-	if updatedStruct, err := structpb.NewStruct(m); err == nil {
-		req.GlobalState = updatedStruct
-	}
 
 	// Final state json
 	var finalJSON []byte
@@ -850,37 +826,64 @@ func mergeIntoActionState(state *EngineState, jsonStr string) error {
 	return nil
 }
 
-func mergeIntoGlobalState(state *EngineState, jsonStr string, targetKey string) error {
-	if jsonStr == "" {
-		return nil
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return fmt.Errorf("malformed JSON in global state merge: %w", err)
-	}
-
-	if state.Req.GlobalState == nil {
-		state.Req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
-	}
-
-	m := state.Req.GlobalState.AsMap()
-	if targetKey != "" {
-		if existing, ok := m[targetKey].(map[string]any); ok {
-			deepMerge(existing, parsed)
-			m[targetKey] = existing
-		} else {
-			m[targetKey] = parsed
+// MergeStateContext handles deep merging step JSON output into the GlobalState
+// and enforces the standard Context envelope pattern.
+func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targetKey string) error {
+	if jsonStr != "" {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+			return fmt.Errorf("malformed JSON in global state merge: %w", err)
 		}
+
+		if req.GlobalState == nil {
+			req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
+		}
+
+		m := req.GlobalState.AsMap()
+		if targetKey != "" {
+			if existing, ok := m[targetKey].(map[string]any); ok {
+				deepMerge(existing, parsed)
+				m[targetKey] = existing
+			} else {
+				m[targetKey] = parsed
+			}
+		} else {
+			deepMerge(m, parsed)
+		}
+
+		newState, err := structpb.NewStruct(m)
+		if err != nil {
+			return fmt.Errorf("failed to update struct for global state: %w", err)
+		}
+		req.GlobalState = newState
+	}
+
+	// Enforce the Standard Envelope Pattern (Sync Metadata -> Context)
+	if req.GlobalState == nil {
+		req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
+	}
+
+	m := req.GlobalState.AsMap()
+	var ctxMap map[string]any
+	if existing, ok := m["Context"].(map[string]any); ok {
+		ctxMap = existing
 	} else {
-		deepMerge(m, parsed)
+		ctxMap = make(map[string]any)
 	}
 
-	newState, err := structpb.NewStruct(m)
-	if err != nil {
-		return fmt.Errorf("failed to update struct for global state: %w", err)
+	if req.Metadata != nil {
+		for k, v := range req.Metadata {
+			ctxMap[k] = v
+		}
+	}
+	ctxMap["JobId"] = req.JobId
+	ctxMap["CompletedStepId"] = req.StepId
+	m["Context"] = ctxMap
+
+	if updatedStruct, err := structpb.NewStruct(m); err == nil {
+		req.GlobalState = updatedStruct
 	}
 
-	state.Req.GlobalState = newState
 	return nil
 }
 

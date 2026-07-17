@@ -58,8 +58,9 @@ This entirely removes hardcoded conditional logic and allows the `.NET` applicat
 ---
 
 ## 💾 Semantic Cache Integration
-The Orchestrator interacts with the `semantic_cache_service` using a **Hybrid Architecture** for maximum resilience and throughput:
-1. **Reads (gRPC)**: Cache lookups are evaluated synchronously via gRPC under the `PRIMITIVE_ZERO_SHOT_CLASSIFICATION` execution handler. If a document chunk mathematically matches a prior index, the Orchestrator instantly terminates the AI step and merges the cached JSON payload directly into the client's global state.
+The Orchestrator interacts with the `semantic_cache_service` using a **Hybrid Architecture** for maximum resilience and throughput. The Orchestrator acts strictly as a "dumb pipe"; the `.NET Client` has absolute authority over Cache Confidence levels via the `ConfidenceThreshold` passed in the execution request.
+
+1. **Reads (gRPC)**: Cache lookups are evaluated synchronously via gRPC under the `PRIMITIVE_ZERO_SHOT_CLASSIFICATION` execution handler. The cache service uses a two-tier lookup (Metadata Hash -> Semantic Search). The client-provided `ConfidenceThreshold` dictates the success criteria. If a document chunk matches a prior index, the Orchestrator instantly terminates the AI step and merges the cached JSON payload directly into the client's global state.
 2. **Writes (JetStream)**: Successful AI data extractions are sequenced dynamically via the `PRIMITIVE_SEMANTIC_CACHE_STORE` execution handler. The Orchestrator fires an asynchronous, durable event to the `CACHE_REQUESTS` stream via NATS JetStream and immediately continues processing without waiting for the vector DB to index the payload, completely removing latency bottlenecks and stampedes.
 3. **Observability**: Cache operations feature a dedicated `CACHE` log level. The Orchestrator prints the exact client metadata used for partitioning, the resulting cosine similarity score, and the explicitly extracted cache payload directly to the console for complete visibility.
 

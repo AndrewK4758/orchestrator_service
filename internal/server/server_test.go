@@ -89,26 +89,21 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	msgBytes, _ := proto.Marshal(req)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
-	go func() {
-		defer wg.Done()
-		err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-		// If we don't have proper mutex locking, race detector will trigger or execution will panic.
-		if err != nil && err.Error() != "node config is missing" {
-			// ignore for now, we just want to test concurrency safety
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-		if err != nil && err.Error() != "node config is missing" {
-			// ignore
-		}
-	}()
+	for i := 0; i < 3; i++ {
+		go func() {
+			defer wg.Done()
+			err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
+			if err != nil && err.Error() != "node config is missing" {
+				// ignore
+			}
+		}()
+	}
 
 	wg.Wait()
+	
+	// We assert it doesn't crash or trigger race conditions running 3 concurrently.
 }
 
 type mockCallbackServer struct {
@@ -273,4 +268,83 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 	// Should attempt to dial 127.0.0.1:9999, fail, and gracefully exit without panicking
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
 	assert.NoError(t, err)
+}
+
+func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
+	pub := &mockPublisher{}
+	srv := NewServer(&ai_client.Client{}, pub, nil)
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId:           "job_cleanup",
+		StepId:          "step_1",
+		CallbackAddress: "127.0.0.1:12345", // A non-existent local port to simulate down client
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: "Test Node",
+			Cache: &pb.CacheConfiguration{
+				Enabled:        true,
+				CollectionName: "test_cache",
+				LookupInput:    "test",
+			},
+		},
+	}
+	
+	// Force a cache hit so we don't need real AI
+	srv.cacheClient = &mockCacheClient{
+		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			return &pb.CheckCacheResponse{Hit: true, Confidence: 1.0, ExtractedPayload: `{"status": "ok"}`}, nil
+		},
+	}
+
+	msgBytes, _ := proto.Marshal(req)
+	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
+	assert.NoError(t, err)
+
+	// Callback will fail. We should assert that `activeJobs` no longer contains "job_cleanup"
+	srv.mu.RLock()
+	_, exists := srv.activeJobs["job_cleanup"]
+	srv.mu.RUnlock()
+
+	assert.False(t, exists, "JobTracker should have been cleaned up after callback failure")
+}
+
+func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
+	pub := &mockPublisher{}
+	srv := NewServer(&ai_client.Client{}, pub, nil)
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId:  "job_cache_timeout",
+		StepId: "step_1",
+		NodeConfig: &pb.NodeConfiguration{
+			NodeName: "Test Node",
+			Cache: &pb.CacheConfiguration{
+				Enabled:        true,
+				CollectionName: "test_cache",
+				LookupInput:    "test",
+			},
+		},
+	}
+	
+	timeoutTriggered := false
+
+	// Simulate cache timeout by returning context.DeadlineExceeded
+	srv.cacheClient = &mockCacheClient{
+		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
+			timeoutTriggered = true
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	// But because we want the engine to execute without panicking or actually running AI,
+	// wait, if we mock the engine, or just let it fail because we didn't mock AI?
+	// The AI will fail since there is no API key, but we want to assert that the fallback is attempted!
+	
+	msgBytes, _ := proto.Marshal(req)
+	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
+	
+	// The ReAct engine will fail because there is no API key / mock AI setup in this basic test,
+	// but it should NOT return an error specifically from the cache service.
+	assert.NoError(t, err) // handleJobMessage itself returns nil but fires failure callback
+	assert.True(t, timeoutTriggered, "Cache service should have been queried and timed out")
+	
+	// We can check if `activeJobs` is cleaned up or if callback was fired with failure
 }

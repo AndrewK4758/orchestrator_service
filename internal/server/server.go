@@ -25,9 +25,11 @@ import (
 )
 
 type JobTracker struct {
-	Req    *pb.ExecuteWorkflowNodeRequest
-	Cancel context.CancelFunc
-	mu     sync.Mutex
+	Req            *pb.ExecuteWorkflowNodeRequest
+	Cancel         context.CancelFunc
+	CurrentStepId  string
+	StepInProgress bool
+	mu             sync.Mutex
 }
 
 func (j *JobTracker) Lock() {
@@ -145,21 +147,26 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		return fmt.Errorf("failed to unmarshal ExecuteWorkflowNodeRequest: %w", err)
 	}
 
-	s.mu.RLock()
+	s.mu.Lock()
 	tracker, exists := s.activeJobs[req.JobId]
-	s.mu.RUnlock()
+	if !exists {
+		tracker = &JobTracker{Req: req}
+		s.activeJobs[req.JobId] = tracker
+	}
+	s.mu.Unlock()
+
+	tracker.Lock()
+	if tracker.StepInProgress && tracker.CurrentStepId == req.StepId {
+		tracker.Unlock()
+		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", req.JobId, req.StepId)
+		return nil
+	}
+	tracker.StepInProgress = true
+	tracker.CurrentStepId = req.StepId
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if !exists {
-		tracker = &JobTracker{Req: req}
-		s.mu.Lock()
-		s.activeJobs[req.JobId] = tracker
-		s.mu.Unlock()
-	}
-
-	tracker.Lock()
 	tracker.Cancel = cancel
 	tracker.Unlock()
 
@@ -199,7 +206,13 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		if err != nil {
 			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
 		} else if cacheResp.Hit {
+			tracker.Lock()
+			tracker.StepInProgress = false
+			tracker.Unlock()
 			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
+			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
+				logger.Error("Server", "Failed to merge cache state context: %v", err)
+			}
 			s.fireCallback(req, cacheResp.ExtractedPayload, "", req.StepId)
 			return nil
 		} else {
@@ -216,15 +229,25 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			logger.Info("System", "Job %s paused for human validation", req.JobId)
 			tracker.Lock()
 			tracker.Req = req
+			tracker.StepInProgress = false
 			tracker.Unlock()
 			return nil
 		}
+		tracker.Lock()
+		tracker.StepInProgress = false
+		tracker.Unlock()
 		logger.Error("System", "Workflow execution failed: %v", err)
 		s.fireCallback(req, stepOutputJSON, err.Error(), lastStepId)
 		return nil
 	}
 
+	tracker.Lock()
+	tracker.StepInProgress = false
+	tracker.Unlock()
 	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
+	if err := engine.MergeStateContext(req, stepOutputJSON, ""); err != nil {
+		logger.Error("Server", "Failed to merge final state context: %v", err)
+	}
 	s.fireCallback(req, stepOutputJSON, "", lastStepId)
 
 	return nil
@@ -249,9 +272,7 @@ func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, st
 	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
 		logger.Error("System", "Failed to dial callback address %s: %v", cbAddress, err)
-		if errMsg != "" {
-			s.handleCallbackError(errMsg, req)
-		}
+		s.handleCallbackError(errMsg, req)
 		return
 	}
 	defer conn.Close()
@@ -288,9 +309,8 @@ func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, st
 
 	if err != nil {
 		logger.Error("System", "Callback failed: %v", err)
-	}
-
-	if errMsg != "" {
+		s.handleCallbackError(errMsg, req)
+	} else if errMsg != "" {
 		s.handleCallbackError(errMsg, req)
 	}
 }

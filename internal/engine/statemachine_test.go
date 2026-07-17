@@ -153,13 +153,17 @@ func TestGenericStateMerging(t *testing.T) {
 		},
 	}
 
-	finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Engine failed to process arbitrary state: %v", err)
 	}
+	if err := MergeStateContext(req, assembledJson, ""); err != nil {
+		t.Fatalf("MergeStateContext failed: %v", err)
+	}
 
+	finalJsonBytes, _ := req.GlobalState.MarshalJSON()
 	var finalData map[string]any
-	if err := json.Unmarshal([]byte(finalJsonStr), &finalData); err != nil {
+	if err := json.Unmarshal(finalJsonBytes, &finalData); err != nil {
 		t.Fatalf("Failed to parse final JSON: %v", err)
 	}
 
@@ -221,6 +225,10 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	_, resultJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Expected Engine to succeed, got error: %v", err)
+	}
+
+	if err := MergeStateContext(req, resultJson, "extracted_data"); err != nil {
+		t.Fatalf("MergeStateContext failed: %v", err)
 	}
 
 	if _, ok := req.GlobalState.AsMap()["extracted_data"]; !ok {
@@ -517,12 +525,12 @@ func TestIdempotentExecution(t *testing.T) {
 		},
 	}
 
-	finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+	_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Engine failed processing despite retry logic: %v", err)
 	}
-	if !strings.Contains(finalJsonStr, "assembled") {
-		t.Fatalf("Expected output to contain 'assembled', got: %s", finalJsonStr)
+	if !strings.Contains(assembledJson, "assembled") {
+		t.Fatalf("Expected output to contain 'assembled', got: %s", assembledJson)
 	}
 	if callCount != 2 {
 		t.Fatalf("Expected Review to be called 2 times due to retry, got: %d", callCount)
@@ -732,13 +740,18 @@ func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
 			},
 		}
 
-		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 		if err != nil {
 			t.Fatalf("Engine failed processing step: %v", err)
 		}
 
+		if err := MergeStateContext(req, assembledJson, ""); err != nil {
+			t.Fatalf("MergeStateContext failed: %v", err)
+		}
+		
+		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
 		var finalData map[string]any
-		if err := json.Unmarshal([]byte(finalJsonStr), &finalData); err != nil {
+		if err := json.Unmarshal(finalJsonBytes, &finalData); err != nil {
 			t.Fatalf("Failed to parse final JSON: %v", err)
 		}
 
@@ -772,13 +785,18 @@ func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
 			},
 		}
 
-		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 		if err != nil {
 			t.Fatalf("Engine failed processing step: %v", err)
 		}
 
+		if err := MergeStateContext(req, assembledJson, ""); err != nil {
+			t.Fatalf("MergeStateContext failed: %v", err)
+		}
+
+		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
 		var finalData map[string]any
-		json.Unmarshal([]byte(finalJsonStr), &finalData)
+		json.Unmarshal(finalJsonBytes, &finalData)
 		contextMap, ok := finalData["Context"].(map[string]any)
 		if !ok {
 			t.Fatalf("Expected 'Context' root object even with nil metadata.")
@@ -817,13 +835,18 @@ func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
 			},
 		}
 
-		finalJsonStr, _, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
+		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
 		if err != nil {
 			t.Fatalf("Engine failed processing step: %v", err)
 		}
 
+		if err := MergeStateContext(req, assembledJson, ""); err != nil {
+			t.Fatalf("MergeStateContext failed: %v", err)
+		}
+
+		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
 		var finalData map[string]any
-		json.Unmarshal([]byte(finalJsonStr), &finalData)
+		json.Unmarshal(finalJsonBytes, &finalData)
 
 		// Verify existing Data block was not destroyed
 		dataMap, ok := finalData["Data"].(map[string]any)
@@ -841,3 +864,100 @@ func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateStepOutput(t *testing.T) {
+	engine := &Engine{}
+
+	tests := []struct {
+		name          string
+		schema        string
+		assembledJson string
+		expectedValid bool
+		reasonMatches string
+	}{
+		{
+			name:          "Happy Path - Simple Object",
+			schema:        `{ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }`,
+			assembledJson: `{ "name": "John Doe" }`,
+			expectedValid: true,
+			reasonMatches: "",
+		},
+		{
+			name:          "Happy Path - Complex Nested",
+			schema:        `{ "type": "object", "properties": { "user": { "type": "object", "properties": { "age": { "type": "integer" } } } } }`,
+			assembledJson: `{ "user": { "age": 30 } }`,
+			expectedValid: true,
+			reasonMatches: "",
+		},
+		{
+			name:          "Failure - Missing Required Field",
+			schema:        `{ "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }`,
+			assembledJson: `{ }`,
+			expectedValid: false,
+			reasonMatches: "id is required",
+		},
+		{
+			name:          "Failure - Type Mismatch",
+			schema:        `{ "type": "object", "properties": { "age": { "type": "integer" } } }`,
+			assembledJson: `{ "age": "thirty" }`,
+			expectedValid: false,
+			reasonMatches: "Invalid type. Expected: integer, given: string",
+		},
+		{
+			name:          "Resiliency - Malformed JSON (EOF)",
+			schema:        `{ "type": "object" }`,
+			assembledJson: `{ "broken": `,
+			expectedValid: false,
+			reasonMatches: "The generated output is not valid JSON. Parse error:",
+		},
+		{
+			name:          "Resiliency - Malformed Schema",
+			schema:        `{"broken_schema": `,
+			assembledJson: `{ "name": "test" }`,
+			expectedValid: false,
+			reasonMatches: "The generated output is not valid JSON. Parse error:",
+		},
+		{
+			name:          "Edge Case - allOf Base Schema Restriction",
+			schema:        `{"allOf": [ {"type": "object", "additionalProperties": false}, {"type": "object", "properties": {"name": {"type": "string"}}} ]}`,
+			assembledJson: `{ "name": "John" }`,
+			expectedValid: false,
+			reasonMatches: "Additional property name is not allowed",
+		},
+		{
+			name:          "Edge Case - allOf Relaxed Base Schema",
+			schema:        `{"allOf": [ {"type": "object"}, {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string"}}} ]}`,
+			assembledJson: `{ "name": "John" }`,
+			expectedValid: true,
+			reasonMatches: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &pb.ExecuteWorkflowNodeRequest{
+				JobId:  "TestJob_123",
+				StepId: "Step_ABC",
+				NodeConfig: &pb.NodeConfiguration{
+					ExpectedSchema: tt.schema,
+				},
+			}
+			state := &EngineState{JobId: req.JobId, Req: req}
+			
+			valid, reason, err := engine.validateStepOutput(context.Background(), state, req, tt.assembledJson)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if valid != tt.expectedValid {
+				t.Errorf("expected valid=%v, got %v", tt.expectedValid, valid)
+			}
+			
+			if tt.reasonMatches != "" && !strings.Contains(reason, tt.reasonMatches) {
+				t.Errorf("expected reason to contain %q, got %q", tt.reasonMatches, reason)
+			} else if tt.reasonMatches == "" && reason != "" {
+				t.Errorf("expected empty reason, got %q", reason)
+			}
+		})
+	}
+}
+
