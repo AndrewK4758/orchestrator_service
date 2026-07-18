@@ -105,6 +105,7 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 	e.primitiveHandlers["PRIMITIVE_HUMAN_STEP"] = e.executeHumanValidationStep
 	e.primitiveHandlers["PRIMITIVE_ZERO_SHOT_CLASSIFICATION"] = e.executeZeroShotClassification
 	e.primitiveHandlers["PRIMITIVE_SEMANTIC_CACHE_STORE"] = e.executeSemanticCacheStore
+	e.primitiveHandlers["PRIMITIVE_DOCUMENT_CHUNKING"] = e.executeDocumentChunking
 
 	return e
 }
@@ -129,6 +130,8 @@ func (e *Engine) generatePlan(ctx context.Context, state *EngineState, req *pb.E
 			primitiveStr = "PRIMITIVE_HUMAN_STEP"
 		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION {
 			primitiveStr = "PRIMITIVE_ZERO_SHOT_CLASSIFICATION"
+		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING {
+			primitiveStr = "PRIMITIVE_DOCUMENT_CHUNKING"
 		}
 		if primitiveStr != "" {
 			logger.Info("Engine", "[JobID: %s | StepID: %s] Client explicitly defined primitive %s. Bypassing AI Planner.", state.JobId, req.StepId, primitiveStr)
@@ -360,7 +363,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			isExplicitPrimitive := (req.NodeConfig.PrimitiveType != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED &&
 				(req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP ||
 					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP ||
-					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION)) ||
+					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION ||
+					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING)) ||
 				(req.NodeConfig.HumanValidation != nil && req.NodeConfig.HumanValidation.Required)
 
 			var approved bool
@@ -406,6 +410,10 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP
 				} else if action.ActionType == "PRIMITIVE_HUMAN_STEP" {
 					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP
+				} else if action.ActionType == "PRIMITIVE_ZERO_SHOT_CLASSIFICATION" {
+					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION
+				} else if action.ActionType == "PRIMITIVE_DOCUMENT_CHUNKING" {
+					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING
 				}
 
 				pbActions = append(pbActions, &pb.ActionDefinition{
