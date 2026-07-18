@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 
-	pb "github.com/AndrewK4758/shared_protos"
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/logger"
+
+	pb "github.com/AndrewK4758/shared_protos"
 )
 
 func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
 	logger.Info("Engine", "[JobID: %s | StepID: %s] Executing Document Chunking", state.JobId, req.StepId)
-	
+
 	if e.chunkingClient == nil {
 		return "", fmt.Errorf("document processing service client is not initialized")
 	}
@@ -29,9 +30,10 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 	}
 
 	resp, err := e.chunkingClient.ChunkDocument(ctx, &pb.ChunkDocumentRequest{
-		JobId:       state.JobId,
-		StepId:      req.StepId,
-		ZipFilePath: zipPath,
+		JobId:           state.JobId,
+		StepId:          req.StepId,
+		ZipFilePath:     zipPath,
+		OriginalRequest: req,
 	})
 
 	if err != nil {
@@ -50,7 +52,7 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 	// This JSON must match whatever "ExpectedSchema" the client passed for this step
 	// For simplicity, we wrap the processed documents into a JSON array string.
 	// We'll use a basic JSON marshaler to merge it back to state.
-	outBytes, _ := json.Marshal(map[string]interface{}{
+	outBytes, _ := json.Marshal(map[string]any{
 		"processed_documents": resp.ProcessedDocuments,
 	})
 
