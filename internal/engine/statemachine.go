@@ -92,6 +92,7 @@ type Engine struct {
 	pub               TracePublisher
 	primitiveHandlers map[string]ActionFunc
 	pendingCacheJobs  sync.Map
+	chunkingClient    pb.DocumentProcessingServiceClient
 }
 
 func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher) *Engine {
@@ -108,6 +109,10 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 	e.primitiveHandlers["PRIMITIVE_DOCUMENT_CHUNKING"] = e.executeDocumentChunking
 
 	return e
+}
+
+func (e *Engine) SetChunkingClient(client pb.DocumentProcessingServiceClient) {
+	e.chunkingClient = client
 }
 
 func (e *Engine) executeHumanValidationStep(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest) (string, error) {

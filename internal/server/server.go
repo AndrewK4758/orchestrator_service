@@ -71,6 +71,17 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 
 	eng := engine.NewEngine(aiClient, cacheClient, pub)
 
+	docProcAddr := os.Getenv("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
+	if docProcAddr == "" {
+		docProcAddr = "127.0.0.1:50053"
+	}
+	docConn, err := grpc.NewClient(docProcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		logger.Warn("System", "failed to connect to document processing service: %v", err)
+	} else {
+		eng.SetChunkingClient(pb.NewDocumentProcessingServiceClient(docConn))
+	}
+
 	srv := &OrchestratorServer{
 		eng:         eng,
 		aiClient:    aiClient,

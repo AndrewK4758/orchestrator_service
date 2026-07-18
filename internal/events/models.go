@@ -13,6 +13,7 @@ const (
 	EventChunkStarted   EventType = "chunk.started"
 	EventChunkCompleted EventType = "chunk.completed"
 	EventChunkFailed    EventType = "chunk.failed"
+	EventChunkTrace     EventType = "chunk.trace"
 
 	EventJobStepStarted       EventType = "step.started"
 	EventJobStepCompleted     EventType = "step.completed"
