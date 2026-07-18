@@ -701,7 +701,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest, failedOutput string, errMsg string) (string, error) {
 	addr := os.Getenv("HUMAN_VALIDATION_SERVICE_ADDRESS")
 	if addr == "" {
-		addr = "localhost:50054"
+		addr = "localhost:50056"
 	}
 
 	maxMsgSizeMb := 100

@@ -73,7 +73,7 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 
 	docProcAddr := os.Getenv("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
 	if docProcAddr == "" {
-		docProcAddr = "127.0.0.1:50053"
+		docProcAddr = "127.0.0.1:50054"
 	}
 	docConn, err := grpc.NewClient(docProcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
