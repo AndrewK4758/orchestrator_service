@@ -18,22 +18,22 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 		return "", fmt.Errorf("document processing service client is not initialized")
 	}
 
-	zipPath := ""
+	relativePath := ""
 	if state.ActionState != nil && state.ActionState.Fields != nil {
-		if val, ok := state.ActionState.Fields["zip_file_path"]; ok {
-			zipPath = val.GetStringValue()
+		if val, ok := state.ActionState.Fields["relative_file_path"]; ok {
+			relativePath = val.GetStringValue()
 		}
 	}
 
-	if zipPath == "" {
-		return "", fmt.Errorf("zip_file_path is missing from ActionState")
+	if relativePath == "" {
+		return "", fmt.Errorf("relative_file_path is missing from ActionState")
 	}
 
 	resp, err := e.chunkingClient.ChunkDocument(ctx, &pb.ChunkDocumentRequest{
-		JobId:           state.JobId,
-		StepId:          req.StepId,
-		ZipFilePath:     zipPath,
-		OriginalRequest: req,
+		JobId:            state.JobId,
+		StepId:           req.StepId,
+		RelativeFilePath: relativePath,
+		OriginalRequest:  req,
 	})
 
 	if err != nil {
