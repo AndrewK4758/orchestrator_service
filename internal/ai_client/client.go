@@ -81,7 +81,11 @@ func NewClient(natsURL string) (*Client, error) {
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		replySubj := msg.Subject()
 		if ch, ok := client.pending.Load(replySubj); ok {
-			ch.(chan jetstream.Msg) <- msg
+			select {
+			case ch.(chan jetstream.Msg) <- msg:
+			default:
+				msg.Ack()
+			}
 		} else {
 			// Orphaned message or timeout
 			msg.Ack()
