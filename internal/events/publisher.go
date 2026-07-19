@@ -96,9 +96,16 @@ func (p *Publisher) Close() {
 }
 
 // PublishJob publishes a new job request to JetStream.
-func (p *Publisher) PublishJob(ctx context.Context, payload []byte) error {
+func (p *Publisher) PublishJob(ctx context.Context, msgId string, payload []byte) error {
 	subject := "jobs.incoming"
-	_, err := p.js.Publish(ctx, subject, payload)
+	msg := &nats.Msg{
+		Subject: subject,
+		Data:    payload,
+		Header:  nats.Header{},
+	}
+	msg.Header.Set(nats.MsgIdHdr, msgId)
+	
+	_, err := p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish job to jetstream: %w", err)
 	}
@@ -107,9 +114,16 @@ func (p *Publisher) PublishJob(ctx context.Context, payload []byte) error {
 }
 
 // PublishPriorityJob publishes an active job continuation to the priority JetStream subject.
-func (p *Publisher) PublishPriorityJob(ctx context.Context, payload []byte) error {
+func (p *Publisher) PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error {
 	subject := "jobs.priority"
-	_, err := p.js.Publish(ctx, subject, payload)
+	msg := &nats.Msg{
+		Subject: subject,
+		Data:    payload,
+		Header:  nats.Header{},
+	}
+	msg.Header.Set(nats.MsgIdHdr, msgId)
+	
+	_, err := p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish priority job to jetstream: %w", err)
 	}

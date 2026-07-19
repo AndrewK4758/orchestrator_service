@@ -173,6 +173,8 @@ Available Primitives:
 - PRIMITIVE_AI_STEP: Use this for AI inference.
 - PRIMITIVE_HUMAN_STEP: Use this if human validation is explicitly requested.
 
+CRITICAL INSTRUCTIONS: Exercise 0 creativity. Strictly forbid guesswork, fallback rules, or app-specific logic. The workflow must be generated purely based on the explicit instructions and expected schema, without injecting external domain knowledge.
+
 Return a JSON array of actions matching the PlannerSchema.`, req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema)
 
 	actionDef := &pb.ActionDefinition{
@@ -235,6 +237,8 @@ Expected Schema: %s
 Proposed Actions:
 %s
 
+CRITICAL INSTRUCTIONS: Exercise 0 creativity. Strictly forbid guesswork, fallback rules, or app-specific logic. Ensure the proposed plan strictly adheres to the provided instructions without injecting external domain knowledge.
+
 Review the actions. If they form a valid plan to achieve the instructions, approve it. If not, reject it with a reason.
 Return a JSON object matching the expected schema.`, req.NodeConfig.SystemInstructions, req.NodeConfig.ExpectedSchema, actionsStr)
 
@@ -275,7 +279,7 @@ func (e *Engine) assembleStepOutput(ctx context.Context, state *EngineState, req
 		}
 	}
 
-	assemblyPrompt := "You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nReturn ONLY the JSON object."
+	assemblyPrompt := "You are an assembler. Combine the local Action State into a single JSON object that strictly matches the expected schema for the step.\n\nCRITICAL INSTRUCTIONS: Exercise 0 creativity. Strictly forbid guesswork, fallback rules, or app-specific logic. Do not synthesize or hallucinate data.\n\nReturn ONLY the JSON object."
 
 	actionDef := &pb.ActionDefinition{
 		Name:                  "Assemble Output",
@@ -357,7 +361,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			if err != nil {
 				logger.Warn("Engine", "[JobID: %s | StepID: %s] Generate plan failed: %v", state.JobId, req.StepId, err)
 				if attempt == maxRetries {
-					return "", "", lastStepName, lastStepId, err
+					return "", "", lastStepName, lastStepId, fmt.Errorf("failed to generate plan: %w", err)
 				}
 				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Plan generation failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
 				continue
@@ -387,7 +391,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			if err != nil {
 				logger.Warn("Engine", "[JobID: %s | StepID: %s] Review plan failed: %v", state.JobId, req.StepId, err)
 				if attempt == maxRetries {
-					return "", "", lastStepName, lastStepId, err
+					return "", "", lastStepName, lastStepId, fmt.Errorf("failed to review plan: %w", err)
 				}
 				e.publishEvent(ctx, state, events.EventPlanRejectedRetry, req.NodeConfig.NodeName, fmt.Sprintf("Plan review failed, retrying (%d/%d): %v", attempt+1, maxRetries, err), "")
 				continue
@@ -519,14 +523,14 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			var err error
 			assembledJson, err = e.assembleStepOutput(ctx, state, req)
 			if err != nil {
-				return "", "", lastStepName, lastStepId, err
+				return "", "", lastStepName, lastStepId, fmt.Errorf("failed to assemble step output: %w", err)
 			}
 
 			// 6. Validation Phase
 			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: VALIDATE OUTPUT", state.JobId, req.StepId)
 			valid, valReason, err := e.validateStepOutput(ctx, state, req, assembledJson)
 			if err != nil {
-				return "", "", lastStepName, lastStepId, err
+				return "", "", lastStepName, lastStepId, fmt.Errorf("failed to validate step output: %w", err)
 			}
 
 			if !valid {
@@ -589,12 +593,13 @@ func (e *Engine) executeAIStep(ctx context.Context, state *EngineState, req *pb.
 
 	if state.ActionState != nil {
 		actionStateMap := state.ActionState.AsMap()
-		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
-			if payload, ok := actionStateMap["extracted_payload"]; ok {
-				logger.Info("Engine", "[JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.StepId)
-				bytes, _ := json.Marshal(payload)
-				return string(bytes), nil
-			}
+		hit, ok1 := actionStateMap["cache_hit"].(bool)
+		payload, ok2 := actionStateMap["extracted_payload"]
+
+		if ok1 && hit && ok2 {
+			logger.Info("Engine", "[JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.StepId)
+			bytes, _ := json.Marshal(payload)
+			return string(bytes), nil
 		}
 	}
 

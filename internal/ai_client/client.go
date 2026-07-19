@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/proto"
 
 	aipb "github.com/AndrewK4758/shared_protos"
@@ -19,9 +20,9 @@ import (
 // Client wraps the NATS connection to the AI Service.
 type Client struct {
 	nc       *nats.Conn
-	js       nats.JetStreamContext
+	js       jetstream.JetStream
 	clientID string
-	sub      *nats.Subscription
+	sub      jetstream.ConsumeContext
 	pending  sync.Map
 }
 
@@ -34,17 +35,20 @@ func NewClient(natsURL string) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	js, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("failed to initialize JetStream: %w", err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Ensure AI_RESPONSES stream exists
 	streamName := "AI_RESPONSES"
-	_, err = js.StreamInfo(streamName)
+	_, err = js.Stream(ctx, streamName)
 	if err != nil {
-		_, err = js.AddStream(&nats.StreamConfig{
+		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 			Name:     streamName,
 			Subjects: []string{"ai.response.>"},
 		})
@@ -64,20 +68,30 @@ func NewClient(natsURL string) (*Client, error) {
 
 	// Create a single multiplexed JetStream subscription for this orchestrator instance
 	subSubject := fmt.Sprintf("ai.response.%s.>", clientID)
-	sub, err := js.Subscribe(subSubject, func(msg *nats.Msg) {
-		replySubj := msg.Subject
+	
+	cons, err := js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: subSubject,
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to create JetStream consumer: %w", err)
+	}
+	
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		replySubj := msg.Subject()
 		if ch, ok := client.pending.Load(replySubj); ok {
-			ch.(chan *nats.Msg) <- msg
+			ch.(chan jetstream.Msg) <- msg
 		} else {
 			// Orphaned message or timeout
 			msg.Ack()
 		}
-	}, nats.ManualAck())
+	})
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("failed to create multiplexed JS subscription: %w", err)
+		return nil, fmt.Errorf("failed to start consuming JS messages: %w", err)
 	}
-	client.sub = sub
+	client.sub = cc
 
 	return client, nil
 }
@@ -85,7 +99,7 @@ func NewClient(natsURL string) (*Client, error) {
 // Close gracefully closes the NATS connection.
 func (c *Client) Close() error {
 	if c.sub != nil {
-		c.sub.Unsubscribe()
+		c.sub.Stop()
 	}
 	c.nc.Close()
 	return nil
@@ -134,7 +148,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	replySubject := fmt.Sprintf("ai.response.%s.%s.%s.%s.%d", c.clientID, appID, tenantID, jobID, time.Now().UnixNano())
 
 	// Register the channel for the multiplexed reply
-	respCh := make(chan *nats.Msg, 1)
+	respCh := make(chan jetstream.Msg, 1)
 	c.pending.Store(replySubject, respCh)
 	defer c.pending.Delete(replySubject)
 
@@ -145,7 +159,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	msg.Header.Set("Reply-Subject", replySubject)
 	msg.Data = reqBytes
 
-	_, err = c.js.PublishMsg(msg)
+	_, err = c.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish to JetStream %s: %w", subject, err)
 	}
@@ -158,7 +172,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	}
 
 	// Wait for response
-	var respMsg *nats.Msg
+	var respMsg jetstream.Msg
 	select {
 	case msg := <-respCh:
 		respMsg = msg
@@ -174,7 +188,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	}
 
 	resp := &aipb.PerformActionResponse{}
-	if err := proto.Unmarshal(respMsg.Data, resp); err != nil {
+	if err := proto.Unmarshal(respMsg.Data(), resp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal PerformActionResponse: %w", err)
 	}
 

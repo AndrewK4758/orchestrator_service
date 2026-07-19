@@ -11,7 +11,7 @@ The Orchestrator acts strictly as a "brawn" execution engine and defers all busi
 1. **Client Node Sequencing:** Client applications (e.g., Artemis) define their workflows in their own SQL databases. The Orchestrator does not know the graph up front.
 2. **ExecuteWorkflowNode (gRPC):** The Client submits a single `ExecuteWorkflowNodeRequest` containing the current JSON `GlobalState` and the specific instructions for the current node (Step).
 3. **Internal Execution (ReAct):** The Orchestrator's internal engine (Planner & Reviewer) evaluates the node instructions and executes internal primitives (e.g., `PRIMITIVE_AI_STEP`, `PRIMITIVE_HUMAN_STEP`, `PRIMITIVE_ZERO_SHOT_CLASSIFICATION`).
-4. **Webhook Callback:** Once the node is completed, the Orchestrator fires a webhook back to the Client containing the dynamically mutated `GlobalState`. The Client evaluates the output against its dynamic rules and submits the next Node in the graph.
+4. **Webhook Callback:** Once the node is completed, the Orchestrator fires a webhook back to the Client containing the dynamically mutated `GlobalState`. The Client evaluates the output against its dynamic rules (e.g., using the C# client's JSONPath routing engine) and submits the next Node in the graph.
 
 ## 🛠 Using the ExecuteWorkflowNode Interface
 

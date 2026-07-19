@@ -29,6 +29,7 @@ type JobTracker struct {
 	Cancel         context.CancelFunc
 	CurrentStepId  string
 	StepInProgress bool
+	CompletedSteps map[string]bool
 	mu             sync.Mutex
 }
 
@@ -57,8 +58,8 @@ type OrchestratorServer struct {
 
 type JobPublisher interface {
 	engine.TracePublisher
-	PublishJob(ctx context.Context, payload []byte) error
-	PublishPriorityJob(ctx context.Context, payload []byte) error
+	PublishJob(ctx context.Context, msgId string, payload []byte) error
+	PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error
 	ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
 	PurgeQueues(ctx context.Context) error
 }
@@ -126,12 +127,16 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 
 	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
 
-	tracker := &JobTracker{
-		Req: req,
-	}
-
 	s.mu.Lock()
-	s.activeJobs[jobID] = tracker
+	tracker, exists := s.activeJobs[jobID]
+	if !exists {
+		tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
+		s.activeJobs[jobID] = tracker
+	} else {
+		tracker.Lock()
+		tracker.Req = req
+		tracker.Unlock()
+	}
 	s.mu.Unlock()
 
 	payloadBytes, err := proto.Marshal(req)
@@ -139,7 +144,8 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 		return nil, fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
 	}
 
-	err = s.pub.PublishJob(ctx, payloadBytes)
+	msgId := fmt.Sprintf("%s-%s", req.JobId, req.StepId)
+	err = s.pub.PublishJob(ctx, msgId, payloadBytes)
 	if err != nil {
 		logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue job: %w", err)
@@ -161,12 +167,32 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	s.mu.Lock()
 	tracker, exists := s.activeJobs[req.JobId]
 	if !exists {
-		tracker = &JobTracker{Req: req}
-		s.activeJobs[req.JobId] = tracker
+		s.mu.Unlock()
+		if s.traceClient != nil {
+			ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
+			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{JobId: req.JobId})
+			cancelTrace()
+			if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == "COMPLETED" || resp.Job.Status == "FAILED") {
+				logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", req.JobId, req.StepId)
+				return nil
+			}
+		}
+		s.mu.Lock()
+		tracker, exists = s.activeJobs[req.JobId]
+		if !exists {
+			tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
+			s.activeJobs[req.JobId] = tracker
+		}
 	}
 	s.mu.Unlock()
 
 	tracker.Lock()
+	if tracker.CompletedSteps != nil && tracker.CompletedSteps[req.StepId] {
+		tracker.Unlock()
+		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for already completed step. Ignoring.", req.JobId, req.StepId)
+		return nil
+	}
+
 	if tracker.StepInProgress && tracker.CurrentStepId == req.StepId {
 		tracker.Unlock()
 		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", req.JobId, req.StepId)
@@ -224,8 +250,16 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
 				logger.Error("Server", "Failed to merge cache state context: %v", err)
 			}
-			s.fireCallback(req, cacheResp.ExtractedPayload, "", req.StepId)
-			return nil
+			err := s.fireCallback(ctx, req, cacheResp.ExtractedPayload, "", req.StepId)
+			if err == nil {
+				tracker.Lock()
+				if tracker.CompletedSteps == nil {
+					tracker.CompletedSteps = make(map[string]bool)
+				}
+				tracker.CompletedSteps[req.StepId] = true
+				tracker.Unlock()
+			}
+			return err
 		} else {
 			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
 		}
@@ -248,8 +282,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		tracker.StepInProgress = false
 		tracker.Unlock()
 		logger.Error("System", "Workflow execution failed: %v", err)
-		s.fireCallback(req, stepOutputJSON, err.Error(), lastStepId)
-		return nil
+		return s.fireCallback(ctx, req, stepOutputJSON, err.Error(), lastStepId)
 	}
 
 	tracker.Lock()
@@ -259,19 +292,26 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	if err := engine.MergeStateContext(req, stepOutputJSON, ""); err != nil {
 		logger.Error("Server", "Failed to merge final state context: %v", err)
 	}
-	s.fireCallback(req, stepOutputJSON, "", lastStepId)
-
-	return nil
+	err = s.fireCallback(ctx, req, stepOutputJSON, "", lastStepId)
+	if err == nil {
+		tracker.Lock()
+		if tracker.CompletedSteps == nil {
+			tracker.CompletedSteps = make(map[string]bool)
+		}
+		tracker.CompletedSteps[req.StepId] = true
+		tracker.Unlock()
+	}
+	return err
 }
 
-func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) {
+func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) error {
 	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
 		logger.Info("System", "No callback address provided, skipping callback")
 		if errMsg != "" {
 			s.handleCallbackError(errMsg, req)
 		}
-		return
+		return nil
 	}
 
 	maxMsgSizeMb := 100
@@ -283,8 +323,7 @@ func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, st
 	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
 		logger.Error("System", "Failed to dial callback address %s: %v", cbAddress, err)
-		s.handleCallbackError(errMsg, req)
-		return
+		return fmt.Errorf("failed to dial callback address %s: %w", cbAddress, err)
 	}
 	defer conn.Close()
 
@@ -296,7 +335,7 @@ func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, st
 			timeoutSecs = parsed
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
 	if errMsg != "" {
@@ -320,10 +359,11 @@ func (s *OrchestratorServer) fireCallback(req *pb.ExecuteWorkflowNodeRequest, st
 
 	if err != nil {
 		logger.Error("System", "Callback failed: %v", err)
-		s.handleCallbackError(errMsg, req)
+		return fmt.Errorf("callback failed: %w", err)
 	} else if errMsg != "" {
 		s.handleCallbackError(errMsg, req)
 	}
+	return nil
 }
 
 func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
@@ -351,7 +391,8 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		return nil, fmt.Errorf("failed to marshal resumed request for job %s: %w", jobID, err)
 	}
 
-	err = s.pub.PublishPriorityJob(ctx, payloadBytes)
+	msgId := fmt.Sprintf("%s-%s-resume", stepReq.JobId, stepReq.StepId)
+	err = s.pub.PublishPriorityJob(ctx, msgId, payloadBytes)
 	if err != nil {
 		logger.Error("System", "Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue resumed step: %w", err)

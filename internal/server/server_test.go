@@ -26,11 +26,11 @@ func (m *mockPublisher) PublishTrace(ctx context.Context, event events.Traceabil
 	return nil
 }
 func (m *mockPublisher) PublishCacheStore(ctx context.Context, data []byte) error { return nil }
-func (m *mockPublisher) PublishJob(ctx context.Context, payload []byte) error {
+func (m *mockPublisher) PublishJob(ctx context.Context, msgId string, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
 }
-func (m *mockPublisher) PublishPriorityJob(ctx context.Context, payload []byte) error {
+func (m *mockPublisher) PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
 }
@@ -265,9 +265,9 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 
 	msgBytes, _ := proto.Marshal(req)
 
-	// Should attempt to dial 127.0.0.1:9999, fail, and gracefully exit without panicking
+	// Should attempt to dial 127.0.0.1:9999, fail, and return an error to NAK the message
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-	assert.NoError(t, err)
+	assert.Error(t, err)
 }
 
 func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
@@ -297,7 +297,7 @@ func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
 
 	msgBytes, _ := proto.Marshal(req)
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-	assert.NoError(t, err)
+	assert.Error(t, err)
 
 	// Callback will fail. We should assert that `activeJobs` no longer contains "job_cleanup"
 	srv.mu.RLock()
