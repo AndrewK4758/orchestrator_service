@@ -22,7 +22,7 @@ func TestGeneratePlan_RequireHumanReview(t *testing.T) {
 	plan, err := eng.generatePlan(context.Background(), state, &pb.ExecuteWorkflowNodeRequest{
 		NodeConfig: &pb.NodeConfiguration{
 			SystemInstructions: step.CustomInstructions,
-			ExpectedSchema: step.ExpectedSchema,
+			ExpectedSchema:     step.ExpectedSchema,
 			HumanValidation: &pb.HumanValidationConfiguration{
 				Required: step.RequireHumanReview,
 			},

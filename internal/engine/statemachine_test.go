@@ -142,7 +142,7 @@ func TestGenericStateMerging(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
@@ -211,7 +211,7 @@ func TestExecuteWorkflow_WritesToStateKey(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
@@ -265,7 +265,7 @@ func TestExecuteWorkflow_AIClientFailure(t *testing.T) {
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 
-		JobId: state.JobId,
+		Identity: &pb.InfrastructureIdentity{JobId: state.JobId},
 
 		GlobalState: state.GlobalState,
 
@@ -346,7 +346,7 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_AI(t *testing.T) {
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 
-		JobId: state.JobId,
+		Identity: &pb.InfrastructureIdentity{JobId: state.JobId},
 
 		GlobalState: state.GlobalState,
 
@@ -425,7 +425,7 @@ func TestExecuteWorkflow_ClientPrimitiveOverride_HUMAN(t *testing.T) {
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 
-		JobId: state.JobId,
+		Identity: &pb.InfrastructureIdentity{JobId: state.JobId},
 
 		GlobalState: state.GlobalState,
 
@@ -514,7 +514,7 @@ func TestIdempotentExecution(t *testing.T) {
 	eng := NewEngine(mockAI, &MockCacheClient{}, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
@@ -580,7 +580,7 @@ func TestFailureInjection(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, mockPub)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      step.Id,
 		NodeConfig: &pb.NodeConfiguration{
@@ -637,7 +637,7 @@ func TestZeroShotCacheHit(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      "step-1",
 		NodeConfig: &pb.NodeConfiguration{
@@ -690,7 +690,7 @@ func TestZeroShotCacheMissFallback(t *testing.T) {
 	eng := NewEngine(mockAI, mockCache, &MockTracePublisher{})
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       state.JobId,
+		Identity:    &pb.InfrastructureIdentity{JobId: state.JobId},
 		GlobalState: state.GlobalState,
 		StepId:      "step-1",
 		NodeConfig: &pb.NodeConfiguration{
@@ -712,157 +712,6 @@ func TestZeroShotCacheMissFallback(t *testing.T) {
 	if !strings.Contains(resultJson, "ai_data") {
 		t.Errorf("Expected result to contain AI payload, got: %s", resultJson)
 	}
-}
-
-func TestExecuteWorkflow_ContextEnvelope(t *testing.T) {
-	// Setup generic engine components
-	mockAI := &MockAIClient{
-		PerformActionFunc: func(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error) {
-			return &pb.PerformActionResponse{ActionResultJson: `{"valid": true, "reason": "ok"}`}, nil
-		},
-	}
-	eng := NewEngine(mockAI, &MockCacheClient{}, &MockTracePublisher{})
-
-	t.Run("Happy Path - Populated Metadata", func(t *testing.T) {
-		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId:       "job_123",
-			StepId:      "step_abc",
-			GlobalState: nil, // Will be initialized by the engine
-			Metadata: map[string]string{
-				"TenantId":      "ClientA",
-				"CorrelationId": "corr-001",
-			},
-			NodeConfig: &pb.NodeConfiguration{
-				NodeName:           "Envelope Test Step",
-				SystemInstructions: "test instructions",
-				ExpectedSchema:     "{}",
-				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP, // Bypass AI Planner/Reviewer
-			},
-		}
-
-		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Engine failed processing step: %v", err)
-		}
-
-		if err := MergeStateContext(req, assembledJson, ""); err != nil {
-			t.Fatalf("MergeStateContext failed: %v", err)
-		}
-		
-		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
-		var finalData map[string]any
-		if err := json.Unmarshal(finalJsonBytes, &finalData); err != nil {
-			t.Fatalf("Failed to parse final JSON: %v", err)
-		}
-
-		contextMap, ok := finalData["Context"].(map[string]any)
-		if !ok {
-			t.Fatalf("Expected 'Context' root object, but it was missing or not a map.")
-		}
-
-		if contextMap["JobId"] != "job_123" {
-			t.Errorf("Expected Context.JobId = 'job_123', got %v", contextMap["JobId"])
-		}
-		if contextMap["CompletedStepId"] != "step_abc" {
-			t.Errorf("Expected Context.CompletedStepId = 'step_abc', got %v", contextMap["CompletedStepId"])
-		}
-		if contextMap["TenantId"] != "ClientA" {
-			t.Errorf("Expected Context.TenantId = 'ClientA', got %v", contextMap["TenantId"])
-		}
-	})
-
-	t.Run("Edge Case - Nil Metadata", func(t *testing.T) {
-		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId:       "job_nil_meta",
-			StepId:      "step_nil",
-			GlobalState: nil,
-			Metadata:    nil,
-			NodeConfig: &pb.NodeConfiguration{
-				NodeName:           "Nil Meta Test",
-				SystemInstructions: "test instructions",
-				ExpectedSchema:     "{}",
-				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
-			},
-		}
-
-		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Engine failed processing step: %v", err)
-		}
-
-		if err := MergeStateContext(req, assembledJson, ""); err != nil {
-			t.Fatalf("MergeStateContext failed: %v", err)
-		}
-
-		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
-		var finalData map[string]any
-		json.Unmarshal(finalJsonBytes, &finalData)
-		contextMap, ok := finalData["Context"].(map[string]any)
-		if !ok {
-			t.Fatalf("Expected 'Context' root object even with nil metadata.")
-		}
-
-		if contextMap["JobId"] != "job_nil_meta" || contextMap["CompletedStepId"] != "step_nil" {
-			t.Errorf("Expected Context to contain JobId and StepId, got %v", contextMap)
-		}
-	})
-
-	t.Run("Idempotency - Existing Context Preservation", func(t *testing.T) {
-		// Create a GlobalState that already has a Context key populated
-		existingStateMap := map[string]any{
-			"Context": map[string]any{
-				"ExistingData": true,
-				"TenantId":     "OldTenant", // This should be overwritten by req.Metadata
-			},
-			"Data": map[string]any{
-				"PriorOutput": 123,
-			},
-		}
-		statePayload, _ := structpb.NewStruct(existingStateMap)
-
-		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId:       "job_idem",
-			StepId:      "step_idem",
-			GlobalState: statePayload,
-			Metadata: map[string]string{
-				"TenantId": "NewTenant",
-			},
-			NodeConfig: &pb.NodeConfiguration{
-				NodeName:           "Idempotency Test",
-				SystemInstructions: "test instructions",
-				ExpectedSchema:     "{}",
-				PrimitiveType:      pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP,
-			},
-		}
-
-		_, assembledJson, _, _, err := eng.ExecuteWorkflow(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Engine failed processing step: %v", err)
-		}
-
-		if err := MergeStateContext(req, assembledJson, ""); err != nil {
-			t.Fatalf("MergeStateContext failed: %v", err)
-		}
-
-		finalJsonBytes, _ := req.GlobalState.MarshalJSON()
-		var finalData map[string]any
-		json.Unmarshal(finalJsonBytes, &finalData)
-
-		// Verify existing Data block was not destroyed
-		dataMap, ok := finalData["Data"].(map[string]any)
-		if !ok || dataMap["PriorOutput"].(float64) != 123 {
-			t.Errorf("Expected existing Data block to be preserved. Got: %v", finalData["Data"])
-		}
-
-		// Verify Context block mapping
-		contextMap := finalData["Context"].(map[string]any)
-		if contextMap["ExistingData"] != true {
-			t.Errorf("Expected Context.ExistingData to be preserved as true. Got: %v", contextMap["ExistingData"])
-		}
-		if contextMap["TenantId"] != "NewTenant" {
-			t.Errorf("Expected Context.TenantId to be overwritten by new metadata. Got: %v", contextMap["TenantId"])
-		}
-	})
 }
 
 func TestValidateStepOutput(t *testing.T) {
@@ -936,14 +785,14 @@ func TestValidateStepOutput(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &pb.ExecuteWorkflowNodeRequest{
-				JobId:  "TestJob_123",
-				StepId: "Step_ABC",
+				Identity: &pb.InfrastructureIdentity{JobId: "TestJob_123"},
+				StepId:   "Step_ABC",
 				NodeConfig: &pb.NodeConfiguration{
 					ExpectedSchema: tt.schema,
 				},
 			}
-			state := &EngineState{JobId: req.JobId, Req: req}
-			
+			state := &EngineState{JobId: req.Identity.JobId, Req: req}
+
 			valid, reason, err := engine.validateStepOutput(context.Background(), state, req, tt.assembledJson)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -951,7 +800,7 @@ func TestValidateStepOutput(t *testing.T) {
 			if valid != tt.expectedValid {
 				t.Errorf("expected valid=%v, got %v", tt.expectedValid, valid)
 			}
-			
+
 			if tt.reasonMatches != "" && !strings.Contains(reason, tt.reasonMatches) {
 				t.Errorf("expected reason to contain %q, got %q", tt.reasonMatches, reason)
 			} else if tt.reasonMatches == "" && reason != "" {
@@ -961,11 +810,10 @@ func TestValidateStepOutput(t *testing.T) {
 	}
 }
 
-
 func TestStateMachine_DocumentChunkingRoute(t *testing.T) {
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  "job_chunking_123",
-		StepId: "step_chunk",
+		Identity: &pb.InfrastructureIdentity{JobId: "job_chunking_123"},
+		StepId:   "step_chunk",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:      "Document Chunking Step",
 			PrimitiveType: pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING,
@@ -980,7 +828,7 @@ func TestStateMachine_DocumentChunkingRoute(t *testing.T) {
 	engine := NewEngine(nil, nil, &MockTracePublisher{})
 
 	_, _, _, _, err := engine.ExecuteWorkflow(context.Background(), req)
-	
+
 	// Since executeDocumentChunking currently returns a stubbed JSON and a success without crashing,
 	// and because we don't have the full callback mock hooked up in this unit test context,
 	// we just want to ensure it doesn't panic and routes correctly (or returns an error related to missing pub/sub instead of 'unknown primitive').

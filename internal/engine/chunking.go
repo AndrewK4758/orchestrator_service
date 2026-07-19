@@ -23,9 +23,9 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 	}
 
 	resp, err := e.chunkingClient.ChunkDocument(ctx, &pb.ChunkDocumentRequest{
-		JobId:            state.JobId,
-		StepId:           req.StepId,
-		OriginalRequest:  req,
+		Identity: state.Req.Identity,
+		StepId:          req.StepId,
+		OriginalRequest: req,
 	})
 
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,7 @@ type Client struct {
 }
 
 // NewClient connects to the NATS server.
-func NewClient(natsURL string) (*Client, error) {
+func NewClient(ctx context.Context, natsURL string) (*Client, error) {
 	logger.Info("System", "Connecting to NATS at %s for AI Service...", natsURL)
 
 	nc, err := nats.Connect(natsURL)
@@ -41,14 +42,14 @@ func NewClient(natsURL string) (*Client, error) {
 		return nil, fmt.Errorf("failed to initialize JetStream: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// Ensure AI_RESPONSES stream exists
 	streamName := "AI_RESPONSES"
-	_, err = js.Stream(ctx, streamName)
+	_, err = js.Stream(initCtx, streamName)
 	if err != nil {
-		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+		_, err = js.CreateStream(initCtx, jetstream.StreamConfig{
 			Name:     streamName,
 			Subjects: []string{"ai.response.>"},
 		})
@@ -68,8 +69,8 @@ func NewClient(natsURL string) (*Client, error) {
 
 	// Create a single multiplexed JetStream subscription for this orchestrator instance
 	subSubject := fmt.Sprintf("ai.response.%s.>", clientID)
-	
-	cons, err := js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+
+	cons, err := js.CreateOrUpdateConsumer(initCtx, streamName, jetstream.ConsumerConfig{
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		FilterSubject: subSubject,
 	})
@@ -77,7 +78,7 @@ func NewClient(natsURL string) (*Client, error) {
 		nc.Close()
 		return nil, fmt.Errorf("failed to create JetStream consumer: %w", err)
 	}
-	
+
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		replySubj := msg.Subject()
 		if ch, ok := client.pending.Load(replySubj); ok {
@@ -109,6 +110,14 @@ func (c *Client) Close() error {
 	return nil
 }
 
+func sanitizeSubjectToken(token string) string {
+	token = strings.ReplaceAll(token, " ", "_")
+	token = strings.ReplaceAll(token, ".", "_")
+	token = strings.ReplaceAll(token, "*", "_")
+	token = strings.ReplaceAll(token, ">", "_")
+	return token
+}
+
 // PerformAction publishes a request to the AI service via JetStream and waits for a response on a Core NATS reply subject.
 func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWorkflowNodeRequest, currentAction *aipb.ActionDefinition, inputBytes []byte, inputText string, modelChoice aipb.ModelChoice) (*aipb.PerformActionResponse, error) {
 	req := &aipb.PerformActionRequest{
@@ -126,19 +135,25 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 
 	appID := "default"
 	tenantID := "default"
-	if workflowCtx != nil && workflowCtx.Metadata != nil {
-		if val, ok := workflowCtx.Metadata["app_id"]; ok && val != "" {
-			appID = val
+	if workflowCtx != nil && workflowCtx.Identity != nil {
+		if workflowCtx.Identity.AppId != "" {
+			appID = workflowCtx.Identity.AppId
 		}
-		if val, ok := workflowCtx.Metadata["tenant_id"]; ok && val != "" {
-			tenantID = val
+		if workflowCtx.Identity.TenantId != "" {
+			tenantID = workflowCtx.Identity.TenantId
 		}
 	}
 
 	jobID := "default"
-	if workflowCtx != nil && workflowCtx.JobId != "" {
-		jobID = workflowCtx.JobId
+	if workflowCtx != nil {
+		if workflowCtx.Identity != nil && workflowCtx.Identity.JobId != "" {
+			jobID = workflowCtx.Identity.JobId
+		}
 	}
+
+	appID = sanitizeSubjectToken(appID)
+	tenantID = sanitizeSubjectToken(tenantID)
+	jobID = sanitizeSubjectToken(jobID)
 
 	modelStr := "UNSPECIFIED"
 	switch req.ModelChoice {

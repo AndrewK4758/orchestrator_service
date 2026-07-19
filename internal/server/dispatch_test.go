@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"orchestrator_service/internal/ai_client"
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"orchestrator_service/internal/ai_client"
 )
 
 type mockTraceClient struct {
@@ -35,8 +35,8 @@ func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  jobID,
-		StepId: stepID,
+		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 		},
@@ -77,8 +77,8 @@ func TestDispatch_DuplicateCompletedDispatch(t *testing.T) {
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  jobID,
-		StepId: stepID,
+		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 		},
@@ -111,7 +111,7 @@ func TestDispatch_DuplicateCompletedDispatch(t *testing.T) {
 func TestDispatch_PurgedStateRedelivery(t *testing.T) {
 	// Test Case 1.3: Purged State Redelivery
 	pub := &mockPublisher{}
-	
+
 	traceClient := &mockTraceClient{
 		getJobStateFn: func(ctx context.Context, in *pb.GetJobStateRequest, opts ...grpc.CallOption) (*pb.GetJobStateResponse, error) {
 			return &pb.GetJobStateResponse{
@@ -120,15 +120,15 @@ func TestDispatch_PurgedStateRedelivery(t *testing.T) {
 			}, nil
 		},
 	}
-	
+
 	srv := NewServer(&ai_client.Client{}, pub, traceClient)
 
 	jobID := "job_purged_redelivery"
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  jobID,
-		StepId: stepID,
+		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 		},

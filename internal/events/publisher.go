@@ -21,7 +21,7 @@ type Publisher struct {
 }
 
 // NewPublisher creates a new NATS JetStream publisher.
-func NewPublisher(natsURL string) (*Publisher, error) {
+func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
@@ -34,7 +34,6 @@ func NewPublisher(natsURL string) (*Publisher, error) {
 	}
 
 	// Ensure the Trace Stream exists
-	ctx := context.Background()
 	traceStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     "TRACE_EVENTS",
 		Subjects: []string{"trace.>"},
@@ -104,12 +103,12 @@ func (p *Publisher) PublishJob(ctx context.Context, msgId string, payload []byte
 		Header:  nats.Header{},
 	}
 	msg.Header.Set(nats.MsgIdHdr, msgId)
-	
+
 	_, err := p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish job to jetstream: %w", err)
 	}
-	p.LogQueueSizeAsync("Enqueue", "orchestrator_jobs_consumer")
+	p.LogQueueSizeAsync(ctx, "Enqueue", "orchestrator_jobs_consumer")
 	return nil
 }
 
@@ -122,12 +121,12 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, msgId string, payloa
 		Header:  nats.Header{},
 	}
 	msg.Header.Set(nats.MsgIdHdr, msgId)
-	
+
 	_, err := p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish priority job to jetstream: %w", err)
 	}
-	p.LogQueueSizeAsync("Enqueue", "orchestrator_priority_consumer")
+	p.LogQueueSizeAsync(ctx, "Enqueue", "orchestrator_priority_consumer")
 	return nil
 }
 
@@ -141,9 +140,9 @@ func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
 }
 
 // LogQueueSizeAsync asynchronously queries JetStream for queue depths to provide non-blocking observability.
-func (p *Publisher) LogQueueSizeAsync(action string, consumerName string) {
+func (p *Publisher) LogQueueSizeAsync(parentCtx context.Context, action string, consumerName string) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 2*time.Second)
 		defer cancel()
 		cons, err := p.js.Consumer(ctx, "JOBS", consumerName)
 		if err != nil {
@@ -223,7 +222,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	logger.Debug("System", "Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
 	createProcessMsg := func(consumerName string) func(msg jetstream.Msg) {
 		return func(msg jetstream.Msg) {
-			p.LogQueueSizeAsync("Dequeue", consumerName)
+			p.LogQueueSizeAsync(ctx, "Dequeue", consumerName)
 			go func(m jetstream.Msg) {
 				// Heartbeat goroutine to keep the message alive during long AI processing
 				done := make(chan struct{})

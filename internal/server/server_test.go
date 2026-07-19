@@ -45,8 +45,8 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 
 	t.Run("ExecuteWorkflowNode queues to internal memory cache and NATS", func(t *testing.T) {
 		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId:  "job_1",
-			StepId: "step_1",
+			Identity: &pb.InfrastructureIdentity{JobId: "job_1"},
+			StepId:   "step_1",
 		}
 		res, err := srv.ExecuteWorkflowNode(context.Background(), req)
 
@@ -59,7 +59,7 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 		srv.mu.RUnlock()
 
 		assert.True(t, exists)
-		assert.Equal(t, "job_1", tracker.Req.JobId)
+		assert.Equal(t, "job_1", tracker.Req.Identity.JobId)
 		assert.Equal(t, 1, len(pub.publishedMsgs))
 	})
 }
@@ -78,8 +78,8 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  "job_concurrent",
-		StepId: "step_1",
+		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent"},
+		StepId:   "step_1",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 		},
@@ -102,7 +102,7 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	}
 
 	wg.Wait()
-	
+
 	// We assert it doesn't crash or trigger race conditions running 3 concurrently.
 }
 
@@ -159,7 +159,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	assert.NoError(t, err)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:           "job_fuzz_1",
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_fuzz_1"},
 		StepId:          "step_1",
 		CallbackAddress: cbAddress,
 		GlobalState:     stateStruct,
@@ -183,9 +183,9 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 
 	srv.cacheClient = &mockCacheClient{
 		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
-			// Validate metadata was forwarded correctly
-			assert.NotNil(t, in.Metadata)
-			assert.Equal(t, "test.pdf", in.Metadata.Fields["filename"].GetStringValue())
+			// Validate identity was forwarded correctly
+			assert.NotNil(t, in.Identity)
+			assert.Equal(t, "job_fuzz_1", in.Identity.JobId)
 			return &pb.CheckCacheResponse{
 				Hit:              true,
 				Confidence:       1.0,
@@ -212,7 +212,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	defer cbMock.mu.Unlock()
 
 	assert.NotNil(t, cbMock.receivedSuccess, "Should have received OnNodeExecutionComplete via cache bypass")
-	assert.Equal(t, "job_fuzz_1", cbMock.receivedSuccess.JobId)
+	assert.Equal(t, "job_fuzz_1", cbMock.receivedSuccess.Identity.JobId)
 
 	// Validate the generic state wasn't corrupted in the payload delivered back to the client
 	returnedState := cbMock.receivedSuccess.GlobalState
@@ -255,7 +255,7 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:           "job_timeout_1",
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_timeout_1"},
 		StepId:          "step_1",
 		CallbackAddress: "127.0.0.1:9999", // Unreachable port
 		NodeConfig: &pb.NodeConfiguration{
@@ -275,7 +275,7 @@ func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:           "job_cleanup",
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_cleanup"},
 		StepId:          "step_1",
 		CallbackAddress: "127.0.0.1:12345", // A non-existent local port to simulate down client
 		NodeConfig: &pb.NodeConfiguration{
@@ -287,7 +287,7 @@ func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
 			},
 		},
 	}
-	
+
 	// Force a cache hit so we don't need real AI
 	srv.cacheClient = &mockCacheClient{
 		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
@@ -312,8 +312,8 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:  "job_cache_timeout",
-		StepId: "step_1",
+		Identity: &pb.InfrastructureIdentity{JobId: "job_cache_timeout"},
+		StepId:   "step_1",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
 			Cache: &pb.CacheConfiguration{
@@ -323,7 +323,7 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 			},
 		},
 	}
-	
+
 	timeoutTriggered := false
 
 	// Simulate cache timeout by returning context.DeadlineExceeded
@@ -337,14 +337,14 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 	// But because we want the engine to execute without panicking or actually running AI,
 	// wait, if we mock the engine, or just let it fail because we didn't mock AI?
 	// The AI will fail since there is no API key, but we want to assert that the fallback is attempted!
-	
+
 	msgBytes, _ := proto.Marshal(req)
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-	
+
 	// The ReAct engine will fail because there is no API key / mock AI setup in this basic test,
 	// but it should NOT return an error specifically from the cache service.
 	assert.NoError(t, err) // handleJobMessage itself returns nil but fires failure callback
 	assert.True(t, timeoutTriggered, "Cache service should have been queried and timed out")
-	
+
 	// We can check if `activeJobs` is cleaned up or if callback was fired with failure
 }

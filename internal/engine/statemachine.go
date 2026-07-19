@@ -128,16 +128,7 @@ func (e *Engine) generatePlan(ctx context.Context, state *EngineState, req *pb.E
 	logger.Info("Engine", "[JobID: %s | StepID: %s] Generating plan for step: %s\n", state.JobId, req.StepId, req.NodeConfig.NodeName)
 
 	if req.NodeConfig.PrimitiveType != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED {
-		primitiveStr := ""
-		if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP {
-			primitiveStr = "PRIMITIVE_AI_STEP"
-		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP {
-			primitiveStr = "PRIMITIVE_HUMAN_STEP"
-		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION {
-			primitiveStr = "PRIMITIVE_ZERO_SHOT_CLASSIFICATION"
-		} else if req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING {
-			primitiveStr = "PRIMITIVE_DOCUMENT_CHUNKING"
-		}
+		primitiveStr := req.NodeConfig.PrimitiveType.String()
 		if primitiveStr != "" {
 			logger.Info("Engine", "[JobID: %s | StepID: %s] Client explicitly defined primitive %s. Bypassing AI Planner.", state.JobId, req.StepId, primitiveStr)
 			return &ActionPlan{
@@ -325,9 +316,20 @@ func (e *Engine) validateStepOutput(ctx context.Context, state *EngineState, req
 }
 
 func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (string, string, string, string, error) {
+	if req == nil {
+		return "", "", "", "", fmt.Errorf("ExecuteWorkflowRequest is nil")
+	}
+	if req.NodeConfig == nil {
+		return "", "", "", "", fmt.Errorf("ExecuteWorkflowRequest.NodeConfig is nil")
+	}
+
+	jobId := req.JobId
+	if req.Identity != nil && req.Identity.JobId != "" {
+		jobId = req.Identity.JobId
+	}
 	state := &EngineState{
 		Req:   req,
-		JobId: req.JobId,
+		JobId: jobId,
 	}
 
 	var lastStepName string
@@ -369,11 +371,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: PLAN GENERATED SUCCESSFULLY", state.JobId, req.StepId)
 
 			// 2. Review Phase
-			isExplicitPrimitive := (req.NodeConfig.PrimitiveType != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED &&
-				(req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP ||
-					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP ||
-					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION ||
-					req.NodeConfig.PrimitiveType == pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING)) ||
+			isExplicitPrimitive := (req.NodeConfig.PrimitiveType != pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED) ||
 				(req.NodeConfig.HumanValidation != nil && req.NodeConfig.HumanValidation.Required)
 
 			var approved bool
@@ -415,14 +413,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			var pbActions []*pb.ActionDefinition
 			for i, action := range plan.Actions {
 				primitiveType := pb.OrchestratorPrimitive_PRIMITIVE_UNSPECIFIED
-				if action.ActionType == "PRIMITIVE_AI_STEP" {
-					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_AI_STEP
-				} else if action.ActionType == "PRIMITIVE_HUMAN_STEP" {
-					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_HUMAN_STEP
-				} else if action.ActionType == "PRIMITIVE_ZERO_SHOT_CLASSIFICATION" {
-					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_ZERO_SHOT_CLASSIFICATION
-				} else if action.ActionType == "PRIMITIVE_DOCUMENT_CHUNKING" {
-					primitiveType = pb.OrchestratorPrimitive_PRIMITIVE_DOCUMENT_CHUNKING
+				if val, ok := pb.OrchestratorPrimitive_value[action.ActionType]; ok {
+					primitiveType = pb.OrchestratorPrimitive(val)
 				}
 
 				pbActions = append(pbActions, &pb.ActionDefinition{
@@ -508,12 +500,13 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 
 		if state.ActionState != nil {
 			actionMap := state.ActionState.AsMap()
-			if term, ok := actionMap["early_termination"].(bool); ok && term {
-				if ploadStr, ok := actionMap["extracted_payload"].(string); ok {
-					assembledJson = ploadStr
-					earlyTerminated = true
-					logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: EARLY TERMINATION DETECTED. SKIPPING ASSEMBLY AND VALIDATION.", state.JobId, req.StepId)
-				}
+			term, _ := actionMap["early_termination"].(bool)
+			ploadStr, hasPayload := actionMap["extracted_payload"].(string)
+
+			if term && hasPayload {
+				assembledJson = ploadStr
+				earlyTerminated = true
+				logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: EARLY TERMINATION DETECTED. SKIPPING ASSEMBLY AND VALIDATION.", state.JobId, req.StepId)
 			}
 		}
 
@@ -593,10 +586,10 @@ func (e *Engine) executeAIStep(ctx context.Context, state *EngineState, req *pb.
 
 	if state.ActionState != nil {
 		actionStateMap := state.ActionState.AsMap()
-		hit, ok1 := actionStateMap["cache_hit"].(bool)
-		payload, ok2 := actionStateMap["extracted_payload"]
+		hit, _ := actionStateMap["cache_hit"].(bool)
+		payload, hasPayload := actionStateMap["extracted_payload"]
 
-		if ok1 && hit && ok2 {
+		if hit && hasPayload {
 			logger.Info("Engine", "[JobID: %s | StepID: %s] Cache hit detected. Skipping AI inference.", state.JobId, req.StepId)
 			bytes, _ := json.Marshal(payload)
 			return string(bytes), nil
@@ -629,7 +622,8 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 
 	if state.ActionState != nil {
 		actionStateMap := state.ActionState.AsMap()
-		if hit, ok := actionStateMap["cache_hit"].(bool); ok && hit {
+		hit, _ := actionStateMap["cache_hit"].(bool)
+		if hit {
 			logger.Cache("Engine", "[JobID: %s | StepID: %s] Cache hit was detected previously. Skipping Store.", state.JobId, req.StepId)
 			return "{}", nil
 		}
@@ -669,7 +663,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 		reqStore := &pb.StoreExtractionRequest{
 			CollectionName:   collectionName,
 			Text:             cacheInput,
-			Metadata:         metadataStruct,
+			Identity: state.Req.Identity,
 			ExtractedPayload: payload,
 		}
 
@@ -736,7 +730,7 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 	}
 
 	createReq := &pb.CreateTaskRequest{
-		JobId:              state.JobId,
+		Identity:           req.Identity,
 		StepName:           req.NodeConfig.NodeName,
 		FailedAiOutput:     failedOutput,
 		ExpectedSchema:     req.NodeConfig.ExpectedSchema,
@@ -769,17 +763,17 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 func (e *Engine) publishEvent(ctx context.Context, state *EngineState, evType events.EventType, chunkID string, message string, valErr string) {
 	if e.pub != nil {
 		tenantID := ""
-		userID := ""
 		appID := ""
-		documentType := ""
-		correlationID := ""
-
+		if state.Req.Identity != nil {
+			tenantID = state.Req.Identity.TenantId
+			appID = state.Req.Identity.AppId
+		}
+		
+		eventMetadata := make(map[string]any)
 		if state.Req.Metadata != nil {
-			tenantID = state.Req.Metadata["tenant_id"]
-			userID = state.Req.Metadata["user_id"]
-			appID = state.Req.Metadata["app_id"]
-			documentType = state.Req.Metadata["document_type"]
-			correlationID = state.Req.Metadata["correlation_id"]
+			for k, v := range state.Req.Metadata {
+				eventMetadata[k] = v
+			}
 		}
 
 		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
@@ -787,20 +781,21 @@ func (e *Engine) publishEvent(ctx context.Context, state *EngineState, evType ev
 			EventType:     evType,
 			Timestamp:     time.Now(),
 			TenantID:      tenantID,
-			UserID:        userID,
 			AppID:         appID,
 			JobID:         state.JobId,
-			DocumentType:  documentType,
-			CorrelationID: correlationID,
 			Stage:         "ReActExecution",
 			Message:       message,
 			Error:         valErr,
 			ChunkID:       chunkID,
+			Metadata:      eventMetadata,
 		})
 	}
 }
 
 func deepMerge(dst map[string]any, src map[string]any) {
+	if dst == nil || src == nil {
+		return
+	}
 	for k, vSrc := range src {
 		vDst, exists := dst[k]
 		if exists {
@@ -847,6 +842,10 @@ func mergeIntoActionState(state *EngineState, jsonStr string) error {
 // MergeStateContext handles deep merging step JSON output into the GlobalState
 // and enforces the standard Context envelope pattern.
 func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targetKey string) error {
+	if req == nil {
+		return fmt.Errorf("request cannot be nil")
+	}
+
 	if jsonStr != "" {
 		var parsed map[string]any
 		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
@@ -874,32 +873,6 @@ func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targe
 			return fmt.Errorf("failed to update struct for global state: %w", err)
 		}
 		req.GlobalState = newState
-	}
-
-	// Enforce the Standard Envelope Pattern (Sync Metadata -> Context)
-	if req.GlobalState == nil {
-		req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
-	}
-
-	m := req.GlobalState.AsMap()
-	var ctxMap map[string]any
-	if existing, ok := m["Context"].(map[string]any); ok {
-		ctxMap = existing
-	} else {
-		ctxMap = make(map[string]any)
-	}
-
-	if req.Metadata != nil {
-		for k, v := range req.Metadata {
-			ctxMap[k] = v
-		}
-	}
-	ctxMap["JobId"] = req.JobId
-	ctxMap["CompletedStepId"] = req.StepId
-	m["Context"] = ctxMap
-
-	if updatedStruct, err := structpb.NewStruct(m); err == nil {
-		req.GlobalState = updatedStruct
 	}
 
 	return nil
@@ -960,7 +933,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 		reqCheck := &pb.CheckCacheRequest{
 			CollectionName: collectionName,
 			Text:           cacheInput,
-			Metadata:       metadataStruct,
+			Identity: state.Req.Identity,
 			Threshold:      threshold,
 		}
 

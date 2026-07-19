@@ -11,7 +11,6 @@ func BenchmarkJSONMarshal_ZeroAlloc(b *testing.B) {
 	event := TraceabilityEvent{
 		JobID:         "test_job",
 		AppID:         "Artemis",
-		CorrelationID: "12345",
 		Timestamp:     time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType:     "Started",
 		Metadata:      map[string]any{"step": "step_1"},
@@ -30,7 +29,6 @@ func TestJSONMarshal_DataLocality(t *testing.T) {
 	event := TraceabilityEvent{
 		JobID:         "test_job",
 		AppID:         "Artemis",
-		CorrelationID: "12345",
 		Timestamp:     time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType:     "Started",
 		Metadata:      map[string]any{"step": "step_1"},

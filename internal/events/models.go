@@ -38,13 +38,10 @@ type TraceabilityEvent struct {
 
 	// Compliance & Security Metadata (Crucial for Title/Closing Attorneys)
 	TenantID string `json:"tenant_id,omitempty"` // Identifies the specific law firm / client
-	UserID   string `json:"user_id,omitempty"`   // Identifies the specific user who uploaded
 	AppID    string `json:"app_id,omitempty"`    // e.g., "DotNetWebClient"
 
 	// Job Context
 	JobID         string `json:"job_id"`
-	DocumentType  string `json:"document_type,omitempty"` // e.g. "Attorney Closing Statement"
-	CorrelationID string `json:"correlation_id,omitempty"`
 
 	Stage     string `json:"stage,omitempty"`
 	JobAction string `json:"job_action,omitempty"`

@@ -23,19 +23,27 @@ type ArtemisCallbackServer struct {
 }
 
 func (s *ArtemisCallbackServer) OnNodeExecutionComplete(ctx context.Context, req *pb.NodeExecutionCompleteRequest) (*pb.NodeExecutionCompleteResponse, error) {
-	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, req.JobId)
+	jobID := ""
+	if req.Identity != nil {
+		jobID = req.Identity.JobId
+	}
+	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, jobID)
 
 	bytes, _ := req.GlobalState.MarshalJSON()
 	outBytes, _ := req.NodeOutput.MarshalJSON()
-	fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", req.JobId, string(outBytes), string(bytes))
+	fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, string(outBytes), string(bytes))
 	s.ResultChan <- string(bytes)
 
 	return &pb.NodeExecutionCompleteResponse{Success: true}, nil
 }
 
 func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
-	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.FailedStepId, req.JobId)
-	fmt.Printf("[%s] Step Failed! Error: %s\n", req.JobId, req.ErrorMessage)
+	jobID := ""
+	if req.Identity != nil {
+		jobID = req.Identity.JobId
+	}
+	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.FailedStepId, jobID)
+	fmt.Printf("[%s] Step Failed! Error: %s\n", jobID, req.ErrorMessage)
 	s.ResultChan <- "ERROR: " + req.ErrorMessage
 
 	return &pb.JobFailedResponse{Success: true}, nil
@@ -114,13 +122,14 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	})
 
 	nodeReq := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       "job_test_123",
-		StepId:      "step_1",
-		GlobalState: initialState,
-		Metadata: map[string]string{
-			"app_id":    "CLI_TEST_APP",
-			"tenant_id": "TEST_TENANT",
+		Identity: &pb.InfrastructureIdentity{
+			JobId:    "job_test_123",
+			AppId:    "CLI_TEST_APP",
+			TenantId: "TEST_TENANT",
 		},
+		StepId:          "step_1",
+		GlobalState:     initialState,
+		Metadata:        map[string]string{},
 		CallbackAddress: "localhost:50055",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:           "Extract Invoice Data",

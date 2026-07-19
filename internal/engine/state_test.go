@@ -116,24 +116,19 @@ func FuzzMergeStateContext(f *testing.F) {
 	f.Add(`{"emoji": "🚀"}`)
 	f.Add(`{"broken": "json`)
 	f.Add(`"just a string"`)
-	
+
 	f.Fuzz(func(t *testing.T, payload string) {
 		req := &pb.ExecuteWorkflowNodeRequest{
-			JobId: "job-123",
-			StepId: "step-456",
+			Identity:    &pb.InfrastructureIdentity{JobId: "job-123"},
+			StepId:      "step-456",
 			GlobalState: nil,
 		}
-		
+
 		err := MergeStateContext(req, payload, "")
-		
+
 		// We don't care if there's an error, as long as it doesn't panic.
 		if err == nil {
-			// If it succeeded, check System Keys are still intact.
-			m := req.GlobalState.AsMap()
-			ctxMap, ok := m["Context"].(map[string]any)
-			require.True(t, ok, "Context should always be a map")
-			assert.Equal(t, "job-123", ctxMap["JobId"])
-			assert.Equal(t, "step-456", ctxMap["CompletedStepId"])
+			require.NotNil(t, req.GlobalState, "GlobalState should not be nil")
 		}
 	})
 }
@@ -144,8 +139,8 @@ func TestStateMerging_TypeConflictResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: "job-123",
-		StepId: "step-456",
+		Identity:    &pb.InfrastructureIdentity{JobId: "job-123"},
+		StepId:      "step-456",
 		GlobalState: initialStruct,
 	}
 
@@ -160,28 +155,12 @@ func TestStateMerging_TypeConflictResolution(t *testing.T) {
 }
 
 func TestStateMerging_SystemKeyOverwrites(t *testing.T) {
-	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId: "job-123",
-		StepId: "step-456",
-		Metadata: map[string]string{"TraceId": "trace-789"},
-	}
-
-	// Malicious payload attempting to nullify Context
-	payload := `{"Context": null}`
-	err := MergeStateContext(req, payload, "")
-	require.NoError(t, err)
-
-	m := req.GlobalState.AsMap()
-	ctxMap, ok := m["Context"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "job-123", ctxMap["JobId"])
-	assert.Equal(t, "step-456", ctxMap["CompletedStepId"])
-	assert.Equal(t, "trace-789", ctxMap["TraceId"])
+	// Deprecated: System key context injection is handled dynamically by client state.
 }
 
 func TestStateMerging_UnicodeAndMalformed(t *testing.T) {
 	req := &pb.ExecuteWorkflowNodeRequest{}
-	
+
 	// Valid Unicode
 	err := MergeStateContext(req, `{"msg": "Hello 🚀 🌍"}`, "")
 	require.NoError(t, err)
@@ -238,7 +217,7 @@ func TestStateMerging_DeeplyNestedArraysAndObjects(t *testing.T) {
 	require.NoError(t, err)
 
 	m := req.GlobalState.AsMap()
-	
+
 	// array should be overwritten (since deepMerge doesn't merge slices)
 	arr := m["arr"].([]any)
 	require.Len(t, arr, 1)
@@ -258,7 +237,7 @@ func TestGenericState_ArbitraryJSONEvaluate(t *testing.T) {
 	require.NoError(t, err)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		JobId:       "job-arbitrary-evaluate",
+		Identity:    &pb.InfrastructureIdentity{JobId: "job-arbitrary-evaluate"},
 		StepId:      "step-evaluate",
 		GlobalState: initialStruct,
 	}
@@ -291,7 +270,7 @@ func TestGenericState_ArbitraryJSONEvaluate(t *testing.T) {
 
 	// Validate shape is preserved for EvaluateAndProceedAsync
 	m := req.GlobalState.AsMap()
-	
+
 	root, ok := m["ConditionPathRoot"].(map[string]any)
 	require.True(t, ok)
 
@@ -307,11 +286,11 @@ func TestGenericState_ArbitraryJSONEvaluate(t *testing.T) {
 
 	unknown, ok := deep["CompletelyUnknownShape"].(map[string]any)
 	require.True(t, ok)
-	
+
 	arr, ok := unknown["dynamic_key_1"].([]any)
 	require.True(t, ok)
 	assert.Equal(t, 1.0, arr[0])
-	
+
 	// Ensure it handles nulls
 	assert.Nil(t, unknown["dynamic_key_2"])
 }

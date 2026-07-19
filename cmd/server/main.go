@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net"
 	"os"
@@ -39,13 +40,14 @@ func main() {
 	}
 
 	// Connect to the external AI Service (acting as the 'Brain') via NATS
-	aiClient, err := ai_client.NewClient(natsURL)
+	ctx := context.Background()
+	aiClient, err := ai_client.NewClient(ctx, natsURL)
 	if err != nil {
 		log.Fatalf("Failed to create AI client: %v", err)
 	}
 	defer aiClient.Close()
 
-	pub, err := events.NewPublisher(natsURL)
+	pub, err := events.NewPublisher(ctx, natsURL)
 	if err != nil {
 		log.Fatalf("Failed to create NATS publisher: %v", err)
 	}

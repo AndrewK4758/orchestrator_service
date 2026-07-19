@@ -8,6 +8,7 @@ import (
 	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,14 @@ type JobPublisher interface {
 	PurgeQueues(ctx context.Context) error
 }
 
+func sanitizeMsgId(id string) string {
+	id = strings.ReplaceAll(id, " ", "_")
+	id = strings.ReplaceAll(id, ".", "_")
+	id = strings.ReplaceAll(id, ">", "_")
+	id = strings.ReplaceAll(id, "*", "_")
+	return id
+}
+
 func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	cacheClient, _, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
 	if err != nil {
@@ -106,23 +115,32 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 		req.GlobalState, _ = structpb.NewStruct(map[string]any{})
 	}
 
-	jobID := req.JobId
+	jobID := ""
+	if req.Identity != nil {
+		jobID = req.Identity.JobId
+	}
 	if jobID == "" {
 		appID := "app"
-		if req.Metadata != nil && req.Metadata["app_id"] != "" {
-			appID = req.Metadata["app_id"]
+		if req.Identity != nil && req.Identity.AppId != "" {
+			appID = req.Identity.AppId
 		}
 		jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
-		req.JobId = jobID
+		if req.Identity == nil {
+			req.Identity = &pb.InfrastructureIdentity{}
+		}
+		req.Identity.JobId = jobID
 	}
 
-	if req.Metadata == nil {
-		req.Metadata = make(map[string]string)
+	tenantID := ""
+	if req.Identity != nil {
+		tenantID = req.Identity.TenantId
 	}
-	tenantID := req.Metadata["tenant_id"]
 	if tenantID == "" {
 		tenantID = "SYSTEM_DEFAULT_TENANT"
-		req.Metadata["tenant_id"] = tenantID
+		if req.Identity == nil {
+			req.Identity = &pb.InfrastructureIdentity{}
+		}
+		req.Identity.TenantId = tenantID
 	}
 
 	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
@@ -144,7 +162,8 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 		return nil, fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
 	}
 
-	msgId := fmt.Sprintf("%s-%s", req.JobId, req.StepId)
+	msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
+	msgId = sanitizeMsgId(msgId)
 	err = s.pub.PublishJob(ctx, msgId, payloadBytes)
 	if err != nil {
 		logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
@@ -164,24 +183,29 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		return fmt.Errorf("failed to unmarshal ExecuteWorkflowNodeRequest: %w", err)
 	}
 
+	jobID := ""
+	if req.Identity != nil {
+		jobID = req.Identity.JobId
+	}
+
 	s.mu.Lock()
-	tracker, exists := s.activeJobs[req.JobId]
+	tracker, exists := s.activeJobs[jobID]
 	if !exists {
 		s.mu.Unlock()
 		if s.traceClient != nil {
 			ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
-			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{JobId: req.JobId})
+			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
 			cancelTrace()
 			if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == "COMPLETED" || resp.Job.Status == "FAILED") {
-				logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", req.JobId, req.StepId)
+				logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, req.StepId)
 				return nil
 			}
 		}
 		s.mu.Lock()
-		tracker, exists = s.activeJobs[req.JobId]
+		tracker, exists = s.activeJobs[jobID]
 		if !exists {
 			tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
-			s.activeJobs[req.JobId] = tracker
+			s.activeJobs[jobID] = tracker
 		}
 	}
 	s.mu.Unlock()
@@ -189,13 +213,13 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	tracker.Lock()
 	if tracker.CompletedSteps != nil && tracker.CompletedSteps[req.StepId] {
 		tracker.Unlock()
-		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for already completed step. Ignoring.", req.JobId, req.StepId)
+		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for already completed step. Ignoring.", jobID, req.StepId)
 		return nil
 	}
 
 	if tracker.StepInProgress && tracker.CurrentStepId == req.StepId {
 		tracker.Unlock()
-		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", req.JobId, req.StepId)
+		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", jobID, req.StepId)
 		return nil
 	}
 	tracker.StepInProgress = true
@@ -208,45 +232,36 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	tracker.Unlock()
 
 	if req.NodeConfig == nil {
-		return fmt.Errorf("node config is missing from request for job %s", req.JobId)
+		return fmt.Errorf("node config is missing from request for job %s", jobID)
 	}
 
 	// ZERO-SHOT CACHE BYPASS
 	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
-		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", req.JobId, req.StepId, req.NodeConfig.Cache.CollectionName)
-		
+		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, req.StepId, req.NodeConfig.Cache.CollectionName)
+
 		timeoutSecs := 120
 		if envVal := os.Getenv("CACHE_TIMEOUT_SECONDS"); envVal != "" {
 			if parsed, err := strconv.Atoi(envVal); err == nil {
 				timeoutSecs = parsed
 			}
 		}
-		
-		var cacheMetadata *structpb.Struct
-		if req.NodeConfig.Cache.Metadata != nil {
-			metaMap := make(map[string]any)
-			for k, v := range req.NodeConfig.Cache.Metadata {
-				metaMap[k] = v
-			}
-			cacheMetadata, _ = structpb.NewStruct(metaMap)
-		}
 
 		ctxCache, cancelCache := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
 			CollectionName: req.NodeConfig.Cache.CollectionName,
 			Text:           req.NodeConfig.Cache.LookupInput,
-			Metadata:       cacheMetadata,
+			Identity:       req.GetIdentity(),
 			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
 		})
 		cancelCache()
 
 		if err != nil {
-			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", req.JobId, req.StepId, err)
+			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", jobID, req.StepId, err)
 		} else if cacheResp.Hit {
 			tracker.Lock()
 			tracker.StepInProgress = false
 			tracker.Unlock()
-			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", req.JobId, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
+			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
 			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
 				logger.Error("Server", "Failed to merge cache state context: %v", err)
 			}
@@ -259,19 +274,22 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 				tracker.CompletedSteps[req.StepId] = true
 				tracker.Unlock()
 			}
-			return err
+			if err != nil {
+				return fmt.Errorf("failed to fire callback for cache hit: %w", err)
+			}
+			return nil
 		} else {
-			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", req.JobId, req.StepId)
+			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
 		}
 	}
 
-	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, req.JobId)
+	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
 
 	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(ctx, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
-			logger.Info("System", "Job %s paused for human validation", req.JobId)
+			logger.Info("System", "Job %s paused for human validation", jobID)
 			tracker.Lock()
 			tracker.Req = req
 			tracker.StepInProgress = false
@@ -301,7 +319,10 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		tracker.CompletedSteps[req.StepId] = true
 		tracker.Unlock()
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to fire callback for successful workflow: %w", err)
+	}
+	return nil
 }
 
 func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) error {
@@ -309,7 +330,7 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 	if cbAddress == "" {
 		logger.Info("System", "No callback address provided, skipping callback")
 		if errMsg != "" {
-			s.handleCallbackError(errMsg, req)
+			s.handleCallbackError(ctx, errMsg, req)
 		}
 		return nil
 	}
@@ -340,7 +361,7 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 
 	if errMsg != "" {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
-			JobId:        req.JobId,
+			Identity:     req.Identity,
 			FailedStepId: lastStepId,
 			ErrorMessage: errMsg,
 		})
@@ -350,7 +371,7 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
 
 		_, err = client.OnNodeExecutionComplete(ctx, &pb.NodeExecutionCompleteRequest{
-			JobId:           req.JobId,
+			Identity:        req.Identity,
 			CompletedStepId: lastStepId,
 			GlobalState:     req.GlobalState,
 			NodeOutput:      stepOutStruct,
@@ -359,16 +380,19 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 
 	if err != nil {
 		logger.Error("System", "Callback failed: %v", err)
-		s.handleCallbackError(err.Error(), req)
+		s.handleCallbackError(ctx, err.Error(), req)
 		return fmt.Errorf("callback failed: %w", err)
 	} else if errMsg != "" {
-		s.handleCallbackError(errMsg, req)
+		s.handleCallbackError(ctx, errMsg, req)
 	}
 	return nil
 }
 
 func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
-	jobID := req.GetJobId()
+	jobID := ""
+	if req.GetIdentity() != nil {
+		jobID = req.GetIdentity().GetJobId()
+	}
 	s.mu.RLock()
 	tracker, exists := s.activeJobs[jobID]
 	s.mu.RUnlock()
@@ -392,7 +416,8 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		return nil, fmt.Errorf("failed to marshal resumed request for job %s: %w", jobID, err)
 	}
 
-	msgId := fmt.Sprintf("%s-%s-resume", stepReq.JobId, stepReq.StepId)
+	msgId := fmt.Sprintf("%s-%s-resume", jobID, stepReq.StepId)
+	msgId = sanitizeMsgId(msgId)
 	err = s.pub.PublishPriorityJob(ctx, msgId, payloadBytes)
 	if err != nil {
 		logger.Error("System", "Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
@@ -405,11 +430,15 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	}, nil
 }
 
-func (s *OrchestratorServer) handleCallbackError(errMsg string, req *pb.ExecuteWorkflowNodeRequest) {
+func (s *OrchestratorServer) handleCallbackError(ctx context.Context, errMsg string, req *pb.ExecuteWorkflowNodeRequest) {
+	jobID := ""
+	if req.Identity != nil {
+		jobID = req.Identity.JobId
+	}
 	s.mu.Lock()
-	delete(s.activeJobs, req.JobId)
+	delete(s.activeJobs, jobID)
 	s.mu.Unlock()
-	logger.Info("System", "Job %s complete or failed. Teared down cache.", req.JobId)
+	logger.Info("System", "Job %s complete or failed. Teared down cache.", jobID)
 
 	if s.traceClient != nil {
 		go func() {
@@ -417,11 +446,11 @@ func (s *OrchestratorServer) handleCallbackError(errMsg string, req *pb.ExecuteW
 			if errMsg != "" {
 				status = "FAILED"
 			}
-			ctxTrace, cancelTrace := context.WithTimeout(context.Background(), 5*time.Second)
+			ctxTrace, cancelTrace := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelTrace()
 			_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
-				JobId:  req.JobId,
-				Status: status,
+				Identity: req.Identity,
+				Status:   status,
 			})
 		}()
 	}
@@ -429,17 +458,23 @@ func (s *OrchestratorServer) handleCallbackError(errMsg string, req *pb.ExecuteW
 }
 
 func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.PurgeSystemStateRequest) (*pb.PurgeSystemStateResponse, error) {
-	if req.GetAppId() == "" {
+	if req.GetIdentity().GetAppId() == "" {
 		return nil, fmt.Errorf("app_id is required")
 	}
 
-	logger.Info("System", "Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetAppId(), req.GetPurgeQueues())
+	logger.Info("System", "Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetIdentity().GetAppId(), req.GetPurgeQueues())
 
 	s.mu.Lock()
 	var jobsToCancel []string
 	for jobID, tracker := range s.activeJobs {
-		if tracker.Req != nil && tracker.Req.Metadata != nil {
-			if tracker.Req.Metadata["app_id"] == req.GetAppId() {
+		if tracker.Req != nil {
+			var appID string
+			if tracker.Req.Identity != nil {
+				appID = tracker.Req.Identity.AppId
+			} else if tracker.Req.Metadata != nil {
+				appID = tracker.Req.Metadata["app_id"]
+			}
+			if appID != "" && appID == req.GetIdentity().GetAppId() {
 				jobsToCancel = append(jobsToCancel, jobID)
 				if tracker.Cancel != nil {
 					tracker.Cancel()
@@ -463,7 +498,7 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 		}
 	}
 
-	logger.Warn("Engine", "[AppID: %s] System state purge commanded by client. Cancelled %d jobs, purged %d queues.", req.GetAppId(), len(jobsToCancel), queuesPurged)
+	logger.Warn("Engine", "[AppID: %s] System state purge commanded by client. Cancelled %d jobs, purged %d queues.", req.GetIdentity().GetAppId(), len(jobsToCancel), queuesPurged)
 
 	return &pb.PurgeSystemStateResponse{
 		Success:       true,

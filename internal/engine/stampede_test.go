@@ -70,7 +70,7 @@ func TestExecuteWorkflow_CacheStampede(t *testing.T) {
 
 			req := &pb.ExecuteWorkflowNodeRequest{
 
-				JobId: state.JobId,
+				Identity: &pb.InfrastructureIdentity{JobId: state.JobId},
 
 				GlobalState: state.GlobalState,
 
