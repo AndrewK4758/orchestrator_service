@@ -512,9 +512,24 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 
 		if !earlyTerminated {
 			// 5. Assembly Phase
-			logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: ASSEMBLE OUTPUT", state.JobId, req.StepId)
 			var err error
-			assembledJson, err = e.assembleStepOutput(ctx, state, req)
+			if len(state.PendingActions) == 1 {
+				logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: ASSEMBLE OUTPUT (BYPASSED - SINGLE ACTION)", state.JobId, req.StepId)
+				if state.ActionState != nil {
+					bytes, marshalErr := state.ActionState.MarshalJSON()
+					if marshalErr == nil {
+						assembledJson = string(bytes)
+					} else {
+						err = fmt.Errorf("failed to marshal single action state: %w", marshalErr)
+					}
+				} else {
+					assembledJson = "{}"
+				}
+			} else {
+				logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> PHASE: ASSEMBLE OUTPUT", state.JobId, req.StepId)
+				assembledJson, err = e.assembleStepOutput(ctx, state, req)
+			}
+
 			if err != nil {
 				return "", "", lastStepName, lastStepId, fmt.Errorf("failed to assemble step output: %w", err)
 			}
