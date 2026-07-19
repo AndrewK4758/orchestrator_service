@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"orchestrator_service/internal/logger"
 	"os"
 	"strconv"
@@ -110,71 +111,84 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 	return srv
 }
 
-func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.ExecuteWorkflowNodeResponse, error) {
-	if req.GlobalState == nil {
-		req.GlobalState, _ = structpb.NewStruct(map[string]any{})
-	}
-
-	jobID := ""
-	if req.Identity != nil {
-		jobID = req.Identity.JobId
-	}
-	if jobID == "" {
-		appID := "app"
-		if req.Identity != nil && req.Identity.AppId != "" {
-			appID = req.Identity.AppId
+func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_ExecuteWorkflowNodeServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		}
-		jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
-		if req.Identity == nil {
-			req.Identity = &pb.InfrastructureIdentity{}
+		ctx := stream.Context()
+
+		if req.GlobalState == nil {
+			req.GlobalState, _ = structpb.NewStruct(map[string]any{})
 		}
-		req.Identity.JobId = jobID
-	}
 
-	tenantID := ""
-	if req.Identity != nil {
-		tenantID = req.Identity.TenantId
-	}
-	if tenantID == "" {
-		tenantID = "SYSTEM_DEFAULT_TENANT"
-		if req.Identity == nil {
-			req.Identity = &pb.InfrastructureIdentity{}
+		jobID := ""
+		if req.Identity != nil {
+			jobID = req.Identity.JobId
 		}
-		req.Identity.TenantId = tenantID
+		if jobID == "" {
+			appID := "app"
+			if req.Identity != nil && req.Identity.AppId != "" {
+				appID = req.Identity.AppId
+			}
+			jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
+			if req.Identity == nil {
+				req.Identity = &pb.InfrastructureIdentity{}
+			}
+			req.Identity.JobId = jobID
+		}
+
+		tenantID := ""
+		if req.Identity != nil {
+			tenantID = req.Identity.TenantId
+		}
+		if tenantID == "" {
+			tenantID = "SYSTEM_DEFAULT_TENANT"
+			if req.Identity == nil {
+				req.Identity = &pb.InfrastructureIdentity{}
+			}
+			req.Identity.TenantId = tenantID
+		}
+
+		logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
+
+		s.mu.Lock()
+		tracker, exists := s.activeJobs[jobID]
+		if !exists {
+			tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
+			s.activeJobs[jobID] = tracker
+		} else {
+			tracker.Lock()
+			tracker.Req = req
+			tracker.Unlock()
+		}
+		s.mu.Unlock()
+
+		payloadBytes, err := proto.Marshal(req)
+		if err != nil {
+			return fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
+		}
+
+		msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
+		msgId = sanitizeMsgId(msgId)
+		err = s.pub.PublishJob(ctx, msgId, payloadBytes)
+		if err != nil {
+			logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
+			return fmt.Errorf("failed to queue job: %w", err)
+		}
+
+		if err := stream.Send(&pb.ExecuteWorkflowNodeResponse{
+			Success: true,
+			Message: "Node queued for execution",
+			StepId:  req.StepId,
+		}); err != nil {
+			return err
+		}
 	}
-
-	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
-
-	s.mu.Lock()
-	tracker, exists := s.activeJobs[jobID]
-	if !exists {
-		tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
-		s.activeJobs[jobID] = tracker
-	} else {
-		tracker.Lock()
-		tracker.Req = req
-		tracker.Unlock()
-	}
-	s.mu.Unlock()
-
-	payloadBytes, err := proto.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
-	}
-
-	msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
-	msgId = sanitizeMsgId(msgId)
-	err = s.pub.PublishJob(ctx, msgId, payloadBytes)
-	if err != nil {
-		logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue job: %w", err)
-	}
-
-	return &pb.ExecuteWorkflowNodeResponse{
-		Success: true,
-		Message: "Node queued for execution",
-		StepId:  req.StepId,
-	}, nil
 }
 
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {
@@ -370,12 +384,19 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		json.Unmarshal([]byte(stepOutputJSON), &stepOutMap)
 		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
 
-		_, err = client.OnNodeExecutionComplete(ctx, &pb.NodeExecutionCompleteRequest{
-			Identity:        req.Identity,
-			CompletedStepId: lastStepId,
-			GlobalState:     req.GlobalState,
-			NodeOutput:      stepOutStruct,
-		})
+		stream, err := client.OnNodeExecutionComplete(ctx)
+		if err == nil {
+			err = stream.Send(&pb.NodeExecutionCompleteRequest{
+				Identity:        req.Identity,
+				CompletedStepId: lastStepId,
+				GlobalState:     req.GlobalState,
+				NodeOutput:      stepOutStruct,
+			})
+			if err == nil {
+				stream.CloseSend()
+				_, err = stream.Recv()
+			}
+		}
 	}
 
 	if err != nil {

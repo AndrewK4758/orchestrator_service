@@ -186,6 +186,20 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
+	normalPullMax := 100
+	if envVal := os.Getenv("NORMAL_PULL_MAX_MESSAGES"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+			normalPullMax = parsed
+		}
+	}
+
+	priorityPullMax := 100
+	if envVal := os.Getenv("PRIORITY_PULL_MAX_MESSAGES"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+			priorityPullMax = parsed
+		}
+	}
+
 	ackWaitSecs := 120 // 2 minutes default
 	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
@@ -252,12 +266,12 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	ccPriority, err := priorityCons.Consume(createProcessMsg("orchestrator_priority_consumer"))
+	ccPriority, err := priorityCons.Consume(createProcessMsg("orchestrator_priority_consumer"), jetstream.PullMaxMessages(priorityPullMax))
 	if err != nil {
 		return fmt.Errorf("failed to start consuming priority: %w", err)
 	}
 
-	ccNormal, err := normalCons.Consume(createProcessMsg("orchestrator_jobs_consumer"))
+	ccNormal, err := normalCons.Consume(createProcessMsg("orchestrator_jobs_consumer"), jetstream.PullMaxMessages(normalPullMax))
 	if err != nil {
 		ccPriority.Stop()
 		return fmt.Errorf("failed to start consuming normal: %w", err)

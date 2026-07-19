@@ -91,7 +91,7 @@ func NewClient(ctx context.Context, natsURL string) (*Client, error) {
 			// Orphaned message or timeout
 			msg.Ack()
 		}
-	})
+	}, jetstream.PullMaxMessages(100))
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("failed to start consuming JS messages: %w", err)

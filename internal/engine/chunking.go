@@ -22,12 +22,25 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 		return "", fmt.Errorf("ActionState or Fields is nil")
 	}
 
-	resp, err := e.chunkingClient.ChunkDocument(ctx, &pb.ChunkDocumentRequest{
-		Identity: state.Req.Identity,
+	stream, err := e.chunkingClient.ChunkDocument(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open chunking stream: %w", err)
+	}
+
+	err = stream.Send(&pb.ChunkDocumentRequest{
+		Identity:        state.Req.Identity,
 		StepId:          req.StepId,
 		OriginalRequest: req,
 	})
+	if err != nil {
+		return "", fmt.Errorf("failed to send chunking request: %w", err)
+	}
 
+	if err := stream.CloseSend(); err != nil {
+		return "", fmt.Errorf("failed to close chunking stream: %w", err)
+	}
+
+	resp, err := stream.Recv()
 	if err != nil {
 		return "", fmt.Errorf("failed to call chunking service: %w", err)
 	}

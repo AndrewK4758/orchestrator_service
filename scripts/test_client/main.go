@@ -22,19 +22,27 @@ type ArtemisCallbackServer struct {
 	ResultChan chan string
 }
 
-func (s *ArtemisCallbackServer) OnNodeExecutionComplete(ctx context.Context, req *pb.NodeExecutionCompleteRequest) (*pb.NodeExecutionCompleteResponse, error) {
-	jobID := ""
-	if req.Identity != nil {
-		jobID = req.Identity.JobId
+func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		jobID := ""
+		if req.Identity != nil {
+			jobID = req.Identity.JobId
+		}
+		fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, jobID)
+
+		bytes, _ := req.GlobalState.MarshalJSON()
+		outBytes, _ := req.NodeOutput.MarshalJSON()
+		fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, string(outBytes), string(bytes))
+		s.ResultChan <- string(bytes)
+
+		if err := stream.Send(&pb.NodeExecutionCompleteResponse{Success: true}); err != nil {
+			return err
+		}
 	}
-	fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, jobID)
-
-	bytes, _ := req.GlobalState.MarshalJSON()
-	outBytes, _ := req.NodeOutput.MarshalJSON()
-	fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, string(outBytes), string(bytes))
-	s.ResultChan <- string(bytes)
-
-	return &pb.NodeExecutionCompleteResponse{Success: true}, nil
 }
 
 func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
@@ -138,9 +146,19 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		},
 	}
 
-	nodeRes, err := client.ExecuteWorkflowNode(context.Background(), nodeReq)
+	stream, err := client.ExecuteWorkflowNode(context.Background())
 	if err != nil {
+		log.Printf("Failed to open stream: %v", err)
+		return
+	}
+	if err := stream.Send(nodeReq); err != nil {
 		log.Printf("Failed to submit document: %v", err)
+		return
+	}
+	stream.CloseSend()
+	nodeRes, err := stream.Recv()
+	if err != nil {
+		log.Printf("Failed to receive stream response: %v", err)
 		return
 	}
 	jobID := "job_test_123"
