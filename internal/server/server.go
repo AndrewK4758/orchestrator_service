@@ -359,6 +359,7 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 
 	if err != nil {
 		logger.Error("System", "Callback failed: %v", err)
+		s.handleCallbackError(err.Error(), req)
 		return fmt.Errorf("callback failed: %w", err)
 	} else if errMsg != "" {
 		s.handleCallbackError(errMsg, req)

@@ -1,11 +1,16 @@
 package ai_client
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	aipb "github.com/AndrewK4758/shared_protos"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // BenchmarkSyncMap_Routing proves that sync.Map is optimized for the ai_client's use case
@@ -78,4 +83,81 @@ func TestPerformAction_DataLocality(t *testing.T) {
 	if allocs > 5 {
 		t.Fatalf("Too many allocations during struct pointer access: %f", allocs)
 	}
+}
+
+// mockJSMsg implements jetstream.Msg for testing
+type mockJSMsg struct {
+	subject string
+	ackCnt  int32
+}
+
+func (m *mockJSMsg) Metadata() (*jetstream.MsgMetadata, error) { return nil, nil }
+func (m *mockJSMsg) Data() []byte                              { return nil }
+func (m *mockJSMsg) Headers() nats.Header                      { return nil }
+func (m *mockJSMsg) Subject() string                           { return m.subject }
+func (m *mockJSMsg) Reply() string                             { return "" }
+func (m *mockJSMsg) Ack() error {
+	atomic.AddInt32(&m.ackCnt, 1)
+	return nil
+}
+func (m *mockJSMsg) DoubleAck(context.Context) error        { return nil }
+func (m *mockJSMsg) Nak() error                             { return nil }
+func (m *mockJSMsg) NakWithDelay(delay time.Duration) error { return nil }
+func (m *mockJSMsg) InProgress() error                      { return nil }
+func (m *mockJSMsg) Term() error                            { return nil }
+func (m *mockJSMsg) TermWithReason(reason string) error     { return nil }
+
+func TestJetStream_DuplicateWebhookReplies_Idempotency(t *testing.T) {
+	client := &Client{}
+	subject := "ai.response.test.idempotency"
+	respCh := make(chan jetstream.Msg, 1)
+
+	client.pending.Store(subject, respCh)
+
+	var wg sync.WaitGroup
+	numDuplicates := 10
+
+	// Track all messages to verify Ack behavior
+	msgs := make([]*mockJSMsg, numDuplicates)
+	for i := 0; i < numDuplicates; i++ {
+		msgs[i] = &mockJSMsg{subject: subject}
+	}
+
+	// Simulate dispatching duplicate webhook replies simultaneously
+	for i := 0; i < numDuplicates; i++ {
+		wg.Add(1)
+		go func(msg *mockJSMsg) {
+			defer wg.Done()
+
+			// Exact logic from client.go multiplexer
+			if ch, ok := client.pending.Load(msg.Subject()); ok {
+				select {
+				case ch.(chan jetstream.Msg) <- msg:
+				default:
+					msg.Ack()
+				}
+			}
+		}(msgs[i])
+	}
+
+	// Wait for all dispatches to complete
+	wg.Wait()
+
+	// Verify exactly one message made it to the channel
+	if len(respCh) != 1 {
+		t.Fatalf("Expected exactly 1 message in channel, got %d", len(respCh))
+	}
+
+	// Verify the remaining messages were Acked
+	var totalAcks int32
+	for _, m := range msgs {
+		totalAcks += atomic.LoadInt32(&m.ackCnt)
+	}
+
+	if totalAcks != int32(numDuplicates-1) {
+		t.Fatalf("Expected %d acks for duplicate messages, got %d", numDuplicates-1, totalAcks)
+	}
+
+	// Clean up
+	client.pending.Delete(subject)
 }

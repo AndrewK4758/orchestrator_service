@@ -249,3 +249,69 @@ func TestStateMerging_DeeplyNestedArraysAndObjects(t *testing.T) {
 	assert.Equal(t, "keep", c["d"])
 	assert.Equal(t, "new", c["e"])
 }
+
+// TestGenericState_ArbitraryJSONEvaluate validates that the Orchestrator safely handles
+// and merges completely unknown, deep, and inverted JSON shapes into GlobalState without crashing,
+// which is required for the C# Client's EvaluateAndProceedAsync JSONPath routing to function correctly.
+func TestGenericState_ArbitraryJSONEvaluate(t *testing.T) {
+	initialStruct, err := structpb.NewStruct(map[string]any{"base": "state"})
+	require.NoError(t, err)
+
+	req := &pb.ExecuteWorkflowNodeRequest{
+		JobId:       "job-arbitrary-evaluate",
+		StepId:      "step-evaluate",
+		GlobalState: initialStruct,
+	}
+
+	// Complex, arbitrary, and inverted JSON shape
+	payload := `
+	{
+		"ConditionPathRoot": {
+			"InvertedIfs": [
+				{"Match": false, "Value": "skip"},
+				{"Match": true, "Value": "proceed_async"}
+			],
+			"DeeplyNested": {
+				"Level1": {
+					"Level2": {
+						"TargetValue": 42.0,
+						"CompletelyUnknownShape": {
+							"dynamic_key_1": [1, 2, 3],
+							"dynamic_key_2": null
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	// Execute
+	err = MergeStateContext(req, payload, "")
+	require.NoError(t, err, "Should not crash on arbitrary JSON shapes")
+
+	// Validate shape is preserved for EvaluateAndProceedAsync
+	m := req.GlobalState.AsMap()
+	
+	root, ok := m["ConditionPathRoot"].(map[string]any)
+	require.True(t, ok)
+
+	ifs, ok := root["InvertedIfs"].([]any)
+	require.True(t, ok)
+	require.Len(t, ifs, 2)
+	assert.Equal(t, true, ifs[1].(map[string]any)["Match"])
+	assert.Equal(t, "proceed_async", ifs[1].(map[string]any)["Value"])
+
+	deep, ok := root["DeeplyNested"].(map[string]any)["Level1"].(map[string]any)["Level2"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 42.0, deep["TargetValue"])
+
+	unknown, ok := deep["CompletelyUnknownShape"].(map[string]any)
+	require.True(t, ok)
+	
+	arr, ok := unknown["dynamic_key_1"].([]any)
+	require.True(t, ok)
+	assert.Equal(t, 1.0, arr[0])
+	
+	// Ensure it handles nulls
+	assert.Nil(t, unknown["dynamic_key_2"])
+}
