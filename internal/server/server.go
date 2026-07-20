@@ -122,7 +122,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_E
 			if err == io.EOF {
 				return nil
 			}
-			return err
+			return fmt.Errorf("failed to receive workflow node request: %w", err)
 		}
 		ctx := stream.Context()
 
@@ -164,7 +164,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_E
 			Message: "Node queued for execution",
 			StepId:  req.StepId,
 		}); err != nil {
-			return err
+			return fmt.Errorf("failed to send queued response for job %s: %w", jobID, err)
 		}
 	}
 }
@@ -324,6 +324,10 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	jobID := ""
 	if req.GetIdentity() != nil {
 		jobID = req.GetIdentity().GetJobId()
+		logger.Info("System", "[DEBUG] ResumeJob called with Identity: %+v, JobID: %s", req.GetIdentity(), jobID)
+	} else {
+		logger.Warn("System", "[DEBUG] ResumeJob called with NIL Identity! Fallback to deprecated job_id: %s. Full req: %+v", req.GetJobId(), req)
+		jobID = req.GetJobId()
 	}
 
 	if s.kvStore == nil {
