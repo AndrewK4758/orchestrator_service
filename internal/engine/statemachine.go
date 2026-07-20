@@ -666,6 +666,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 			Text:             cacheInput,
 			Identity:         state.Req.Identity,
 			ExtractedPayload: payload,
+			Metadata:         req.Metadata,
 		}
 
 		correlationID := fmt.Sprintf("%s_%s", state.JobId, req.StepId)
@@ -937,6 +938,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 			Text:           cacheInput,
 			Identity:       state.Req.Identity,
 			Threshold:      threshold,
+			Metadata:       req.Metadata,
 		}
 
 		resp, err = e.cacheClient.CheckCache(ctx, reqCheck)

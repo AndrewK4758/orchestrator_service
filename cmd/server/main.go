@@ -83,7 +83,7 @@ func main() {
 	traceClient := pb.NewTraceabilityQueryClient(traceConn)
 
 	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxRecvMsgSize(maxMsgSizeMb*1024*1024),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time: 30 * time.Second,
 		}),

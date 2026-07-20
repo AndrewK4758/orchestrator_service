@@ -62,4 +62,6 @@ type WebhookEvent struct {
 	StepOutputJSON string `json:"step_output_json"`
 	ErrMsg         string `json:"err_msg"`
 	LastStepId     string `json:"last_step_id"`
+	IsSuspended    bool   `json:"is_suspended"`
+	SuspendReason  string `json:"suspend_reason"`
 }

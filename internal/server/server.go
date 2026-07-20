@@ -223,6 +223,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			Text:           req.NodeConfig.Cache.LookupInput,
 			Identity:       req.GetIdentity(),
 			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
+			Metadata:       req.Metadata,
 		})
 		cancelCache()
 
@@ -260,6 +261,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 					return fmt.Errorf("failed to persist paused job in KV store: %w", putErr)
 				}
 			}
+			s.fireJobSuspendedCallback(execCtx, req, lastStepId, err.Error())
 			return nil
 		}
 		logger.Error("System", "Workflow execution failed: %v", err)
@@ -273,6 +275,28 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	err = s.fireCallback(execCtx, req, stepOutputJSON, "", lastStepId)
 	if err != nil {
 		return fmt.Errorf("failed to fire callback for successful workflow: %w", err)
+	}
+	return nil
+}
+
+func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, lastStepId string, reason string) error {
+	cbAddress := req.CallbackAddress
+	if cbAddress == "" {
+		return nil
+	}
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
+	}
+	evt := &events.WebhookEvent{
+		ReqBytes:      reqBytes,
+		LastStepId:    lastStepId,
+		IsSuspended:   true,
+		SuspendReason: reason,
+	}
+	err = s.pub.PublishWebhook(ctx, evt)
+	if err != nil {
+		return fmt.Errorf("failed to publish webhook event: %w", err)
 	}
 	return nil
 }
@@ -467,7 +491,15 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	if evt.ErrMsg != "" {
+	if evt.IsSuspended {
+		_, err = client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
+			JobId:            req.GetIdentity().GetJobId(),
+			SuspendedStepId:  evt.LastStepId,
+			Reason:           evt.SuspendReason,
+			Identity:         req.Identity,
+			Metadata:         req.Metadata,
+		})
+	} else if evt.ErrMsg != "" {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
 			Identity:     req.Identity,
 			FailedStepId: evt.LastStepId,
