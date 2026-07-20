@@ -27,21 +27,9 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-type JobTracker struct {
-	Req            *pb.ExecuteWorkflowNodeRequest
-	Cancel         context.CancelFunc
-	CurrentStepId  string
-	StepInProgress bool
-	CompletedSteps map[string]bool
-	mu             sync.Mutex
-}
-
-func (j *JobTracker) Lock() {
-	j.mu.Lock()
-}
-
-func (j *JobTracker) Unlock() {
-	j.mu.Unlock()
+type JobExecInfo struct {
+	AppID  string
+	Cancel context.CancelFunc
 }
 
 // OrchestratorServer implements the OrchestratorService gRPC interface.
@@ -52,8 +40,9 @@ type OrchestratorServer struct {
 	aiClient *ai_client.Client
 	pub      JobPublisher
 
-	mu         sync.RWMutex
-	activeJobs map[string]*JobTracker
+	kvStore      jetstream.KeyValue
+	activeExecMu sync.RWMutex
+	activeExecs  map[string]*JobExecInfo
 
 	traceClient pb.TraceabilityQueryClient
 	cacheClient pb.SemanticCacheServiceClient
@@ -67,6 +56,7 @@ type JobPublisher interface {
 	PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error
 	ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
 	PurgeQueues(ctx context.Context) error
+	GetActiveJobsKV(ctx context.Context) (jetstream.KeyValue, error)
 }
 
 func sanitizeMsgId(id string) string {
@@ -96,11 +86,17 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		eng.SetChunkingClient(pb.NewDocumentProcessingServiceClient(docConn))
 	}
 
+	kvStore, err := pub.GetActiveJobsKV(ctx)
+	if err != nil {
+		logger.Error("System", "Failed to initialize active_jobs KV store: %v", err)
+	}
+
 	srv := &OrchestratorServer{
 		eng:         eng,
 		aiClient:    aiClient,
 		pub:         pub,
-		activeJobs:  make(map[string]*JobTracker),
+		kvStore:     kvStore,
+		activeExecs: make(map[string]*JobExecInfo),
 		traceClient: traceClient,
 		cacheClient: cacheClient,
 	}
@@ -150,18 +146,6 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_E
 
 		logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
 
-		s.mu.Lock()
-		tracker, exists := s.activeJobs[jobID]
-		if !exists {
-			tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
-			s.activeJobs[jobID] = tracker
-		} else {
-			tracker.Lock()
-			tracker.Req = req
-			tracker.Unlock()
-		}
-		s.mu.Unlock()
-
 		payloadBytes, err := proto.Marshal(req)
 		if err != nil {
 			return fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
@@ -192,58 +176,46 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	}
 
 	jobID := ""
+	appID := ""
 	if req.Identity != nil {
 		jobID = req.Identity.JobId
+		appID = req.Identity.AppId
 	}
 
-	s.mu.Lock()
-	tracker, exists := s.activeJobs[jobID]
-	if !exists {
-		s.mu.Unlock()
-		if s.traceClient != nil {
-			ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
-			resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
-			cancelTrace()
-			if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == "COMPLETED" || resp.Job.Status == "FAILED") {
-				logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, req.StepId)
-				return nil
-			}
-		}
-		s.mu.Lock()
-		tracker, exists = s.activeJobs[jobID]
-		if !exists {
-			tracker = &JobTracker{Req: req, CompletedSteps: make(map[string]bool)}
-			s.activeJobs[jobID] = tracker
+	if s.traceClient != nil {
+		ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
+		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
+		cancelTrace()
+		if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == "COMPLETED" || resp.Job.Status == "FAILED") {
+			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, req.StepId)
+			return nil
 		}
 	}
-	s.mu.Unlock()
 
-	tracker.Lock()
-	if tracker.CompletedSteps != nil && tracker.CompletedSteps[req.StepId] {
-		tracker.Unlock()
-		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for already completed step. Ignoring.", jobID, req.StepId)
-		return nil
-	}
-
-	if tracker.StepInProgress && tracker.CurrentStepId == req.StepId {
-		tracker.Unlock()
+	s.activeExecMu.Lock()
+	if _, exists := s.activeExecs[jobID]; exists {
+		s.activeExecMu.Unlock()
 		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", jobID, req.StepId)
 		return nil
 	}
-	tracker.StepInProgress = true
-	tracker.CurrentStepId = req.StepId
-
-	ctx, cancel := context.WithCancel(ctx)
+	
+	execCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	tracker.Cancel = cancel
-	tracker.Unlock()
+	s.activeExecs[jobID] = &JobExecInfo{AppID: appID, Cancel: cancel}
+	s.activeExecMu.Unlock()
+
+	defer func() {
+		s.activeExecMu.Lock()
+		delete(s.activeExecs, jobID)
+		s.activeExecMu.Unlock()
+	}()
 
 	if req.NodeConfig == nil {
 		return fmt.Errorf("node config is missing from request for job %s", jobID)
 	}
-
-	// ZERO-SHOT CACHE BYPASS
+	
+	// ZERO-SHOT CACHE BYPASS (remove tracker references, use execCtx)
 	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
 		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, req.StepId, req.NodeConfig.Cache.CollectionName)
 
@@ -254,7 +226,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			}
 		}
 
-		ctxCache, cancelCache := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+		ctxCache, cancelCache := context.WithTimeout(execCtx, time.Duration(timeoutSecs)*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
 			CollectionName: req.NodeConfig.Cache.CollectionName,
 			Text:           req.NodeConfig.Cache.LookupInput,
@@ -266,22 +238,11 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		if err != nil {
 			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", jobID, req.StepId, err)
 		} else if cacheResp.Hit {
-			tracker.Lock()
-			tracker.StepInProgress = false
-			tracker.Unlock()
 			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
 			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
 				logger.Error("Server", "Failed to merge cache state context: %v", err)
 			}
-			err := s.fireCallback(ctx, req, cacheResp.ExtractedPayload, "", req.StepId)
-			if err == nil {
-				tracker.Lock()
-				if tracker.CompletedSteps == nil {
-					tracker.CompletedSteps = make(map[string]bool)
-				}
-				tracker.CompletedSteps[req.StepId] = true
-				tracker.Unlock()
-			}
+			err := s.fireCallback(execCtx, req, cacheResp.ExtractedPayload, "", req.StepId)
 			if err != nil {
 				return fmt.Errorf("failed to fire callback for cache hit: %w", err)
 			}
@@ -293,40 +254,32 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
 
-	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(ctx, req)
+	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(execCtx, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
 			logger.Info("System", "Job %s paused for human validation", jobID)
-			tracker.Lock()
-			tracker.Req = req
-			tracker.StepInProgress = false
-			tracker.Unlock()
+			if s.kvStore != nil {
+				reqBytes, marshalErr := proto.Marshal(req)
+				if marshalErr != nil {
+					return fmt.Errorf("failed to marshal request for paused job: %w", marshalErr)
+				}
+				_, putErr := s.kvStore.Put(execCtx, jobID, reqBytes)
+				if putErr != nil {
+					return fmt.Errorf("failed to persist paused job in KV store: %w", putErr)
+				}
+			}
 			return nil
 		}
-		tracker.Lock()
-		tracker.StepInProgress = false
-		tracker.Unlock()
 		logger.Error("System", "Workflow execution failed: %v", err)
-		return s.fireCallback(ctx, req, stepOutputJSON, err.Error(), lastStepId)
+		return s.fireCallback(execCtx, req, stepOutputJSON, err.Error(), lastStepId)
 	}
 
-	tracker.Lock()
-	tracker.StepInProgress = false
-	tracker.Unlock()
 	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
 	if err := engine.MergeStateContext(req, stepOutputJSON, ""); err != nil {
 		logger.Error("Server", "Failed to merge final state context: %v", err)
 	}
-	err = s.fireCallback(ctx, req, stepOutputJSON, "", lastStepId)
-	if err == nil {
-		tracker.Lock()
-		if tracker.CompletedSteps == nil {
-			tracker.CompletedSteps = make(map[string]bool)
-		}
-		tracker.CompletedSteps[req.StepId] = true
-		tracker.Unlock()
-	}
+	err = s.fireCallback(execCtx, req, stepOutputJSON, "", lastStepId)
 	if err != nil {
 		return fmt.Errorf("failed to fire callback for successful workflow: %w", err)
 	}
@@ -372,35 +325,42 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	if req.GetIdentity() != nil {
 		jobID = req.GetIdentity().GetJobId()
 	}
-	s.mu.RLock()
-	tracker, exists := s.activeJobs[jobID]
-	s.mu.RUnlock()
 
-	if !exists {
-		return &pb.ResumeJobResponse{Success: false, Message: "Job not found"}, nil
+	if s.kvStore == nil {
+		return nil, fmt.Errorf("KV store is not initialized")
 	}
 
-	tracker.Lock()
-	stepReq := tracker.Req
-	if stepReq == nil {
-		tracker.Unlock()
-		return &pb.ResumeJobResponse{Success: false, Message: "No active step to resume"}, nil
+	kvEntry, err := s.kvStore.Get(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return &pb.ResumeJobResponse{Success: false, Message: "Job not found in KV store"}, nil
+		}
+		return nil, fmt.Errorf("failed to get paused job from KV store: %w", err)
 	}
-	tracker.Unlock()
+
+	// Delete from KV store now that it's resumed
+	err = s.kvStore.Delete(ctx, jobID)
+	if err != nil {
+		logger.Warn("System", "Failed to delete KV entry for job %s: %v", jobID, err)
+	}
+
+	stepReq := &pb.ExecuteWorkflowNodeRequest{}
+	if err := proto.Unmarshal(kvEntry.Value(), stepReq); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal saved request: %w", err)
+	}
 
 	logger.Info("System", "Resuming job %s after human correction", jobID)
 
-	payloadBytes, err := proto.Marshal(stepReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal resumed request for job %s: %w", jobID, err)
+	// Merge the corrected JSON into the original state context
+	if err := engine.MergeStateContext(stepReq, req.GetCorrectedJson(), ""); err != nil {
+		return nil, fmt.Errorf("failed to merge corrected JSON: %w", err)
 	}
 
-	msgId := fmt.Sprintf("%s-%s-resume", jobID, stepReq.StepId)
-	msgId = sanitizeMsgId(msgId)
-	err = s.pub.PublishPriorityJob(ctx, stepReq.Identity, msgId, payloadBytes)
+	// Immediately fire webhook callback instead of publishing to JetStream priority queue
+	err = s.fireCallback(ctx, stepReq, req.GetCorrectedJson(), "", stepReq.StepId)
 	if err != nil {
-		logger.Error("System", "Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
-		return nil, fmt.Errorf("failed to queue resumed step: %w", err)
+		logger.Error("System", "Failed to fire callback for resumed job: %v", err)
+		return nil, fmt.Errorf("failed to fire callback for resumed job: %w", err)
 	}
 
 	return &pb.ResumeJobResponse{
@@ -414,9 +374,6 @@ func (s *OrchestratorServer) handleCallbackError(ctx context.Context, errMsg str
 	if req.Identity != nil {
 		jobID = req.Identity.JobId
 	}
-	s.mu.Lock()
-	delete(s.activeJobs, jobID)
-	s.mu.Unlock()
 	logger.Info("System", "Job %s complete or failed. Teared down cache.", jobID)
 
 	if s.traceClient != nil {
@@ -443,27 +400,21 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 
 	logger.Info("System", "Received PurgeSystemState request for AppID: %s (purge_queues=%v)", req.GetIdentity().GetAppId(), req.GetPurgeQueues())
 
-	s.mu.Lock()
+	s.activeExecMu.Lock()
 	var jobsToCancel []string
-	for jobID, tracker := range s.activeJobs {
-		if tracker.Req != nil {
-			var appID string
-			if tracker.Req.Identity != nil {
-				appID = tracker.Req.Identity.AppId
-			}
-			if appID != "" && appID == req.GetIdentity().GetAppId() {
-				jobsToCancel = append(jobsToCancel, jobID)
-				if tracker.Cancel != nil {
-					tracker.Cancel()
-				}
+	for jobID, execInfo := range s.activeExecs {
+		if execInfo.AppID != "" && execInfo.AppID == req.GetIdentity().GetAppId() {
+			jobsToCancel = append(jobsToCancel, jobID)
+			if execInfo.Cancel != nil {
+				execInfo.Cancel()
 			}
 		}
 	}
 	// Remove cancelled jobs from tracking
 	for _, jobID := range jobsToCancel {
-		delete(s.activeJobs, jobID)
+		delete(s.activeExecs, jobID)
 	}
-	s.mu.Unlock()
+	s.activeExecMu.Unlock()
 
 	queuesPurged := 0
 	if req.GetPurgeQueues() {

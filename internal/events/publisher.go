@@ -5,6 +5,7 @@ import (
 	"strings"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"orchestrator_service/internal/logger"
@@ -67,6 +68,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
 		_ = webhooksStream.Purge(ctx)
+		_ = js.DeleteKeyValue(ctx, "active_jobs")
 	}
 
 	return &Publisher{
@@ -198,6 +200,23 @@ func (p *Publisher) PurgeQueues(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+// GetActiveJobsKV returns the Key-Value store used to track jobs awaiting human validation.
+func (p *Publisher) GetActiveJobsKV(ctx context.Context) (jetstream.KeyValue, error) {
+	kv, err := p.js.KeyValue(ctx, "active_jobs")
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) {
+			kv, err = p.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+				Bucket: "active_jobs",
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create active_jobs KV bucket: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to get active_jobs KV bucket: %w", err)
+		}
+	}
+	return kv, nil
 }
 
 func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
