@@ -741,6 +741,7 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 		JobName:            jobName,
 		StepId:             req.StepId,
 		StepContextInput:   "",
+		Metadata:           req.Metadata,
 	}
 
 	timeoutSecs := 10
