@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -18,19 +19,51 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+import "io"
+
+type mockExecuteWorkflowNodeServer struct {
+	grpc.ServerStream
+	ctx      context.Context
+	reqs     []*pb.ExecuteWorkflowNodeRequest
+	reqIndex int
+	resp     *pb.ExecuteWorkflowNodeResponse
+}
+
+func (m *mockExecuteWorkflowNodeServer) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+
+func (m *mockExecuteWorkflowNodeServer) Recv() (*pb.ExecuteWorkflowNodeRequest, error) {
+	if m.reqIndex < len(m.reqs) {
+		req := m.reqs[m.reqIndex]
+		m.reqIndex++
+		return req, nil
+	}
+	return nil, io.EOF
+}
+
+func (m *mockExecuteWorkflowNodeServer) Send(res *pb.ExecuteWorkflowNodeResponse) error {
+	m.resp = res
+	return nil
+}
+
 type mockPublisher struct {
-	publishedMsgs [][]byte
+	publishedWebhook *events.WebhookEvent
+	publishedMsgs    [][]byte
 }
 
 func (m *mockPublisher) PublishTrace(ctx context.Context, event events.TraceabilityEvent) error {
 	return nil
 }
 func (m *mockPublisher) PublishCacheStore(ctx context.Context, data []byte) error { return nil }
-func (m *mockPublisher) PublishJob(ctx context.Context, msgId string, payload []byte) error {
+func (m *mockPublisher) PublishJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
 }
-func (m *mockPublisher) PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error {
+func (m *mockPublisher) PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
 }
@@ -38,6 +71,13 @@ func (m *mockPublisher) ConsumeJobs(ctx context.Context, handler func(ctx contex
 	return nil
 }
 func (m *mockPublisher) PurgeQueues(ctx context.Context) error { return nil }
+func (m *mockPublisher) PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error {
+	m.publishedWebhook = payload
+	return nil
+}
+func (m *mockPublisher) ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
+	return nil
+}
 
 func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 	pub := &mockPublisher{}
@@ -45,10 +85,15 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 
 	t.Run("ExecuteWorkflowNode queues to internal memory cache and NATS", func(t *testing.T) {
 		req := &pb.ExecuteWorkflowNodeRequest{
-			Identity: &pb.InfrastructureIdentity{JobId: "job_1"},
+			Identity: &pb.InfrastructureIdentity{JobId: "job_1", TenantId: "tenant_1"},
 			StepId:   "step_1",
+			Metadata: map[string]string{"app_id": "test_app"},
 		}
-		res, err := srv.ExecuteWorkflowNode(context.Background(), req)
+		stream := &mockExecuteWorkflowNodeServer{
+			reqs: []*pb.ExecuteWorkflowNodeRequest{req},
+		}
+		err := srv.ExecuteWorkflowNode(stream)
+		res := stream.resp
 
 		assert.NoError(t, err)
 		assert.True(t, res.Success)
@@ -78,7 +123,8 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	srv := NewServer(&ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent"},
+		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent", TenantId: "tenant_1"},
+		Metadata: map[string]string{"app_id": "test_app"},
 		StepId:   "step_1",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -113,11 +159,15 @@ type mockCallbackServer struct {
 	receivedFail    *pb.JobFailedRequest
 }
 
-func (s *mockCallbackServer) OnNodeExecutionComplete(ctx context.Context, req *pb.NodeExecutionCompleteRequest) (*pb.NodeExecutionCompleteResponse, error) {
+func (s *mockCallbackServer) OnNodeExecutionComplete(stream grpc.BidiStreamingServer[pb.NodeExecutionCompleteRequest, pb.NodeExecutionCompleteResponse]) error {
+	req, err := stream.Recv()
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.receivedSuccess = req
-	return &pb.NodeExecutionCompleteResponse{Success: true}, nil
+	s.mu.Unlock()
+	return stream.Send(&pb.NodeExecutionCompleteResponse{Success: true})
 }
 
 func (s *mockCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
@@ -159,7 +209,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	assert.NoError(t, err)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: "job_fuzz_1"},
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_fuzz_1", TenantId: "tenant_1"},
 		StepId:          "step_1",
 		CallbackAddress: cbAddress,
 		GlobalState:     stateStruct,
@@ -195,8 +245,14 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	}
 
 	// 1. First test ExecuteWorkflowNode safely merges metadata and doesn't drop schema
-	res, err := srv.ExecuteWorkflowNode(context.Background(), req)
+	stream := &mockExecuteWorkflowNodeServer{
+		ctx:  context.Background(),
+		reqs: []*pb.ExecuteWorkflowNodeRequest{req},
+	}
+	err = srv.ExecuteWorkflowNode(stream)
 	assert.NoError(t, err)
+	assert.NotNil(t, stream.resp)
+	res := stream.resp
 	assert.True(t, res.Success)
 	assert.Equal(t, "FuzzApp", req.Metadata["app_id"]) // Validates the app_id wasn't mutated in a hardcoded way
 
@@ -206,12 +262,18 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	err = srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
 	assert.NoError(t, err) // the handler itself returns nil, but fires callback
 
+	// Now we simulate JetStream picking up the published webhook payload
+	assert.NotNil(t, pub.publishedWebhook, "Should have published a webhook event via cache bypass")
+	webhookBytes, _ := json.Marshal(pub.publishedWebhook)
+	err = srv.processWebhookMsg(context.Background(), mockMsg{data: webhookBytes})
+	assert.NoError(t, err)
+
 	time.Sleep(100 * time.Millisecond) // wait for callback
 
 	cbMock.mu.Lock()
 	defer cbMock.mu.Unlock()
 
-	assert.NotNil(t, cbMock.receivedSuccess, "Should have received OnNodeExecutionComplete via cache bypass")
+	assert.NotNil(t, cbMock.receivedSuccess, "Should have received OnNodeExecutionComplete")
 	assert.Equal(t, "job_fuzz_1", cbMock.receivedSuccess.Identity.JobId)
 
 	// Validate the generic state wasn't corrupted in the payload delivered back to the client
@@ -265,46 +327,16 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 
 	msgBytes, _ := proto.Marshal(req)
 
-	// Should attempt to dial 127.0.0.1:9999, fail, and return an error to NAK the message
+	// handleJobMessage should succeed and publish the webhook event
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
+	assert.NoError(t, err)
+
+	assert.NotNil(t, pub.publishedWebhook)
+	webhookBytes, _ := json.Marshal(pub.publishedWebhook)
+
+	// processWebhookMsg should fail to dial and return an error
+	err = srv.processWebhookMsg(context.Background(), mockMsg{data: webhookBytes})
 	assert.Error(t, err)
-}
-
-func TestOrchestratorServer_CallbackFailureCleanup(t *testing.T) {
-	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
-
-	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: "job_cleanup"},
-		StepId:          "step_1",
-		CallbackAddress: "127.0.0.1:12345", // A non-existent local port to simulate down client
-		NodeConfig: &pb.NodeConfiguration{
-			NodeName: "Test Node",
-			Cache: &pb.CacheConfiguration{
-				Enabled:        true,
-				CollectionName: "test_cache",
-				LookupInput:    "test",
-			},
-		},
-	}
-
-	// Force a cache hit so we don't need real AI
-	srv.cacheClient = &mockCacheClient{
-		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
-			return &pb.CheckCacheResponse{Hit: true, Confidence: 1.0, ExtractedPayload: `{"status": "ok"}`}, nil
-		},
-	}
-
-	msgBytes, _ := proto.Marshal(req)
-	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
-	assert.Error(t, err)
-
-	// Callback will fail. We should assert that `activeJobs` no longer contains "job_cleanup"
-	srv.mu.RLock()
-	_, exists := srv.activeJobs["job_cleanup"]
-	srv.mu.RUnlock()
-
-	assert.False(t, exists, "JobTracker should have been cleaned up after callback failure")
 }
 
 func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {

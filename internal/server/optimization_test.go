@@ -16,7 +16,7 @@ func BenchmarkActiveJobsLockContention(b *testing.B) {
 	// Pre-fill activeJobs to simulate load
 	for i := range 10000 {
 		jobID := fmt.Sprintf("job_%d", i)
-		srv.activeJobs[jobID] = &JobTracker{Req: &pb.ExecuteWorkflowNodeRequest{Identity: &pb.InfrastructureIdentity{JobId: fmt.Sprintf("job_%d", i)}}}
+		srv.activeJobs[jobID] = &JobTracker{Req: &pb.ExecuteWorkflowNodeRequest{Identity: &pb.InfrastructureIdentity{JobId: fmt.Sprintf("job_%d", i), TenantId: "tenant_1"}}}
 	}
 
 	b.ResetTimer()
@@ -29,7 +29,7 @@ func BenchmarkActiveJobsLockContention(b *testing.B) {
 
 			// Simulate Write (Add Job)
 			srv.mu.Lock()
-			srv.activeJobs[jobID] = &JobTracker{Req: &pb.ExecuteWorkflowNodeRequest{Identity: &pb.InfrastructureIdentity{JobId: jobID}}}
+			srv.activeJobs[jobID] = &JobTracker{Req: &pb.ExecuteWorkflowNodeRequest{Identity: &pb.InfrastructureIdentity{JobId: jobID, TenantId: "tenant_1"}}}
 			srv.mu.Unlock()
 
 			// Simulate Read (Check Job)

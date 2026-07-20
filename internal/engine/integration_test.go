@@ -32,8 +32,8 @@ func TestIntegration_JetStreamIsolation(t *testing.T) {
 			tenantID:      "TenantA",
 			appID:         "App1",
 			jobID:         "Job123",
-			publishSub:    "jobs.TenantA",
-			consumeSub:    "jobs.TenantA",
+			publishSub:    "jobs.TenantA.App1.Job123.incoming",
+			consumeSub:    "jobs.TenantA.App1.Job123.incoming",
 			expectedError: nil,
 			shouldConsume: true,
 		},
@@ -43,8 +43,8 @@ func TestIntegration_JetStreamIsolation(t *testing.T) {
 			tenantID:      "TenantB",
 			appID:         "App2",
 			jobID:         "Job999",
-			publishSub:    "jobs.TenantA", // Tenant B publishing to A
-			consumeSub:    "jobs.TenantB", // Tenant B listening on B
+			publishSub:    "jobs.TenantA.App1.Job123.incoming", // Tenant B publishing to A
+			consumeSub:    "jobs.TenantB.App2.Job999.incoming", // Tenant B listening on B
 			expectedError: errors.New("permission denied"), // Or just no message
 			shouldConsume: false,
 		},
@@ -54,8 +54,8 @@ func TestIntegration_JetStreamIsolation(t *testing.T) {
 			tenantID:      "TenantC",
 			appID:         "App_X",
 			jobID:         "Job_X_1",
-			publishSub:    "jobs.incoming",
-			consumeSub:    "jobs.incoming",
+			publishSub:    "jobs.TenantC.App_X.Job_X_1.incoming",
+			consumeSub:    "jobs.TenantC.App_X.Job_X_1.incoming",
 			expectedError: nil,
 			shouldConsume: true,
 		},

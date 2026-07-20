@@ -188,25 +188,11 @@ Return a JSON array of actions matching the PlannerSchema.`, req.NodeConfig.Syst
 	}
 
 	var plan ActionPlan
-	if err := json.Unmarshal([]byte(rawJson), &plan); err != nil {
-		return nil, fmt.Errorf("action failed for job %s: failed to parse plan: %w", state.JobId, err)
+	if err := json.Unmarshal([]byte(cleanJSON(rawJson)), &plan); err != nil {
+		return nil, fmt.Errorf("action failed for job %s: failed to parse plan result: %w", state.JobId, err)
 	}
 
 	return &plan, nil
-}
-
-// cleanJSON removes common markdown wrappers if the AI hallucinated them.
-func cleanJSON(input string) string {
-	cleaned := strings.TrimSpace(input)
-	if after, ok := strings.CutPrefix(cleaned, "```json"); ok {
-		cleaned = after
-	} else if after0, ok0 := strings.CutPrefix(cleaned, "```"); ok0 {
-		cleaned = after0
-	}
-	if before, ok := strings.CutSuffix(cleaned, "```"); ok {
-		cleaned = before
-	}
-	return strings.TrimSpace(cleaned)
 }
 
 func (e *Engine) reviewPlan(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest, plan *ActionPlan) (bool, string, error) {
@@ -254,7 +240,7 @@ Return a JSON object matching the expected schema.`, req.NodeConfig.SystemInstru
 		Approved bool   `json:"approved"`
 		Reason   string `json:"reason"`
 	}
-	if err := json.Unmarshal([]byte(rawJson), &result); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(rawJson)), &result); err != nil {
 		return false, "", fmt.Errorf("action failed for job %s: failed to parse review result: %w", state.JobId, err)
 	}
 
@@ -678,7 +664,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 		reqStore := &pb.StoreExtractionRequest{
 			CollectionName:   collectionName,
 			Text:             cacheInput,
-			Identity: state.Req.Identity,
+			Identity:         state.Req.Identity,
 			ExtractedPayload: payload,
 		}
 
@@ -783,7 +769,7 @@ func (e *Engine) publishEvent(ctx context.Context, state *EngineState, evType ev
 			tenantID = state.Req.Identity.TenantId
 			appID = state.Req.Identity.AppId
 		}
-		
+
 		eventMetadata := make(map[string]any)
 		if state.Req.Metadata != nil {
 			for k, v := range state.Req.Metadata {
@@ -792,17 +778,17 @@ func (e *Engine) publishEvent(ctx context.Context, state *EngineState, evType ev
 		}
 
 		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-			EventID:       fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-			EventType:     evType,
-			Timestamp:     time.Now(),
-			TenantID:      tenantID,
-			AppID:         appID,
-			JobID:         state.JobId,
-			Stage:         "ReActExecution",
-			Message:       message,
-			Error:         valErr,
-			ChunkID:       chunkID,
-			Metadata:      eventMetadata,
+			EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+			EventType: evType,
+			Timestamp: time.Now(),
+			TenantID:  tenantID,
+			AppID:     appID,
+			JobID:     state.JobId,
+			Stage:     "ReActExecution",
+			Message:   message,
+			Error:     valErr,
+			ChunkID:   chunkID,
+			Metadata:  eventMetadata,
 		})
 	}
 }
@@ -830,7 +816,7 @@ func mergeIntoActionState(state *EngineState, jsonStr string) error {
 		return nil
 	}
 	var parsed map[string]any
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(jsonStr)), &parsed); err != nil {
 		return fmt.Errorf("malformed JSON in action state merge: %w", err)
 	}
 
@@ -948,7 +934,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 		reqCheck := &pb.CheckCacheRequest{
 			CollectionName: collectionName,
 			Text:           cacheInput,
-			Identity: state.Req.Identity,
+			Identity:       state.Req.Identity,
 			Threshold:      threshold,
 		}
 
@@ -1002,4 +988,61 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 	}
 
 	return aiRespStr, nil
+}
+
+func cleanJSON(input string) string {
+	input = strings.TrimSpace(input)
+
+	if start := strings.Index(input, "```"); start != -1 {
+		if end := strings.LastIndex(input, "```"); end > start+2 {
+			content := input[start+3 : end]
+			content = strings.TrimSpace(content)
+			if strings.HasPrefix(strings.ToLower(content), "json") {
+				content = strings.TrimSpace(content[4:])
+			}
+			input = content
+		}
+	}
+
+	firstBrace := strings.Index(input, "{")
+	firstBracket := strings.Index(input, "[")
+
+	first := -1
+	if firstBrace != -1 && firstBracket != -1 {
+		if firstBrace < firstBracket {
+			first = firstBrace
+		} else {
+			first = firstBracket
+		}
+	} else if firstBrace != -1 {
+		first = firstBrace
+	} else if firstBracket != -1 {
+		first = firstBracket
+	}
+
+	if first == -1 {
+		return input
+	}
+
+	lastBrace := strings.LastIndex(input, "}")
+	lastBracket := strings.LastIndex(input, "]")
+
+	last := -1
+	if lastBrace != -1 && lastBracket != -1 {
+		if lastBrace > lastBracket {
+			last = lastBrace
+		} else {
+			last = lastBracket
+		}
+	} else if lastBrace != -1 {
+		last = lastBrace
+	} else if lastBracket != -1 {
+		last = lastBracket
+	}
+
+	if last != -1 && last > first {
+		return input[first : last+1]
+	}
+
+	return input
 }

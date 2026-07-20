@@ -1,6 +1,8 @@
 package events
 
 import (
+	pb "github.com/AndrewK4758/shared_protos"
+	"strings"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,10 +53,20 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update jobs stream: %w", err)
 	}
 
+	// Ensure the Webhooks Stream exists
+	webhooksStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "WEBHOOKS",
+		Subjects: []string{"webhooks.>"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update webhooks stream: %w", err)
+	}
+
 	if os.Getenv("PURGE_QUEUE_ON_STARTUP") == "true" {
-		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS and TRACE_EVENTS streams on startup...")
+		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, and WEBHOOKS streams on startup...")
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
+		_ = webhooksStream.Purge(ctx)
 	}
 
 	return &Publisher{
@@ -95,8 +107,23 @@ func (p *Publisher) Close() {
 }
 
 // PublishJob publishes a new job request to JetStream.
-func (p *Publisher) PublishJob(ctx context.Context, msgId string, payload []byte) error {
-	subject := "jobs.incoming"
+func sanitizeSubjectToken(token string) string {
+	token = strings.ReplaceAll(token, " ", "_")
+	token = strings.ReplaceAll(token, ".", "_")
+	token = strings.ReplaceAll(token, ">", "_")
+	token = strings.ReplaceAll(token, "*", "_")
+	if token == "" {
+		return "unknown"
+	}
+	return token
+}
+
+// PublishJob publishes a new job request to JetStream.
+func (p *Publisher) PublishJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
+	tenantId := sanitizeSubjectToken(identity.GetTenantId())
+	appId := sanitizeSubjectToken(identity.GetAppId())
+	jobId := sanitizeSubjectToken(identity.GetJobId())
+	subject := fmt.Sprintf("jobs.%s.%s.%s.incoming", tenantId, appId, jobId)
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    payload,
@@ -113,8 +140,11 @@ func (p *Publisher) PublishJob(ctx context.Context, msgId string, payload []byte
 }
 
 // PublishPriorityJob publishes an active job continuation to the priority JetStream subject.
-func (p *Publisher) PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error {
-	subject := "jobs.priority"
+func (p *Publisher) PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
+	tenantId := sanitizeSubjectToken(identity.GetTenantId())
+	appId := sanitizeSubjectToken(identity.GetAppId())
+	jobId := sanitizeSubjectToken(identity.GetJobId())
+	subject := fmt.Sprintf("jobs.%s.%s.%s.priority", tenantId, appId, jobId)
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    payload,
@@ -213,7 +243,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       time.Duration(ackWaitSecs) * time.Second,
 		MaxAckPending: priorityAckPending,
-		FilterSubject: "jobs.priority",
+		FilterSubject: "jobs.*.*.*.priority",
 		MaxDeliver:    3,
 	})
 	if err != nil {
@@ -226,7 +256,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       time.Duration(ackWaitSecs) * time.Second,
 		MaxAckPending: normalAckPending,
-		FilterSubject: "jobs.incoming",
+		FilterSubject: "jobs.*.*.*.incoming",
 		MaxDeliver:    3,
 	})
 	if err != nil {
@@ -281,6 +311,66 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		<-ctx.Done()
 		ccPriority.Stop()
 		ccNormal.Stop()
+	}()
+
+	return nil
+}
+
+// PublishWebhook queues a webhook to NATS for resilient delivery.
+func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook payload: %w", err)
+	}
+
+	_, err = p.js.Publish(ctx, "webhooks.callback", data)
+	if err != nil {
+		return fmt.Errorf("failed to publish webhook to jetstream: %w", err)
+	}
+
+	return nil
+}
+
+// ConsumeWebhooks handles consuming webhook payloads with exponential backoff.
+func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
+	cons, err := p.js.CreateOrUpdateConsumer(ctx, "WEBHOOKS", jetstream.ConsumerConfig{
+		Durable:       "orchestrator_webhooks_consumer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxDeliver:    20,
+		FilterSubject: "webhooks.callback",
+		BackOff: []time.Duration{
+			10 * time.Second,
+			30 * time.Second,
+			1 * time.Minute,
+			2 * time.Minute,
+			5 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			1 * time.Hour,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create webhooks consumer: %w", err)
+	}
+
+	logger.Debug("System", "Consumer started on stream WEBHOOKS. Waiting for messages...")
+
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		err := handler(ctx, msg)
+		if err != nil {
+			logger.Error("System", "Failed to process webhook msg, nacking for redelivery: %v", err)
+			_ = msg.Nak()
+		} else {
+			_ = msg.Ack()
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start consuming webhooks: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		cc.Stop()
 	}()
 
 	return nil

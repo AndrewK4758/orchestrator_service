@@ -16,6 +16,7 @@ import (
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/engine"
+	"orchestrator_service/internal/events"
 
 	pb "github.com/AndrewK4758/shared_protos"
 
@@ -60,9 +61,11 @@ type OrchestratorServer struct {
 
 type JobPublisher interface {
 	engine.TracePublisher
-	PublishJob(ctx context.Context, msgId string, payload []byte) error
-	PublishPriorityJob(ctx context.Context, msgId string, payload []byte) error
+	PublishJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error
+	PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error
 	ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
+	PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error
+	ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
 	PurgeQueues(ctx context.Context) error
 }
 
@@ -108,6 +111,11 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 		logger.Error("System", "Failed to start job consumer: %v", err)
 	}
 
+	err = srv.pub.ConsumeWebhooks(context.Background(), srv.processWebhookMsg)
+	if err != nil {
+		logger.Error("System", "Failed to start webhooks consumer: %v", err)
+	}
+
 	return srv
 }
 
@@ -126,32 +134,18 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_E
 			req.GlobalState, _ = structpb.NewStruct(map[string]any{})
 		}
 
-		jobID := ""
-		if req.Identity != nil {
-			jobID = req.Identity.JobId
+		if req.Identity == nil {
+			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity is strictly required")
 		}
+		
+		jobID := req.Identity.JobId
 		if jobID == "" {
-			appID := "app"
-			if req.Identity != nil && req.Identity.AppId != "" {
-				appID = req.Identity.AppId
-			}
-			jobID = fmt.Sprintf("%s_%d", appID, time.Now().UnixNano())
-			if req.Identity == nil {
-				req.Identity = &pb.InfrastructureIdentity{}
-			}
-			req.Identity.JobId = jobID
+			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.JobId is strictly required")
 		}
 
-		tenantID := ""
-		if req.Identity != nil {
-			tenantID = req.Identity.TenantId
-		}
+		tenantID := req.Identity.TenantId
 		if tenantID == "" {
-			tenantID = "SYSTEM_DEFAULT_TENANT"
-			if req.Identity == nil {
-				req.Identity = &pb.InfrastructureIdentity{}
-			}
-			req.Identity.TenantId = tenantID
+			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.TenantId is strictly required")
 		}
 
 		logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
@@ -175,7 +169,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_E
 
 		msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
 		msgId = sanitizeMsgId(msgId)
-		err = s.pub.PublishJob(ctx, msgId, payloadBytes)
+		err = s.pub.PublishJob(ctx, req.Identity, msgId, payloadBytes)
 		if err != nil {
 			logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
 			return fmt.Errorf("failed to queue job: %w", err)
@@ -349,63 +343,27 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		return nil
 	}
 
-	maxMsgSizeMb := 100
-	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			maxMsgSizeMb = parsed
-		}
-	}
-	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
+	reqBytes, err := proto.Marshal(req)
 	if err != nil {
-		logger.Error("System", "Failed to dial callback address %s: %v", cbAddress, err)
-		return fmt.Errorf("failed to dial callback address %s: %w", cbAddress, err)
+		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
 	}
-	defer conn.Close()
 
-	client := pb.NewOrchestratorCallbackServiceClient(conn)
-
-	timeoutSecs := 10
-	if envVal := os.Getenv("GRPC_TIMEOUT_SECONDS"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			timeoutSecs = parsed
-		}
+	evt := &events.WebhookEvent{
+		ReqBytes:       reqBytes,
+		StepOutputJSON: stepOutputJSON,
+		ErrMsg:         errMsg,
+		LastStepId:     lastStepId,
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
-	defer cancel()
+
+	err = s.pub.PublishWebhook(ctx, evt)
+	if err != nil {
+		return fmt.Errorf("failed to publish webhook event: %w", err)
+	}
 
 	if errMsg != "" {
-		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
-			Identity:     req.Identity,
-			FailedStepId: lastStepId,
-			ErrorMessage: errMsg,
-		})
-	} else {
-		var stepOutMap map[string]any
-		json.Unmarshal([]byte(stepOutputJSON), &stepOutMap)
-		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
-
-		stream, err := client.OnNodeExecutionComplete(ctx)
-		if err == nil {
-			err = stream.Send(&pb.NodeExecutionCompleteRequest{
-				Identity:        req.Identity,
-				CompletedStepId: lastStepId,
-				GlobalState:     req.GlobalState,
-				NodeOutput:      stepOutStruct,
-			})
-			if err == nil {
-				stream.CloseSend()
-				_, err = stream.Recv()
-			}
-		}
-	}
-
-	if err != nil {
-		logger.Error("System", "Callback failed: %v", err)
-		s.handleCallbackError(ctx, err.Error(), req)
-		return fmt.Errorf("callback failed: %w", err)
-	} else if errMsg != "" {
 		s.handleCallbackError(ctx, errMsg, req)
 	}
+
 	return nil
 }
 
@@ -439,7 +397,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 
 	msgId := fmt.Sprintf("%s-%s-resume", jobID, stepReq.StepId)
 	msgId = sanitizeMsgId(msgId)
-	err = s.pub.PublishPriorityJob(ctx, msgId, payloadBytes)
+	err = s.pub.PublishPriorityJob(ctx, stepReq.Identity, msgId, payloadBytes)
 	if err != nil {
 		logger.Error("System", "Failed to publish resumed step to JetStream for JobID %s: %v", jobID, err)
 		return nil, fmt.Errorf("failed to queue resumed step: %w", err)
@@ -492,8 +450,6 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 			var appID string
 			if tracker.Req.Identity != nil {
 				appID = tracker.Req.Identity.AppId
-			} else if tracker.Req.Metadata != nil {
-				appID = tracker.Req.Metadata["app_id"]
 			}
 			if appID != "" && appID == req.GetIdentity().GetAppId() {
 				jobsToCancel = append(jobsToCancel, jobID)
@@ -526,4 +482,82 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 		JobsCancelled: int32(len(jobsToCancel)),
 		QueuesPurged:  int32(queuesPurged),
 	}, nil
+}
+
+func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstream.Msg) error {
+	var evt events.WebhookEvent
+	if err := json.Unmarshal(msg.Data(), &evt); err != nil {
+		logger.Error("System", "Failed to unmarshal webhook msg: %v", err)
+		return nil // Invalid payload, don't retry
+	}
+
+	req := &pb.ExecuteWorkflowNodeRequest{}
+	if err := proto.Unmarshal(evt.ReqBytes, req); err != nil {
+		logger.Error("System", "Failed to unmarshal proto for webhook: %v", err)
+		return nil // Invalid proto, don't retry
+	}
+
+	cbAddress := req.CallbackAddress
+	if cbAddress == "" {
+		return nil
+	}
+
+	maxMsgSizeMb := 100
+	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxMsgSizeMb = parsed
+		}
+	}
+	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
+	if err != nil {
+		return fmt.Errorf("failed to dial callback address %s: %w", cbAddress, err)
+	}
+	defer conn.Close()
+
+	client := pb.NewOrchestratorCallbackServiceClient(conn)
+
+	timeoutSecs := 10
+	if envVal := os.Getenv("GRPC_TIMEOUT_SECONDS"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			timeoutSecs = parsed
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	if evt.ErrMsg != "" {
+		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
+			Identity:     req.Identity,
+			FailedStepId: evt.LastStepId,
+			ErrorMessage: evt.ErrMsg,
+		})
+	} else {
+		var stepOutMap map[string]any
+		json.Unmarshal([]byte(evt.StepOutputJSON), &stepOutMap)
+		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
+
+		var stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteClient
+		stream, err = client.OnNodeExecutionComplete(ctx)
+		if err == nil {
+			err = stream.Send(&pb.NodeExecutionCompleteRequest{
+				Identity:        req.Identity,
+				CompletedStepId: evt.LastStepId,
+				GlobalState:     req.GlobalState,
+				NodeOutput:      stepOutStruct,
+			})
+			if err == nil {
+				stream.CloseSend()
+				_, err = stream.Recv()
+				if err == io.EOF {
+					err = nil
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("callback failed: %w", err)
+	}
+
+	return nil
 }

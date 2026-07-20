@@ -6,10 +6,10 @@ This service is explicitly decoupled from the core `ai_service` to adhere to the
 
 ## 🏗 The LangGraph State Architecture
 
-The Orchestrator acts strictly as a "brawn" execution engine and defers all business logic back to the client apps. It is **100% application-agnostic** and operates on a pure LangGraph-style state machine model.
+The Orchestrator acts strictly as a "brawn" execution engine and defers all business logic back to the client apps. It is **100% application-agnostic**, has ZERO hardcoded client logic, and operates purely on arbitrary JSON shapes within a LangGraph-style state machine model.
 
-1. **Client Node Sequencing:** Client applications (e.g., Artemis) define their workflows in their own SQL databases. The Orchestrator does not know the graph up front.
-2. **ExecuteWorkflowNode (gRPC):** The Client submits a single `ExecuteWorkflowNodeRequest` containing the current JSON `GlobalState` and the specific instructions for the current node (Step).
+1. **Client Node Sequencing:** Client applications (e.g., Artemis) define their workflows in their own SQL databases. The Orchestrator does not know the graph up front and acts only on generic state.
+2. **ExecuteWorkflowNode (gRPC):** The Client submits a single `ExecuteWorkflowNodeRequest` containing the current JSON `GlobalState` (arbitrary structural data) and the specific instructions for the current node (Step).
 3. **Internal Execution (ReAct):** The Orchestrator's internal engine (Planner & Reviewer) evaluates the node instructions and executes internal primitives (e.g., `PRIMITIVE_AI_STEP`, `PRIMITIVE_HUMAN_STEP`, `PRIMITIVE_ZERO_SHOT_CLASSIFICATION`).
 4. **Webhook Callback:** Once the node is completed, the Orchestrator fires a webhook back to the Client containing the dynamically mutated `GlobalState`. The Client evaluates the output against its dynamic rules (e.g., using the C# client's JSONPath routing engine) and submits the next Node in the graph.
 

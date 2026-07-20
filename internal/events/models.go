@@ -54,3 +54,12 @@ type TraceabilityEvent struct {
 	Metadata      map[string]any `json:"metadata,omitempty"`
 	ExtractedData string         `json:"extracted_data,omitempty"` // Only populated on completion if needed
 }
+
+// WebhookEvent holds the payload necessary for the Orchestrator to securely relay callbacks
+// via a resilient JetStream retry queue without storing Protobuf references directly.
+type WebhookEvent struct {
+	ReqBytes       []byte `json:"req_bytes"`
+	StepOutputJSON string `json:"step_output_json"`
+	ErrMsg         string `json:"err_msg"`
+	LastStepId     string `json:"last_step_id"`
+}

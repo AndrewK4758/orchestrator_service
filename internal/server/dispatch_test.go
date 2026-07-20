@@ -35,7 +35,7 @@ func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		Identity: &pb.InfrastructureIdentity{JobId: jobID, TenantId: "tenant_1"},
 		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -77,7 +77,7 @@ func TestDispatch_DuplicateCompletedDispatch(t *testing.T) {
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		Identity: &pb.InfrastructureIdentity{JobId: jobID, TenantId: "tenant_1"},
 		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -127,7 +127,7 @@ func TestDispatch_PurgedStateRedelivery(t *testing.T) {
 	stepID := "step_1"
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: jobID},
+		Identity: &pb.InfrastructureIdentity{JobId: jobID, TenantId: "tenant_1"},
 		StepId:   stepID,
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
