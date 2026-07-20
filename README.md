@@ -38,6 +38,7 @@ The `NodeConfig.PrimitiveType` enum explicitly routes the Orchestrator's executi
 
 4. **`PRIMITIVE_HUMAN_STEP` (Human In The Loop)**
    - **Triggers**: Connects to the `human_validation_service`.
+   - **Dependencies**: Requires the `active_jobs` NATS JetStream KV store. Note that it is automatically created on startup but is an architectural dependency for state suspension during human validation.
    - **Usage**: Used when the AI lacks confidence or encounters a fatal schema exception. The Orchestrator suspends the graph execution and queues a task for human operators. Once the human manually corrects the JSON state, the Orchestrator resumes the graph by sending the callback to the client.
 
 ## ✉️ The Standard Callback Envelope Pattern

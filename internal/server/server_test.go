@@ -377,3 +377,191 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 
 	// We can check if `activeJobs` is cleaned up or if callback was fired with failure
 }
+
+type mockKeyValue struct {
+	jetstream.KeyValue
+	getFn    func(ctx context.Context, key string) (jetstream.KeyValueEntry, error)
+	deleteFn func(ctx context.Context, key string) error
+}
+
+func (m *mockKeyValue) Get(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
+	if m.getFn != nil {
+		return m.getFn(ctx, key)
+	}
+	return nil, jetstream.ErrKeyNotFound
+}
+
+func (m *mockKeyValue) Delete(ctx context.Context, key string, opts ...jetstream.KVDeleteOpt) error {
+	if m.deleteFn != nil {
+		return m.deleteFn(ctx, key)
+	}
+	return nil
+}
+
+type mockKeyValueEntry struct {
+	jetstream.KeyValueEntry
+	val []byte
+}
+
+func (m *mockKeyValueEntry) Value() []byte {
+	return m.val
+}
+
+func TestOrchestratorServer_ResumeJob(t *testing.T) {
+	tests := []struct {
+		name          string
+		jobID         string
+		correctedJson string
+		setupKV       func(*testing.T, *mockKeyValue)
+		validate      func(*testing.T, *pb.ResumeJobResponse, *mockPublisher, bool)
+	}{
+		{
+			name:          "TestResumeJob_MergeArbitraryJson",
+			jobID:         "job_merge",
+			correctedJson: `{"unknown_top_level": {"nested": "value"}, "list_field": [1,2,3]}`,
+			setupKV: func(t *testing.T, kv *mockKeyValue) {
+				initialReq := &pb.ExecuteWorkflowNodeRequest{
+					Identity:    &pb.InfrastructureIdentity{JobId: "job_merge"},
+					StepId:      "step_merge",
+					CallbackAddress: "localhost",
+					GlobalState: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+				}
+				initialReqBytes, _ := proto.Marshal(initialReq)
+				kv.getFn = func(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
+					assert.Equal(t, "job_merge", key)
+					return &mockKeyValueEntry{val: initialReqBytes}, nil
+				}
+				kv.deleteFn = func(ctx context.Context, key string) error { return nil }
+			},
+			validate: func(t *testing.T, res *pb.ResumeJobResponse, pub *mockPublisher, deleteCalled bool) {
+				assert.True(t, res.Success)
+				assert.NotNil(t, pub.publishedWebhook)
+				assert.Equal(t, "step_merge", pub.publishedWebhook.LastStepId)
+			},
+		},
+		{
+			name:          "TestResumeJob_Success",
+			jobID:         "job_success",
+			correctedJson: `{"msg": "success"}`,
+			setupKV: func(t *testing.T, kv *mockKeyValue) {
+				initialReq := &pb.ExecuteWorkflowNodeRequest{
+					Identity:   &pb.InfrastructureIdentity{JobId: "job_success"},
+					StepId:     "step_success",
+					CallbackAddress: "localhost",
+				}
+				initialReqBytes, _ := proto.Marshal(initialReq)
+				kv.getFn = func(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
+					return &mockKeyValueEntry{val: initialReqBytes}, nil
+				}
+				kv.deleteFn = func(ctx context.Context, key string) error { return nil }
+			},
+			validate: func(t *testing.T, res *pb.ResumeJobResponse, pub *mockPublisher, deleteCalled bool) {
+				assert.True(t, res.Success)
+				assert.True(t, deleteCalled)
+				assert.NotNil(t, pub.publishedWebhook)
+				assert.Empty(t, pub.publishedMsgs) // Not republished
+			},
+		},
+		{
+			name:          "TestResumeJob_NotFound",
+			jobID:         "job_missing",
+			correctedJson: `{}`,
+			setupKV: func(t *testing.T, kv *mockKeyValue) {
+				kv.getFn = func(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
+					return nil, jetstream.ErrKeyNotFound
+				}
+			},
+			validate: func(t *testing.T, res *pb.ResumeJobResponse, pub *mockPublisher, deleteCalled bool) {
+				assert.False(t, res.Success)
+				assert.Equal(t, "Job not found in KV store", res.Message)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &mockPublisher{}
+			srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
+
+			deleteCalled := false
+			mockKV := &mockKeyValue{}
+			tt.setupKV(t, mockKV)
+
+			originalDelete := mockKV.deleteFn
+			if originalDelete != nil {
+				mockKV.deleteFn = func(ctx context.Context, key string) error {
+					deleteCalled = true
+					return originalDelete(ctx, key)
+				}
+			}
+
+			srv.kvStore = mockKV
+
+			resumeReq := &pb.ResumeJobRequest{
+				Identity:      &pb.InfrastructureIdentity{JobId: tt.jobID},
+				CorrectedJson: tt.correctedJson,
+			}
+
+			res, err := srv.ResumeJob(context.Background(), resumeReq)
+			assert.NoError(t, err)
+			tt.validate(t, res, pub, deleteCalled)
+		})
+	}
+}
+
+func TestOrchestratorServer_PurgeSystemState(t *testing.T) {
+	tests := []struct {
+		name          string
+		appID         string
+		purgeQueues   bool
+		setupActive   func(*OrchestratorServer) *bool
+		validate      func(*testing.T, *OrchestratorServer, *pb.PurgeSystemStateResponse, *bool)
+	}{
+		{
+			name:        "TestPurgeSystemState_WithActiveExecs",
+			appID:       "tenant_app_1",
+			purgeQueues: true,
+			setupActive: func(srv *OrchestratorServer) *bool {
+				cancelCalled := new(bool)
+				srv.activeExecMu.Lock()
+				srv.activeExecs["job_active_1"] = &JobExecInfo{
+					AppID: "tenant_app_1",
+					Cancel: func() {
+						*cancelCalled = true
+					},
+				}
+				srv.activeExecMu.Unlock()
+				return cancelCalled
+			},
+			validate: func(t *testing.T, srv *OrchestratorServer, res *pb.PurgeSystemStateResponse, cancelCalled *bool) {
+				assert.True(t, res.Success)
+				assert.Equal(t, int32(1), res.JobsCancelled)
+				assert.Equal(t, int32(3), res.QueuesPurged)
+				assert.True(t, *cancelCalled)
+
+				srv.activeExecMu.Lock()
+				_, exists := srv.activeExecs["job_active_1"]
+				srv.activeExecMu.Unlock()
+				assert.False(t, exists)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &mockPublisher{}
+			srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
+
+			cancelCalled := tt.setupActive(srv)
+
+			purgeReq := &pb.PurgeSystemStateRequest{
+				Identity:    &pb.InfrastructureIdentity{AppId: tt.appID},
+				PurgeQueues: tt.purgeQueues,
+			}
+
+			res, err := srv.PurgeSystemState(context.Background(), purgeReq)
+			assert.NoError(t, err)
+			tt.validate(t, srv, res, cancelCalled)
+		})
+	}
+}
