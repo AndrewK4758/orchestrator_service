@@ -115,58 +115,49 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 	return srv
 }
 
-func (s *OrchestratorServer) ExecuteWorkflowNode(stream pb.OrchestratorService_ExecuteWorkflowNodeServer) error {
-	for {
-		req, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("failed to receive workflow node request: %w", err)
-		}
-		ctx := stream.Context()
-
-		if req.GlobalState == nil {
-			req.GlobalState, _ = structpb.NewStruct(map[string]any{})
-		}
-
-		if req.Identity == nil {
-			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity is strictly required")
-		}
-		
-		jobID := req.Identity.JobId
-		if jobID == "" {
-			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.JobId is strictly required")
-		}
-
-		tenantID := req.Identity.TenantId
-		if tenantID == "" {
-			return fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.TenantId is strictly required")
-		}
-
-		logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
-
-		payloadBytes, err := proto.Marshal(req)
-		if err != nil {
-			return fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
-		}
-
-		msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
-		msgId = sanitizeMsgId(msgId)
-		err = s.pub.PublishJob(ctx, req.Identity, msgId, payloadBytes)
-		if err != nil {
-			logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
-			return fmt.Errorf("failed to queue job: %w", err)
-		}
-
-		if err := stream.Send(&pb.ExecuteWorkflowNodeResponse{
-			Success: true,
-			Message: "Node queued for execution",
-			StepId:  req.StepId,
-		}); err != nil {
-			return fmt.Errorf("failed to send queued response for job %s: %w", jobID, err)
-		}
+func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.ExecuteWorkflowNodeResponse, error) {
+	if req.GlobalState == nil {
+		req.GlobalState, _ = structpb.NewStruct(map[string]any{})
 	}
+
+	if req.Identity == nil {
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity is strictly required")
+	}
+	
+	jobID := req.Identity.JobId
+	if jobID == "" {
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.JobId is strictly required")
+	}
+
+	tenantID := req.Identity.TenantId
+	if tenantID == "" {
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.TenantId is strictly required")
+	}
+
+	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
+
+	payloadBytes, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest for job %s: %w", jobID, err)
+	}
+
+	msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
+	msgId = sanitizeMsgId(msgId)
+
+	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err = s.pub.PublishJob(pubCtx, req.Identity, msgId, payloadBytes)
+	if err != nil {
+		logger.Error("System", "Failed to publish job to JetStream for JobID %s: %v", jobID, err)
+		return nil, fmt.Errorf("failed to queue job: %w", err)
+	}
+
+	return &pb.ExecuteWorkflowNodeResponse{
+		Success: true,
+		Message: "Node queued for execution",
+		StepId:  req.StepId,
+	}, nil
 }
 
 func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream.Msg) error {

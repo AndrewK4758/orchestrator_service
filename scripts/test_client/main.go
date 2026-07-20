@@ -146,19 +146,9 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		},
 	}
 
-	stream, err := client.ExecuteWorkflowNode(context.Background())
+	nodeRes, err := client.ExecuteWorkflowNode(context.Background(), nodeReq)
 	if err != nil {
-		log.Printf("Failed to open stream: %v", err)
-		return
-	}
-	if err := stream.Send(nodeReq); err != nil {
-		log.Printf("Failed to submit document: %v", err)
-		return
-	}
-	stream.CloseSend()
-	nodeRes, err := stream.Recv()
-	if err != nil {
-		log.Printf("Failed to receive stream response: %v", err)
+		log.Printf("Failed to execute workflow node: %v", err)
 		return
 	}
 	jobID := "job_test_123"

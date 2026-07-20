@@ -92,15 +92,11 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 			StepId:   "step_1",
 			Metadata: map[string]string{"app_id": "test_app"},
 		}
-		stream := &mockExecuteWorkflowNodeServer{
-			reqs: []*pb.ExecuteWorkflowNodeRequest{req},
-		}
-		err := srv.ExecuteWorkflowNode(stream)
-		res := stream.resp
+		res, err := srv.ExecuteWorkflowNode(context.Background(), req)
 
 		assert.NoError(t, err)
 		assert.True(t, res.Success)
-		assert.Equal(t, "step_1", res.StepId) // wait res.StepId would be step_1, wait we pass req.StepId
+		assert.Equal(t, "step_1", res.StepId)
 
 		assert.Equal(t, 1, len(pub.publishedMsgs))
 	})
@@ -242,14 +238,9 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	}
 
 	// 1. First test ExecuteWorkflowNode safely merges metadata and doesn't drop schema
-	stream := &mockExecuteWorkflowNodeServer{
-		ctx:  context.Background(),
-		reqs: []*pb.ExecuteWorkflowNodeRequest{req},
-	}
-	err = srv.ExecuteWorkflowNode(stream)
+	res, err := srv.ExecuteWorkflowNode(context.Background(), req)
 	assert.NoError(t, err)
-	assert.NotNil(t, stream.resp)
-	res := stream.resp
+	assert.NotNil(t, res)
 	assert.True(t, res.Success)
 	assert.Equal(t, "FuzzApp", req.Metadata["app_id"]) // Validates the app_id wasn't mutated in a hardcoded way
 

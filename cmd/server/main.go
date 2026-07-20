@@ -8,10 +8,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	"strconv"
+	"time"
+
 	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
-	"strconv"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
 
 	"orchestrator_service/internal/ai_client"
 	"orchestrator_service/internal/events"
@@ -77,7 +82,18 @@ func main() {
 	defer traceConn.Close()
 	traceClient := pb.NewTraceabilityQueryClient(traceConn)
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time: 30 * time.Second,
+		}),
+		grpc.ChainUnaryInterceptor(
+			recovery.UnaryServerInterceptor(),
+		),
+		grpc.ChainStreamInterceptor(
+			recovery.StreamServerInterceptor(),
+		),
+	)
 
 	// Register the Orchestrator service and inject dependencies
 	orchestratorServer := server.NewServer(ctx, aiClient, pub, traceClient)
@@ -86,8 +102,14 @@ func main() {
 	// Register reflection service on gRPC server so clients can query it
 	reflection.Register(grpcServer)
 
-	log.Printf("Orchestrator Service starting on port %s...", port)
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("Failed to serve gRPC server: %v", err)
-	}
+	go func() {
+		log.Printf("Orchestrator Service starting on port %s...", port)
+		if err := grpcServer.Serve(listener); err != nil {
+			log.Fatalf("Failed to serve gRPC server: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("Shutting down Orchestrator Service gracefully...")
+	grpcServer.GracefulStop()
 }
