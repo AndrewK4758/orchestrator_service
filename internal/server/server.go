@@ -530,6 +530,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 			Identity:     req.Identity,
 			FailedStepId: evt.LastStepId,
 			ErrorMessage: evt.ErrMsg,
+			Metadata:     req.Metadata,
 		})
 	} else {
 		var stepOutMap map[string]any
@@ -544,6 +545,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 				CompletedStepId: evt.LastStepId,
 				GlobalState:     req.GlobalState,
 				NodeOutput:      stepOutStruct,
+				Metadata:        req.Metadata,
 			})
 			if err == nil {
 				stream.CloseSend()
