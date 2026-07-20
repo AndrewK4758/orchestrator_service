@@ -17,6 +17,16 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+const (
+	StreamJobs          = "JOBS"
+	StreamTraceEvents   = "TRACE_EVENTS"
+	StreamWebhooks      = "WEBHOOKS"
+	StreamCacheRequests = "CACHE_REQUESTS"
+
+	KVActiveJobs         = "active_jobs"
+	KVCacheRequestsStore = "cache.requests.store"
+)
+
 // Publisher handles pushing state and trace events to JetStream.
 type Publisher struct {
 	nc *nats.Conn
@@ -38,7 +48,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 
 	// Ensure the Trace Stream exists
 	traceStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     "TRACE_EVENTS",
+		Name:     StreamTraceEvents,
 		Subjects: []string{"trace.>"},
 	})
 	if err != nil {
@@ -47,7 +57,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 
 	// Ensure the Jobs Stream exists
 	jobsStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     "JOBS",
+		Name:     StreamJobs,
 		Subjects: []string{"jobs.>"},
 	})
 	if err != nil {
@@ -56,7 +66,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 
 	// Ensure the Webhooks Stream exists
 	webhooksStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     "WEBHOOKS",
+		Name:     StreamWebhooks,
 		Subjects: []string{"webhooks.>"},
 	})
 	if err != nil {
@@ -68,7 +78,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
 		_ = webhooksStream.Purge(ctx)
-		_ = js.DeleteKeyValue(ctx, "active_jobs")
+		_ = js.DeleteKeyValue(ctx, KVActiveJobs)
 	}
 
 	return &Publisher{
@@ -114,9 +124,6 @@ func sanitizeSubjectToken(token string) string {
 	token = strings.ReplaceAll(token, ".", "_")
 	token = strings.ReplaceAll(token, ">", "_")
 	token = strings.ReplaceAll(token, "*", "_")
-	if token == "" {
-		return "unknown"
-	}
 	return token
 }
 
@@ -163,7 +170,7 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, identity *pb.Infrast
 }
 
 func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
-	subject := "cache.requests.store"
+	subject := KVCacheRequestsStore
 	_, err := p.js.Publish(ctx, subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish cache store to jetstream: %w", err)
@@ -176,8 +183,9 @@ func (p *Publisher) LogQueueSizeAsync(parentCtx context.Context, action string, 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 2*time.Second)
 		defer cancel()
-		cons, err := p.js.Consumer(ctx, "JOBS", consumerName)
+		cons, err := p.js.Consumer(ctx, StreamJobs, consumerName)
 		if err != nil {
+			logger.Warn("System", "Failed to retrieve consumer info for metrics logging: %v", err)
 			return
 		}
 		info, err := cons.Info(ctx)
@@ -191,7 +199,7 @@ func (p *Publisher) LogQueueSizeAsync(parentCtx context.Context, action string, 
 func (p *Publisher) PurgeQueues(ctx context.Context) error {
 	logger.Info("Publisher", "Purging all relevant JetStream queues...")
 
-	streams := []string{"JOBS", "TRACE_EVENTS", "CACHE_REQUESTS"}
+	streams := []string{StreamJobs, StreamTraceEvents, StreamCacheRequests}
 	for _, streamName := range streams {
 		stream, err := p.js.Stream(ctx, streamName)
 		if err == nil {
@@ -203,11 +211,11 @@ func (p *Publisher) PurgeQueues(ctx context.Context) error {
 }
 // GetActiveJobsKV returns the Key-Value store used to track jobs awaiting human validation.
 func (p *Publisher) GetActiveJobsKV(ctx context.Context) (jetstream.KeyValue, error) {
-	kv, err := p.js.KeyValue(ctx, "active_jobs")
+	kv, err := p.js.KeyValue(ctx, KVActiveJobs)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrBucketNotFound) {
 			kv, err = p.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-				Bucket: "active_jobs",
+				Bucket: KVActiveJobs,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to create active_jobs KV bucket: %w", err)
@@ -226,12 +234,16 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	if envVal := os.Getenv("NORMAL_MAX_ACK_PENDING"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			normalAckPending = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse NORMAL_MAX_ACK_PENDING: %w", err)
 		}
 	}
 
 	if envVal := os.Getenv("PRIORITY_MAX_ACK_PENDING"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			priorityAckPending = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse PRIORITY_MAX_ACK_PENDING: %w", err)
 		}
 	}
 
@@ -239,6 +251,8 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	if envVal := os.Getenv("NORMAL_PULL_MAX_MESSAGES"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			normalPullMax = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse NORMAL_PULL_MAX_MESSAGES: %w", err)
 		}
 	}
 
@@ -246,6 +260,8 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	if envVal := os.Getenv("PRIORITY_PULL_MAX_MESSAGES"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			priorityPullMax = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse PRIORITY_PULL_MAX_MESSAGES: %w", err)
 		}
 	}
 
@@ -253,40 +269,60 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			ackWaitSecs = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse NATS_TIMEOUT_SECONDS: %w", err)
 		}
 	}
 
+	maxDeliver := 3
+	if envVal := os.Getenv("NATS_MAX_DELIVER"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+			maxDeliver = parsed
+		} else if err != nil {
+			return fmt.Errorf("failed to parse NATS_MAX_DELIVER: %w", err)
+		}
+	}
+
+	const (
+		DurablePriorityConsumerName = "orchestrator_priority_consumer"
+		DurableNormalConsumerName   = "orchestrator_jobs_consumer"
+		SubjectPriority             = "jobs.*.*.*.priority"
+		SubjectNormal               = "jobs.*.*.*.incoming"
+	)
+
 	// Priority Consumer
-	priorityCons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
-		Durable:       "orchestrator_priority_consumer",
+	priorityCons, err := p.js.CreateOrUpdateConsumer(ctx, StreamJobs, jetstream.ConsumerConfig{
+		Durable:       DurablePriorityConsumerName,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       time.Duration(ackWaitSecs) * time.Second,
 		MaxAckPending: priorityAckPending,
-		FilterSubject: "jobs.*.*.*.priority",
-		MaxDeliver:    3,
+		FilterSubject: SubjectPriority,
+		MaxDeliver:    maxDeliver,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create priority consumer: %w", err)
 	}
 
 	// Normal Consumer
-	normalCons, err := p.js.CreateOrUpdateConsumer(ctx, "JOBS", jetstream.ConsumerConfig{
-		Durable:       "orchestrator_jobs_consumer",
+	normalCons, err := p.js.CreateOrUpdateConsumer(ctx, StreamJobs, jetstream.ConsumerConfig{
+		Durable:       DurableNormalConsumerName,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       time.Duration(ackWaitSecs) * time.Second,
 		MaxAckPending: normalAckPending,
-		FilterSubject: "jobs.*.*.*.incoming",
-		MaxDeliver:    3,
+		FilterSubject: SubjectNormal,
+		MaxDeliver:    maxDeliver,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create normal consumer: %w", err)
 	}
 
 	logger.Debug("System", "Consumers started on stream JOBS (Normal pending=%d, Priority pending=%d). Waiting for messages...", normalAckPending, priorityAckPending)
-	createProcessMsg := func(consumerName string) func(msg jetstream.Msg) {
+	createProcessMsg := func(consumerName string, sem chan struct{}) func(msg jetstream.Msg) {
 		return func(msg jetstream.Msg) {
+			sem <- struct{}{}
 			p.LogQueueSizeAsync(ctx, "Dequeue", consumerName)
 			go func(m jetstream.Msg) {
+				defer func() { <-sem }()
 				// Heartbeat goroutine to keep the message alive during long AI processing
 				done := make(chan struct{})
 				go func() {
@@ -294,6 +330,8 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 					defer ticker.Stop()
 					for {
 						select {
+						case <-ctx.Done():
+							return
 						case <-ticker.C:
 							_ = m.InProgress()
 						case <-done:
@@ -302,7 +340,9 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 					}
 				}()
 
-				err := handler(ctx, m)
+				ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Minute)
+				err := handler(ctxMsg, m)
+				cancelMsg()
 				close(done) // Signal heartbeat to stop
 
 				if err != nil {
@@ -315,12 +355,14 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	ccPriority, err := priorityCons.Consume(createProcessMsg("orchestrator_priority_consumer"), jetstream.PullMaxMessages(priorityPullMax))
+	prioritySem := make(chan struct{}, priorityAckPending)
+	ccPriority, err := priorityCons.Consume(createProcessMsg("orchestrator_priority_consumer", prioritySem), jetstream.PullMaxMessages(priorityPullMax))
 	if err != nil {
 		return fmt.Errorf("failed to start consuming priority: %w", err)
 	}
 
-	ccNormal, err := normalCons.Consume(createProcessMsg("orchestrator_jobs_consumer"), jetstream.PullMaxMessages(normalPullMax))
+	normalSem := make(chan struct{}, normalAckPending)
+	ccNormal, err := normalCons.Consume(createProcessMsg("orchestrator_jobs_consumer", normalSem), jetstream.PullMaxMessages(normalPullMax))
 	if err != nil {
 		ccPriority.Stop()
 		return fmt.Errorf("failed to start consuming normal: %w", err)
@@ -352,7 +394,7 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 
 // ConsumeWebhooks handles consuming webhook payloads with exponential backoff.
 func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
-	cons, err := p.js.CreateOrUpdateConsumer(ctx, "WEBHOOKS", jetstream.ConsumerConfig{
+	cons, err := p.js.CreateOrUpdateConsumer(ctx, StreamWebhooks, jetstream.ConsumerConfig{
 		Durable:       "orchestrator_webhooks_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxDeliver:    20,
@@ -374,14 +416,27 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 
 	logger.Debug("System", "Consumer started on stream WEBHOOKS. Waiting for messages...")
 
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
-		err := handler(ctx, msg)
-		if err != nil {
-			logger.Error("System", "Failed to process webhook msg, nacking for redelivery: %v", err)
-			_ = msg.Nak()
-		} else {
-			_ = msg.Ack()
+	maxConcurrency := 50
+	if envVal := os.Getenv("WEBHOOKS_MAX_CONCURRENCY"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxConcurrency = parsed
 		}
+	}
+	sem := make(chan struct{}, maxConcurrency)
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		sem <- struct{}{}
+		go func(m jetstream.Msg) {
+			defer func() { <-sem }()
+			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			err := handler(ctxMsg, m)
+			cancelMsg()
+			if err != nil {
+				logger.Error("System", "Failed to process webhook msg, nacking for redelivery: %v", err)
+				_ = m.Nak()
+			} else {
+				_ = m.Ack()
+			}
+		}(msg)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start consuming webhooks: %w", err)

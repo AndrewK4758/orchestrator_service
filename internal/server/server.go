@@ -27,6 +27,11 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+const (
+	StatusCompleted = "COMPLETED"
+	StatusFailed    = "FAILED"
+)
+
 type JobExecInfo struct {
 	AppID  string
 	Cancel context.CancelFunc
@@ -46,6 +51,9 @@ type OrchestratorServer struct {
 
 	traceClient pb.TraceabilityQueryClient
 	cacheClient pb.SemanticCacheServiceClient
+
+	webhookConnMu sync.RWMutex
+	webhookConns  map[string]*grpc.ClientConn
 }
 
 type JobPublisher interface {
@@ -92,13 +100,14 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 	}
 
 	srv := &OrchestratorServer{
-		eng:         eng,
-		aiClient:    aiClient,
-		pub:         pub,
-		kvStore:     kvStore,
-		activeExecs: make(map[string]*JobExecInfo),
-		traceClient: traceClient,
-		cacheClient: cacheClient,
+		eng:          eng,
+		aiClient:     aiClient,
+		pub:          pub,
+		kvStore:      kvStore,
+		activeExecs:  make(map[string]*JobExecInfo),
+		traceClient:  traceClient,
+		cacheClient:  cacheClient,
+		webhookConns: make(map[string]*grpc.ClientConn),
 	}
 
 	// Load pending jobs from Traceability Service
@@ -132,6 +141,11 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 	tenantID := req.Identity.TenantId
 	if tenantID == "" {
 		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.TenantId is strictly required")
+	}
+
+	appID := req.Identity.AppId
+	if appID == "" {
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.AppId is strictly required")
 	}
 
 	logger.Info("System", "Received ExecuteWorkflowNode for JobID: %s, StepID: %s", jobID, req.StepId)
@@ -177,7 +191,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
 		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
 		cancelTrace()
-		if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == "COMPLETED" || resp.Job.Status == "FAILED") {
+		if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == StatusCompleted || resp.Job.Status == StatusFailed) {
 			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, req.StepId)
 			return nil
 		}
@@ -261,7 +275,10 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 					return fmt.Errorf("failed to persist paused job in KV store: %w", putErr)
 				}
 			}
-			s.fireJobSuspendedCallback(execCtx, req, lastStepId, err.Error())
+			cbErr := s.fireJobSuspendedCallback(execCtx, req, stepOutputJSON, lastStepId, err.Error())
+			if cbErr != nil {
+				logger.Error("System", "Failed to fire job suspended callback: %v", cbErr)
+			}
 			return nil
 		}
 		logger.Error("System", "Workflow execution failed: %v", err)
@@ -279,7 +296,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	return nil
 }
 
-func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, lastStepId string, reason string) error {
+func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, lastStepId string, reason string) error {
 	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
 		return nil
@@ -289,10 +306,11 @@ func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *
 		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
 	}
 	evt := &events.WebhookEvent{
-		ReqBytes:      reqBytes,
-		LastStepId:    lastStepId,
-		IsSuspended:   true,
-		SuspendReason: reason,
+		ReqBytes:       reqBytes,
+		StepOutputJSON: stepOutputJSON,
+		LastStepId:     lastStepId,
+		IsSuspended:    true,
+		SuspendReason:  reason,
 	}
 	err = s.pub.PublishWebhook(ctx, evt)
 	if err != nil {
@@ -393,9 +411,9 @@ func (s *OrchestratorServer) handleCallbackError(ctx context.Context, errMsg str
 
 	if s.traceClient != nil {
 		go func() {
-			status := "COMPLETED"
+			status := StatusCompleted
 			if errMsg != "" {
-				status = "FAILED"
+				status = StatusFailed
 			}
 			ctxTrace, cancelTrace := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelTrace()
@@ -468,17 +486,30 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		return nil
 	}
 
-	maxMsgSizeMb := 100
-	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			maxMsgSizeMb = parsed
+	s.webhookConnMu.RLock()
+	conn, ok := s.webhookConns[cbAddress]
+	s.webhookConnMu.RUnlock()
+
+	if !ok {
+		s.webhookConnMu.Lock()
+		conn, ok = s.webhookConns[cbAddress]
+		if !ok {
+			maxMsgSizeMb := 100
+			if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+				if parsed, err := strconv.Atoi(envVal); err == nil {
+					maxMsgSizeMb = parsed
+				}
+			}
+			var err error
+			conn, err = grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
+			if err != nil {
+				s.webhookConnMu.Unlock()
+				return fmt.Errorf("failed to dial callback address %s: %w", cbAddress, err)
+			}
+			s.webhookConns[cbAddress] = conn
 		}
+		s.webhookConnMu.Unlock()
 	}
-	conn, err := grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
-	if err != nil {
-		return fmt.Errorf("failed to dial callback address %s: %w", cbAddress, err)
-	}
-	defer conn.Close()
 
 	client := pb.NewOrchestratorCallbackServiceClient(conn)
 
@@ -491,6 +522,16 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
+	var stepOutMap map[string]any
+	if evt.StepOutputJSON != "" {
+		json.Unmarshal([]byte(evt.StepOutputJSON), &stepOutMap)
+	}
+	if stepOutMap == nil {
+		stepOutMap = make(map[string]any)
+	}
+	stepOutStruct, _ := structpb.NewStruct(stepOutMap)
+
+	var err error
 	if evt.IsSuspended {
 		_, err = client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
 			JobId:            req.GetIdentity().GetJobId(),
@@ -498,6 +539,8 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 			Reason:           evt.SuspendReason,
 			Identity:         req.Identity,
 			Metadata:         req.Metadata,
+			GlobalState:      req.GlobalState,
+			NodeOutput:       stepOutStruct,
 		})
 	} else if evt.ErrMsg != "" {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
@@ -505,12 +548,10 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 			FailedStepId: evt.LastStepId,
 			ErrorMessage: evt.ErrMsg,
 			Metadata:     req.Metadata,
+			GlobalState:  req.GlobalState,
+			NodeOutput:   stepOutStruct,
 		})
 	} else {
-		var stepOutMap map[string]any
-		json.Unmarshal([]byte(evt.StepOutputJSON), &stepOutMap)
-		stepOutStruct, _ := structpb.NewStruct(stepOutMap)
-
 		var stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteClient
 		stream, err = client.OnNodeExecutionComplete(ctx)
 		if err == nil {

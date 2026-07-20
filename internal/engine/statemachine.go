@@ -116,7 +116,11 @@ func (e *Engine) SetChunkingClient(client pb.DocumentProcessingServiceClient) {
 }
 
 func (e *Engine) executeHumanValidationStep(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
-	taskID, err := e.triggerHumanValidation(ctx, state, req, "", "Client triggered manual validation")
+	failedOutput := "{}"
+	if val, ok := req.Metadata["failed_ai_output"]; ok && val != "" {
+		failedOutput = val
+	}
+	taskID, err := e.triggerHumanValidation(ctx, state, req, failedOutput, "Client triggered manual validation")
 	if err != nil {
 		return "", fmt.Errorf("failed to create human validation task: %w", err)
 	}
@@ -385,7 +389,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 				logger.Info("Engine", "[JobID: %s | StepID: %s] Plan rejected during Review Phase: %s", state.JobId, req.StepId, reviewReason)
 				if attempt == maxRetries {
 					e.publishEvent(ctx, state, events.EventJobStepFailed, req.NodeConfig.NodeName, "Review rejected plan after retries", reviewReason)
-					taskID, _ := e.triggerHumanValidation(ctx, state, req, "Plan Rejected: "+reviewReason, "Please correct the instructions or schema.")
+					planJson, _ := json.Marshal(plan)
+					taskID, _ := e.triggerHumanValidation(ctx, state, req, string(planJson), "Plan Rejected: "+reviewReason)
 					return "", "", lastStepName, lastStepId, fmt.Errorf("%w: %s", ErrPendingHumanValidation, taskID)
 				}
 
@@ -435,6 +440,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 				StepId:      req.StepId,
 				GlobalState: req.GlobalState,
 				Metadata:    req.Metadata,
+				Identity:    req.Identity,
 				NodeConfig: &pb.NodeConfiguration{
 					NodeName:           fmt.Sprintf("%s - %s", req.NodeConfig.NodeName, action.OrchestratorPrimitive),
 					SystemInstructions: action.Prompt,
@@ -531,7 +537,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 				logger.Info("Engine", "[JobID: %s | StepID: %s] Step Validation Failed: %s", state.JobId, req.StepId, valReason)
 				if attempt == maxRetries {
 					e.publishEvent(ctx, state, events.EventStepValidationFailed, req.NodeConfig.NodeName, "Step Validation Failed after retries", valReason)
-					taskID, _ := e.triggerHumanValidation(ctx, state, req, "Validation Failed: "+valReason, "The final output did not match the expected schema.")
+					taskID, _ := e.triggerHumanValidation(ctx, state, req, assembledJson, "Validation Failed: "+valReason)
 					return "", "", lastStepName, lastStepId, fmt.Errorf("%w: %s", ErrPendingHumanValidation, taskID)
 				}
 
@@ -721,8 +727,19 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 	client := pb.NewHumanValidationServiceClient(conn)
 
 	jobName := ""
+	if req.Identity != nil {
+		jobName = req.Identity.JobId
+	}
+	if name, ok := req.Metadata["job_name"]; ok && name != "" {
+		jobName = name
+	}
+
+	stepName := ""
 	if req.NodeConfig != nil {
-		jobName = req.NodeConfig.NodeName
+		stepName = req.NodeConfig.NodeName
+	}
+	if name, ok := req.Metadata["failed_step_name"]; ok && name != "" {
+		stepName = name
 	}
 
 	globalStateJSON := "{}"
@@ -733,7 +750,7 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 
 	createReq := &pb.CreateTaskRequest{
 		Identity:           req.Identity,
-		StepName:           req.NodeConfig.NodeName,
+		StepName:           stepName,
 		FailedAiOutput:     failedOutput,
 		ExpectedSchema:     req.NodeConfig.ExpectedSchema,
 		PromptInstructions: req.NodeConfig.SystemInstructions,

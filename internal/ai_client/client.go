@@ -126,6 +126,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 		Context:       workflowCtx,
 		CurrentAction: currentAction,
 		ModelChoice:   modelChoice,
+		Identity:      workflowCtx.GetIdentity(),
 	}
 
 	reqBytes, err := proto.Marshal(req)

@@ -88,7 +88,7 @@ func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 
 	t.Run("ExecuteWorkflowNode queues to internal memory cache and NATS", func(t *testing.T) {
 		req := &pb.ExecuteWorkflowNodeRequest{
-			Identity: &pb.InfrastructureIdentity{JobId: "job_1", TenantId: "tenant_1"},
+			Identity: &pb.InfrastructureIdentity{JobId: "job_1", TenantId: "tenant_1", AppId: "app_1"},
 			StepId:   "step_1",
 			Metadata: map[string]string{"app_id": "test_app"},
 		}
@@ -116,7 +116,7 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent", TenantId: "tenant_1"},
+		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent", TenantId: "tenant_1", AppId: "app_1"},
 		Metadata: map[string]string{"app_id": "test_app"},
 		StepId:   "step_1",
 		NodeConfig: &pb.NodeConfiguration{
@@ -202,7 +202,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	assert.NoError(t, err)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: "job_fuzz_1", TenantId: "tenant_1"},
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_fuzz_1", TenantId: "tenant_1", AppId: "app_1"},
 		StepId:          "step_1",
 		CallbackAddress: cbAddress,
 		GlobalState:     stateStruct,
@@ -305,7 +305,7 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: "job_timeout_1"},
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_timeout_1", TenantId: "tenant_1", AppId: "app_1"},
 		StepId:          "step_1",
 		CallbackAddress: "127.0.0.1:9999", // Unreachable port
 		NodeConfig: &pb.NodeConfiguration{
@@ -332,7 +332,7 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity: &pb.InfrastructureIdentity{JobId: "job_cache_timeout"},
+		Identity: &pb.InfrastructureIdentity{JobId: "job_cache_timeout", TenantId: "tenant_1", AppId: "app_1"},
 		StepId:   "step_1",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -412,7 +412,7 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 			correctedJson: `{"unknown_top_level": {"nested": "value"}, "list_field": [1,2,3]}`,
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
-					Identity:    &pb.InfrastructureIdentity{JobId: "job_merge"},
+					Identity:    &pb.InfrastructureIdentity{JobId: "job_merge", TenantId: "tenant_1", AppId: "app_1"},
 					StepId:      "step_merge",
 					CallbackAddress: "localhost",
 					GlobalState: &structpb.Struct{Fields: map[string]*structpb.Value{}},
@@ -436,7 +436,7 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 			correctedJson: `{"msg": "success"}`,
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
-					Identity:   &pb.InfrastructureIdentity{JobId: "job_success"},
+					Identity:   &pb.InfrastructureIdentity{JobId: "job_success", TenantId: "tenant_1", AppId: "app_1"},
 					StepId:     "step_success",
 					CallbackAddress: "localhost",
 				}
@@ -489,7 +489,7 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 			srv.kvStore = mockKV
 
 			resumeReq := &pb.ResumeJobRequest{
-				Identity:      &pb.InfrastructureIdentity{JobId: tt.jobID},
+				Identity:      &pb.InfrastructureIdentity{JobId: tt.jobID, TenantId: "tenant_1", AppId: "app_1"},
 				CorrectedJson: tt.correctedJson,
 			}
 
