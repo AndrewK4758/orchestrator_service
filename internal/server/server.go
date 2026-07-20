@@ -321,14 +321,10 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 }
 
 func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
-	jobID := ""
-	if req.GetIdentity() != nil {
-		jobID = req.GetIdentity().GetJobId()
-		logger.Info("System", "[DEBUG] ResumeJob called with Identity: %+v, JobID: %s", req.GetIdentity(), jobID)
-	} else {
-		logger.Warn("System", "[DEBUG] ResumeJob called with NIL Identity! Fallback to deprecated job_id: %s. Full req: %+v", req.GetJobId(), req)
-		jobID = req.GetJobId()
+	if req.GetIdentity() == nil || req.GetIdentity().GetJobId() == "" {
+		return nil, fmt.Errorf("invalid request: missing Identity or JobId")
 	}
+	jobID := req.GetIdentity().GetJobId()
 
 	if s.kvStore == nil {
 		return nil, fmt.Errorf("KV store is not initialized")
@@ -342,11 +338,6 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		return nil, fmt.Errorf("failed to get paused job from KV store: %w", err)
 	}
 
-	// Delete from KV store now that it's resumed
-	err = s.kvStore.Delete(ctx, jobID)
-	if err != nil {
-		logger.Warn("System", "Failed to delete KV entry for job %s: %v", jobID, err)
-	}
 
 	stepReq := &pb.ExecuteWorkflowNodeRequest{}
 	if err := proto.Unmarshal(kvEntry.Value(), stepReq); err != nil {
@@ -365,6 +356,11 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	if err != nil {
 		logger.Error("System", "Failed to fire callback for resumed job: %v", err)
 		return nil, fmt.Errorf("failed to fire callback for resumed job: %w", err)
+	}
+
+	// Delete from KV store ONLY after successful callback (Idempotency fix)
+	if deleteErr := s.kvStore.Delete(ctx, jobID); deleteErr != nil {
+		logger.Warn("System", "Failed to delete KV entry for job %s: %v", jobID, deleteErr)
 	}
 
 	return &pb.ResumeJobResponse{
