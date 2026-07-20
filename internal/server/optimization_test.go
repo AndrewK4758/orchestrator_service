@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 
 func BenchmarkActiveJobsLockContention(b *testing.B) {
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	// Pre-fill activeJobs to simulate load
 	for i := range 10000 {

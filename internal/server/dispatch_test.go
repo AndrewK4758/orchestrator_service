@@ -29,7 +29,7 @@ func (m *mockTraceClient) GetJobState(ctx context.Context, in *pb.GetJobStateReq
 func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 	// Test Case 1.1: Duplicate Active Dispatch
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	jobID := "job_active_dup"
 	stepID := "step_1"
@@ -71,7 +71,7 @@ func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 func TestDispatch_DuplicateCompletedDispatch(t *testing.T) {
 	// Test Case 1.2: Duplicate Completed Dispatch
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	jobID := "job_completed_dup"
 	stepID := "step_1"
@@ -121,7 +121,7 @@ func TestDispatch_PurgedStateRedelivery(t *testing.T) {
 		},
 	}
 
-	srv := NewServer(&ai_client.Client{}, pub, traceClient)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, traceClient)
 
 	jobID := "job_purged_redelivery"
 	stepID := "step_1"

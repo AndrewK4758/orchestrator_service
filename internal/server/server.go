@@ -77,7 +77,7 @@ func sanitizeMsgId(id string) string {
 	return id
 }
 
-func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
+func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	cacheClient, _, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
 	if err != nil {
 		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
@@ -106,12 +106,12 @@ func NewServer(aiClient *ai_client.Client, pub JobPublisher, traceClient pb.Trac
 	}
 
 	// Load pending jobs from Traceability Service
-	err = srv.pub.ConsumeJobs(context.Background(), srv.handleJobMessage)
+	err = srv.pub.ConsumeJobs(ctx, srv.handleJobMessage)
 	if err != nil {
 		logger.Error("System", "Failed to start job consumer: %v", err)
 	}
 
-	err = srv.pub.ConsumeWebhooks(context.Background(), srv.processWebhookMsg)
+	err = srv.pub.ConsumeWebhooks(ctx, srv.processWebhookMsg)
 	if err != nil {
 		logger.Error("System", "Failed to start webhooks consumer: %v", err)
 	}

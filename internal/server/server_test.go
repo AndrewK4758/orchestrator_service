@@ -81,7 +81,7 @@ func (m *mockPublisher) ConsumeWebhooks(ctx context.Context, handler func(ctx co
 
 func TestOrchestratorServer_ExecuteWorkflowNode(t *testing.T) {
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	t.Run("ExecuteWorkflowNode queues to internal memory cache and NATS", func(t *testing.T) {
 		req := &pb.ExecuteWorkflowNodeRequest{
@@ -120,7 +120,7 @@ func (m mockMsg) Data() []byte {
 
 func TestIdempotentExecution_Concurrent(t *testing.T) {
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 		Identity: &pb.InfrastructureIdentity{JobId: "job_concurrent", TenantId: "tenant_1"},
@@ -192,7 +192,7 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	defer grpcServer.Stop()
 
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	// Setup mock cache client to force a cache hit (bypassing AI)
 	srv.cacheClient = &mockCacheClient{}
@@ -314,7 +314,7 @@ func (m *mockCacheClient) CheckMetadataExists(ctx context.Context, in *pb.CheckM
 
 func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 		Identity:        &pb.InfrastructureIdentity{JobId: "job_timeout_1"},
@@ -341,7 +341,7 @@ func TestOrchestratorServer_CallbackTimeoutResiliency(t *testing.T) {
 
 func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 	pub := &mockPublisher{}
-	srv := NewServer(&ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
 
 	req := &pb.ExecuteWorkflowNodeRequest{
 		Identity: &pb.InfrastructureIdentity{JobId: "job_cache_timeout"},

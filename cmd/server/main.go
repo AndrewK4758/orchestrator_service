@@ -5,6 +5,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
@@ -40,7 +42,9 @@ func main() {
 	}
 
 	// Connect to the external AI Service (acting as the 'Brain') via NATS
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	aiClient, err := ai_client.NewClient(ctx, natsURL)
 	if err != nil {
 		log.Fatalf("Failed to create AI client: %v", err)
@@ -76,7 +80,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 
 	// Register the Orchestrator service and inject dependencies
-	orchestratorServer := server.NewServer(aiClient, pub, traceClient)
+	orchestratorServer := server.NewServer(ctx, aiClient, pub, traceClient)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it
