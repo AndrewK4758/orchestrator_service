@@ -653,10 +653,15 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 	collectionName := "default_collection"
 
 	if req.NodeConfig != nil && req.NodeConfig.Cache != nil {
-		cacheInput = req.NodeConfig.Cache.LookupInput
+		cacheInput = strings.TrimSpace(req.NodeConfig.Cache.LookupInput)
 		if req.NodeConfig.Cache.CollectionName != "" {
 			collectionName = req.NodeConfig.Cache.CollectionName
 		}
+	}
+
+	if useCache && cacheInput == "" {
+		logger.Warn("Engine", "[JobID: %s | StepID: %s] Cache enabled but lookup input is empty. Skipping Cache Store.", state.JobId, req.StepId)
+		useCache = false
 	}
 
 	if useCache {
@@ -922,11 +927,16 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 	collectionName := "default_collection"
 
 	if req.NodeConfig != nil && req.NodeConfig.Cache != nil {
-		cacheInput = req.NodeConfig.Cache.LookupInput
+		cacheInput = strings.TrimSpace(req.NodeConfig.Cache.LookupInput)
 		if req.NodeConfig.Cache.CollectionName != "" {
 			collectionName = req.NodeConfig.Cache.CollectionName
 		}
 		threshold = req.NodeConfig.Cache.ConfidenceThreshold
+	}
+
+	if useCache && cacheInput == "" {
+		logger.Warn("Engine", "[JobID: %s | StepID: %s] Cache enabled but lookup input is empty. Skipping Cache Check.", state.JobId, req.StepId)
+		useCache = false
 	}
 
 	if useCache {
