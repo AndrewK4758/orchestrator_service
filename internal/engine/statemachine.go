@@ -328,7 +328,23 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 	lastStepName = req.NodeConfig.NodeName
 	lastStepId = req.StepId
 
-	if req.NodeConfig.SystemInstructions == "" || req.NodeConfig.ExpectedSchema == "" {
+	if req.DocumentChunking != nil || req.AiExtraction != nil || req.SemanticCache != nil || req.HumanValidation != nil {
+		logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> EXECUTING EXPLICIT ROOT ENTITY CONTRACT", state.JobId, req.StepId)
+		assembledJson, err := e.executeNode(ctx, state, req)
+		if err != nil {
+			if errors.Is(err, ErrPendingHumanValidation) {
+				return "", "", lastStepName, lastStepId, err
+			}
+			return "", "", lastStepName, lastStepId, fmt.Errorf("explicit node execution failed: %w", err)
+		}
+		
+		var finalJSON []byte
+		finalJSON, _ = req.GlobalState.MarshalJSON()
+		logger.Debug("Engine", "[EXECUTION MAP] [JobID: %s | StepID: %s] -> WORKFLOW EXECUTION SUCCESS: %s", state.JobId, req.StepId, lastStepName)
+		return string(finalJSON), assembledJson, lastStepName, lastStepId, nil
+	}
+
+	if req.NodeConfig == nil || req.NodeConfig.SystemInstructions == "" || req.NodeConfig.ExpectedSchema == "" {
 		return "", "", lastStepName, lastStepId, fmt.Errorf("step %s is missing required CustomInstructions or ExpectedSchema", req.NodeConfig.NodeName)
 	}
 
@@ -677,7 +693,7 @@ func (e *Engine) executeSemanticCacheStore(ctx context.Context, state *EngineSta
 			Text:             cacheInput,
 			Identity:         state.Req.Identity,
 			ExtractedPayload: payload,
-			Metadata:         req.Metadata,
+			Metadata:         state.Req.NodeConfig.Cache.Metadata,
 		}
 
 		correlationID := fmt.Sprintf("%s_%s", state.JobId, req.StepId)
@@ -731,14 +747,6 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 
 	client := pb.NewHumanValidationServiceClient(conn)
 
-	jobName := ""
-	if req.Identity != nil {
-		jobName = req.Identity.JobId
-	}
-	if name, ok := req.Metadata["job_name"]; ok && name != "" {
-		jobName = name
-	}
-
 	stepName := ""
 	if req.NodeConfig != nil {
 		stepName = req.NodeConfig.NodeName
@@ -761,7 +769,6 @@ func (e *Engine) triggerHumanValidation(ctx context.Context, state *EngineState,
 		PromptInstructions: req.NodeConfig.SystemInstructions,
 		ErrorMessage:       errMsg,
 		GlobalStateJson:    globalStateJSON,
-		JobName:            jobName,
 		StepId:             req.StepId,
 		StepContextInput:   "",
 		Metadata:           req.Metadata,
@@ -965,7 +972,7 @@ func (e *Engine) executeZeroShotClassification(ctx context.Context, state *Engin
 			Text:           cacheInput,
 			Identity:       state.Req.Identity,
 			Threshold:      threshold,
-			Metadata:       req.Metadata,
+			Metadata:       state.Req.NodeConfig.Cache.Metadata,
 		}
 
 		resp, err = e.cacheClient.CheckCache(ctx, reqCheck)
@@ -1039,11 +1046,7 @@ func cleanJSON(input string) string {
 
 	first := -1
 	if firstBrace != -1 && firstBracket != -1 {
-		if firstBrace < firstBracket {
-			first = firstBrace
-		} else {
-			first = firstBracket
-		}
+		first = min(firstBrace, firstBracket)
 	} else if firstBrace != -1 {
 		first = firstBrace
 	} else if firstBracket != -1 {
@@ -1059,11 +1062,7 @@ func cleanJSON(input string) string {
 
 	last := -1
 	if lastBrace != -1 && lastBracket != -1 {
-		if lastBrace > lastBracket {
-			last = lastBrace
-		} else {
-			last = lastBracket
-		}
+		last = max(lastBrace, lastBracket)
 	} else if lastBrace != -1 {
 		last = lastBrace
 	} else if lastBracket != -1 {
@@ -1075,4 +1074,17 @@ func cleanJSON(input string) string {
 	}
 
 	return input
+}
+
+func (e *Engine) executeNode(ctx context.Context, state *EngineState, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
+	if req.DocumentChunking != nil {
+		return e.executeDocumentChunking(ctx, state, req)
+	} else if req.AiExtraction != nil {
+		return e.executeAIStep(ctx, state, req)
+	} else if req.SemanticCache != nil {
+		return e.executeSemanticCacheStore(ctx, state, req)
+	} else if req.HumanValidation != nil {
+		return e.executeHumanValidationStep(ctx, state, req)
+	}
+	return "", fmt.Errorf("no structural contract found")
 }

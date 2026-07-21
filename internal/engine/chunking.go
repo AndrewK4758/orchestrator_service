@@ -28,9 +28,10 @@ func (e *Engine) executeDocumentChunking(ctx context.Context, state *EngineState
 	}
 
 	err = stream.Send(&pb.ChunkDocumentRequest{
-		Identity:        state.Req.Identity,
-		StepId:          req.StepId,
-		OriginalRequest: req,
+		Identity:         state.Req.Identity,
+		StepId:           req.StepId,
+		DocumentChunking: req.DocumentChunking,
+		OriginalRequest:  req,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to send chunking request: %w", err)

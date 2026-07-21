@@ -6,17 +6,7 @@ import "time"
 type EventType string
 
 const (
-	EventJobStarted   EventType = "job.started"
-	EventJobCompleted EventType = "job.completed"
-	EventJobFailed    EventType = "job.failed"
-
-	EventChunkStarted   EventType = "chunk.started"
-	EventChunkCompleted EventType = "chunk.completed"
-	EventChunkFailed    EventType = "chunk.failed"
-	EventChunkTrace     EventType = "chunk.trace"
-
-	EventJobStepStarted       EventType = "step.started"
-	EventJobStepCompleted     EventType = "step.completed"
+	EventChunkTrace           EventType = "chunk.trace"
 	EventJobStepFailed        EventType = "step.failed"
 	EventJobStepPendingHuman  EventType = "step.pending_human"
 	EventStepValidationFailed EventType = "step.validation_failed"
@@ -41,7 +31,7 @@ type TraceabilityEvent struct {
 	AppID    string `json:"app_id,omitempty"`    // e.g., "DotNetWebClient"
 
 	// Job Context
-	JobID         string `json:"job_id"`
+	JobID string `json:"job_id"`
 
 	Stage     string `json:"stage,omitempty"`
 	JobAction string `json:"job_action,omitempty"`

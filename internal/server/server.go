@@ -132,7 +132,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 	if req.Identity == nil {
 		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity is strictly required")
 	}
-	
+
 	jobID := req.Identity.JobId
 	if jobID == "" {
 		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.JobId is strictly required")
@@ -158,6 +158,7 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 	msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
 	msgId = sanitizeMsgId(msgId)
 
+	//move 5 to env variable
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -187,7 +188,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		appID = req.Identity.AppId
 	}
 
-	if s.traceClient != nil {
+	if s.traceClient != nil { //move 2 to environment variable
 		ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
 		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
 		cancelTrace()
@@ -203,7 +204,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", jobID, req.StepId)
 		return nil
 	}
-	
+
 	execCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -219,7 +220,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	if req.NodeConfig == nil {
 		return fmt.Errorf("node config is missing from request for job %s", jobID)
 	}
-	
+
 	// ZERO-SHOT CACHE BYPASS (remove tracker references, use execCtx)
 	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
 		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, req.StepId, req.NodeConfig.Cache.CollectionName)
@@ -237,7 +238,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			Text:           req.NodeConfig.Cache.LookupInput,
 			Identity:       req.GetIdentity(),
 			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
-			Metadata:       req.Metadata,
+			Metadata:       req.NodeConfig.Cache.Metadata,
 		})
 		cancelCache()
 
@@ -253,9 +254,9 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 				return fmt.Errorf("failed to fire callback for cache hit: %w", err)
 			}
 			return nil
-		} else {
-			logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
 		}
+
+		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
 	}
 
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
@@ -370,7 +371,6 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 		}
 		return nil, fmt.Errorf("failed to get paused job from KV store: %w", err)
 	}
-
 
 	stepReq := &pb.ExecuteWorkflowNodeRequest{}
 	if err := proto.Unmarshal(kvEntry.Value(), stepReq); err != nil {
@@ -534,13 +534,12 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	var err error
 	if evt.IsSuspended {
 		_, err = client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
-			JobId:            req.GetIdentity().GetJobId(),
-			SuspendedStepId:  evt.LastStepId,
-			Reason:           evt.SuspendReason,
-			Identity:         req.Identity,
-			Metadata:         req.Metadata,
-			GlobalState:      req.GlobalState,
-			NodeOutput:       stepOutStruct,
+			SuspendedStepId: evt.LastStepId,
+			Reason:          evt.SuspendReason,
+			Identity:        req.Identity,
+			Metadata:        req.Metadata,
+			GlobalState:     req.GlobalState,
+			NodeOutput:      stepOutStruct,
 		})
 	} else if evt.ErrMsg != "" {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
