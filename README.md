@@ -75,6 +75,8 @@ You can tune the throughput via the `.env` file:
 * **`MAX_ACK_PENDING`**: This strictly mathematically limits the maximum number of concurrent jobs the Orchestrator is allowed to pull from NATS.
   * **Default (5)**: Perfectly tuned for an AI Engine (e.g., Ollama/vLLM) node with exactly 12GB VRAM. This prevents the GPU from being starved or OOM crashing, allowing NATS to queue the remaining backlog gracefully.
   * **High-Throughput (1000+)**: If you switch to an enterprise cloud AI (like Gemini 1.5 via API), increase this limit to scale Go's highly-concurrent network I/O up to process thousands of simultaneous tasks.
+* **`WORKER_RESPONSE_TIMEOUT_SEC`**: This configures the maximum number of seconds the orchestrator will wait for a response from a worker before treating the execution as a timeout.
+  * **Default (300)**: A generous 5-minute timeout designed to accommodate slow AI inference tasks without triggering unnecessary retries.
 
 The Orchestrator also utilizes dynamic `msg.InProgress()` heartbeats, allowing lightning-fast crash recovery (`AckWait` = 2 minutes) without prematurely terminating long-running GPU inference tasks!
 

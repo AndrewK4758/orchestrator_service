@@ -8,6 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/AndrewK4758/shared_utils/logger"
+
 	"strconv"
 	"time"
 
@@ -22,12 +24,13 @@ import (
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/server"
 
+	"buf.build/go/protovalidate"
 	pb "github.com/AndrewK4758/shared_protos"
 	"google.golang.org/grpc/credentials/insecure"
-	"buf.build/go/protovalidate"
 )
 
 func main() {
+	logger.InitLogger()
 	// Attempt to load .env, ignore error if it doesn't exist
 	_ = godotenv.Load()
 

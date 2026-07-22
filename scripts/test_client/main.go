@@ -45,6 +45,12 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 	}
 }
 
+func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.JobSuspendedRequest) (*pb.JobSuspendedResponse, error) {
+	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.SuspendedStepId, req.Identity.JobId, req.Reason)
+	s.ResultChan <- "SUSPENDED: " + req.Reason
+	return &pb.JobSuspendedResponse{Success: true}, nil
+}
+
 func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
 	jobID := ""
 	if req.Identity != nil {
@@ -140,6 +146,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		Metadata:        map[string]string{},
 		CallbackAddress: "localhost:50055",
 		NodeConfig: &pb.NodeConfiguration{
+			TargetWorkerSubject: "worker.human.validation",
 			NodeName:           "Extract Invoice Data",
 			SystemInstructions: "Extract the invoice number and total amount.",
 			ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,

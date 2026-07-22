@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"orchestrator_service/internal/logger"
+	"github.com/AndrewK4758/shared_utils/logger"
 	"os"
 	"strconv"
 	"strings"
@@ -81,7 +81,11 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
 	}
 
-	eng := engine.NewEngine(aiClient, cacheClient, pub)
+	eng, err := engine.NewEngine(ctx, aiClient, cacheClient, pub)
+	if err != nil {
+		logger.Error("System", "Failed to initialize engine: %v", err)
+		panic(fmt.Errorf("failed to initialize engine: %w", err))
+	}
 
 	docProcAddr := os.Getenv("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
 	if docProcAddr == "" {

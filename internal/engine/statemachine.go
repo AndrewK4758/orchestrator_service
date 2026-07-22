@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"orchestrator_service/internal/events"
-	"orchestrator_service/internal/logger"
+	"github.com/AndrewK4758/shared_utils/logger"
+
+	"github.com/AndrewK4758/shared_utils/schemautil"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/google/uuid"
@@ -53,7 +55,7 @@ type Engine struct {
 	pending  sync.Map
 }
 
-func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher) *Engine {
+func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher) (*Engine, error) {
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = "nats://localhost:4222"
@@ -62,14 +64,13 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		logger.Error("System", "Failed to connect to NATS in Engine: %v", err)
+		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	var js jetstream.JetStream
-	if nc != nil {
-		js, err = jetstream.New(nc)
-		if err != nil {
-			logger.Error("System", "Failed to init JetStream in Engine: %v", err)
-		}
+	js, err := jetstream.New(nc)
+	if err != nil {
+		logger.Error("System", "Failed to init JetStream in Engine: %v", err)
+		return nil, fmt.Errorf("failed to init JetStream: %w", err)
 	}
 
 	clientID := uuid.New().String()
@@ -82,51 +83,52 @@ func NewEngine(aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub
 		clientID:    clientID,
 	}
 
-	if js != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-		streamName := "WORKER_RESPONSES"
-		_, err = js.Stream(ctx, streamName)
-		if err != nil {
-			_, err = js.CreateStream(ctx, jetstream.StreamConfig{
-				Name:     streamName,
-				Subjects: []string{"worker.response.>"},
-			})
-			if err != nil {
-				logger.Warn("System", "Failed to create WORKER_RESPONSES stream: %v", err)
-			}
-		}
-
-		subSubject := fmt.Sprintf("worker.response.%s.>", clientID)
-		cons, err := js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-			AckPolicy:     jetstream.AckExplicitPolicy,
-			FilterSubject: subSubject,
+	streamName := "WORKER_RESPONSES"
+	_, err = js.Stream(setupCtx, streamName)
+	if err != nil {
+		_, err = js.CreateStream(setupCtx, jetstream.StreamConfig{
+			Name:     streamName,
+			Subjects: []string{"worker.response.>"},
 		})
 		if err != nil {
-			logger.Error("System", "Failed to create consumer: %v", err)
-		} else {
-			cc, err := cons.Consume(func(msg jetstream.Msg) {
-				replySubj := msg.Subject()
-				if ch, ok := e.pending.Load(replySubj); ok {
-					select {
-					case ch.(chan jetstream.Msg) <- msg:
-					default:
-						msg.Ack()
-					}
-				} else {
-					msg.Ack()
-				}
-			}, jetstream.PullMaxMessages(100))
-			if err != nil {
-				logger.Error("System", "Failed to consume JS messages: %v", err)
-			} else {
-				e.sub = cc
-			}
+			logger.Warn("System", "Failed to create WORKER_RESPONSES stream: %v", err)
+			return nil, fmt.Errorf("failed to create WORKER_RESPONSES stream: %w", err)
 		}
 	}
 
-	return e
+	subSubject := fmt.Sprintf("worker.response.%s.>", clientID)
+	cons, err := js.CreateOrUpdateConsumer(setupCtx, streamName, jetstream.ConsumerConfig{
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: subSubject,
+	})
+	if err != nil {
+		logger.Error("System", "Failed to create consumer: %v", err)
+		return nil, fmt.Errorf("failed to create consumer: %w", err)
+	}
+
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		replySubj := msg.Subject()
+		if ch, ok := e.pending.Load(replySubj); ok {
+			select {
+			case ch.(chan jetstream.Msg) <- msg:
+			default:
+				msg.Ack()
+			}
+		} else {
+			msg.Ack()
+		}
+	}, jetstream.PullMaxMessages(100))
+	if err != nil {
+		logger.Error("System", "Failed to consume JS messages: %v", err)
+		return nil, fmt.Errorf("failed to consume JS messages: %w", err)
+	}
+
+	e.sub = cc
+
+	return e, nil
 }
 
 func (e *Engine) SetChunkingClient(client pb.DocumentProcessingServiceClient) {
@@ -273,12 +275,25 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 		}
 	}
 
+	timeoutSecStr := os.Getenv("WORKER_RESPONSE_TIMEOUT_SEC")
+	timeoutSec := 300
+	if timeoutSecStr != "" {
+		if val, err := strconv.Atoi(timeoutSecStr); err == nil {
+			timeoutSec = val
+		}
+	}
+
 	schemaStr := req.NodeConfig.ExpectedSchema
-	compiler := jsonschema.NewCompiler()
+	compiler := schemautil.SetupRelaxedCompiler()
 	var schema *jsonschema.Schema
 	if schemaStr != "" {
-		if err := compiler.AddResource("schema.json", strings.NewReader(schemaStr)); err == nil {
-			schema, _ = compiler.Compile("schema.json")
+		var err error
+		if err = compiler.AddResource("schema.json", strings.NewReader(schemaStr)); err != nil {
+			return "", fmt.Errorf("invalid expected schema format: %w", err)
+		}
+		schema, err = compiler.Compile("schema.json")
+		if err != nil {
+			return "", fmt.Errorf("failed to compile expected schema: %w", err)
 		}
 	}
 
@@ -310,14 +325,18 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 			continue
 		}
 
+		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return "", fmt.Errorf("context cancelled during worker execution wait: %w", ctx.Err())
-		case <-time.After(30 * time.Second):
+		case <-timer.C:
+			timer.Stop()
 			logger.Warn("Engine", "Timeout waiting for worker response on attempt %d", attempt)
 			lastErr = fmt.Errorf("timeout waiting for worker response")
 			continue
 		case respMsg := <-ch:
+			timer.Stop()
 			respMsg.Ack()
 
 			var resp pb.PerformActionResponse
@@ -327,6 +346,9 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 				if !resp.Success {
 					logger.Warn("Engine", "Worker returned error on attempt %d: %s", attempt, resp.ErrorMessage)
 					lastErr = fmt.Errorf("worker error: %s", resp.ErrorMessage)
+					if !resp.GetIsTransientError() {
+						return "", fmt.Errorf("%w: deterministic fatal error from worker: %w", ErrPendingHumanValidation, lastErr)
+					}
 					continue
 				}
 				rawJson = cleanJSON(resp.GetActionResultJson())
@@ -336,14 +358,12 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 				var doc any
 				if err := json.Unmarshal([]byte(rawJson), &doc); err != nil {
 					logger.Warn("Engine", "Failed to unmarshal worker JSON on attempt %d: %v", attempt, err)
-					lastErr = err
-					continue
+					return "", fmt.Errorf("failed to unmarshal result: %w", err)
 				}
 
 				if err := schema.Validate(doc); err != nil {
 					logger.Warn("Engine", "JSON validation failed on attempt %d: %v", attempt, err)
-					lastErr = err
-					continue
+					return "", fmt.Errorf("schema validation failed: %w", err)
 				}
 			}
 
@@ -352,5 +372,5 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	}
 
 	logger.Error("Engine", "Generic step failed after %d retries. Last error: %v", maxRetries, lastErr)
-	return "", fmt.Errorf("%w: max inference retries reached: %v", ErrPendingHumanValidation, lastErr)
+	return "", fmt.Errorf("%w: max inference retries reached: %w", ErrPendingHumanValidation, lastErr)
 }

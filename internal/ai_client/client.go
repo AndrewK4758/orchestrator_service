@@ -3,7 +3,7 @@ package ai_client
 import (
 	"context"
 	"fmt"
-	"orchestrator_service/internal/logger"
+	"github.com/AndrewK4758/shared_utils/logger"
 	"os"
 	"strconv"
 	"strings"

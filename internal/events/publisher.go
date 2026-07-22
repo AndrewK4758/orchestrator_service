@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"orchestrator_service/internal/logger"
+	"github.com/AndrewK4758/shared_utils/logger"
 	"os"
 	"strconv"
 	"time"
