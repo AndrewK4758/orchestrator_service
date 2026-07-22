@@ -24,6 +24,7 @@ import (
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"google.golang.org/grpc/credentials/insecure"
+	"buf.build/go/protovalidate"
 )
 
 func main() {
@@ -82,6 +83,11 @@ func main() {
 	defer traceConn.Close()
 	traceClient := pb.NewTraceabilityQueryClient(traceConn)
 
+	v, err := protovalidate.New()
+	if err != nil {
+		log.Fatalf("Failed to initialize protovalidate: %v", err)
+	}
+
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMsgSizeMb*1024*1024),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -89,6 +95,7 @@ func main() {
 		}),
 		grpc.ChainUnaryInterceptor(
 			recovery.UnaryServerInterceptor(),
+			server.ValidationInterceptor(v),
 		),
 		grpc.ChainStreamInterceptor(
 			recovery.StreamServerInterceptor(),
