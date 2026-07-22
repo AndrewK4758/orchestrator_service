@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pb "github.com/AndrewK4758/shared_protos"
+	"github.com/AndrewK4758/shared_utils/logger"
 )
 
 type ArtemisCallbackServer struct {
@@ -46,8 +46,8 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 }
 
 func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.JobSuspendedRequest) (*pb.JobSuspendedResponse, error) {
-	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.SuspendedStepId, req.Identity.JobId, req.Reason)
-	s.ResultChan <- "SUSPENDED: " + req.Reason
+	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.SuspendedStepId, req.Identity.JobId, req.GetErrorContract().GetMessage())
+	s.ResultChan <- "SUSPENDED: " + req.GetErrorContract().GetMessage()
 	return &pb.JobSuspendedResponse{Success: true}, nil
 }
 
@@ -57,21 +57,21 @@ func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFail
 		jobID = req.Identity.JobId
 	}
 	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.FailedStepId, jobID)
-	fmt.Printf("[%s] Step Failed! Error: %s\n", jobID, req.ErrorMessage)
-	s.ResultChan <- "ERROR: " + req.ErrorMessage
+	fmt.Printf("[%s] Step Failed! Error: %s\n", jobID, req.GetErrorContract().GetMessage())
+	s.ResultChan <- "ERROR: " + req.GetErrorContract().GetMessage()
 
 	return &pb.JobFailedResponse{Success: true}, nil
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatalf("Usage: go run main.go <path_to_pdf_or_directory>")
+		logger.Fatal("Orchestrator", "Usage: go run main.go <path_to_pdf_or_directory>")
 	}
 	inputPath := os.Args[1]
 
 	lis, err := net.Listen("tcp", ":50055")
 	if err != nil {
-		log.Fatalf("Failed to listen for callbacks: %v", err)
+		logger.Fatal("Orchestrator", "Failed to listen for callbacks: %v", err)
 	}
 	grpcServer := grpc.NewServer()
 	artemisServer := &ArtemisCallbackServer{
@@ -82,7 +82,7 @@ func main() {
 	go func() {
 		fmt.Println("🎧 Callback Server listening on :50055")
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("Failed to serve callbacks: %v", err)
+			logger.Fatal("Orchestrator", "Failed to serve callbacks: %v", err)
 		}
 	}()
 
@@ -90,14 +90,14 @@ func main() {
 
 	conn, err := grpc.NewClient("localhost:50052", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("Failed to connect to orchestrator: %v", err)
+		logger.Fatal("Orchestrator", "Failed to connect to orchestrator: %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewOrchestratorServiceClient(conn)
 
 	info, err := os.Stat(inputPath)
 	if err != nil {
-		log.Fatalf("Failed to stat input path: %v", err)
+		logger.Fatal("Orchestrator", "Failed to stat input path: %v", err)
 	}
 
 	var files []string
@@ -124,7 +124,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 
 	pdfBytes, err := os.ReadFile(inputPath)
 	if err != nil {
-		log.Printf("Failed to read file %s: %v", inputPath, err)
+		logger.Info("Orchestrator", "Failed to read file %s: %v", inputPath, err)
 		return
 	}
 
@@ -147,15 +147,15 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		CallbackAddress: "localhost:50055",
 		NodeConfig: &pb.NodeConfiguration{
 			TargetWorkerSubject: "worker.human.validation",
-			NodeName:           "Extract Invoice Data",
-			SystemInstructions: "Extract the invoice number and total amount.",
-			ExpectedSchema:     `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
+			NodeName:            "Extract Invoice Data",
+			SystemInstructions:  "Extract the invoice number and total amount.",
+			ExpectedSchema:      `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
 		},
 	}
 
 	nodeRes, err := client.ExecuteWorkflowNode(context.Background(), nodeReq)
 	if err != nil {
-		log.Printf("Failed to execute workflow node: %v", err)
+		logger.Info("Orchestrator", "Failed to execute workflow node: %v", err)
 		return
 	}
 	jobID := "job_test_123"

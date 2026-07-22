@@ -253,7 +253,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
 				logger.Error("Server", "Failed to merge cache state context: %v", err)
 			}
-			err := s.fireCallback(execCtx, req, cacheResp.ExtractedPayload, "", req.StepId)
+			err := s.fireCallback(execCtx, req, &engine.StepResult{OutputJSON: cacheResp.ExtractedPayload, StepId: req.StepId})
 			if err != nil {
 				return fmt.Errorf("failed to fire callback for cache hit: %w", err)
 			}
@@ -265,7 +265,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
 
-	_, stepOutputJSON, _, lastStepId, err := s.eng.ExecuteWorkflow(execCtx, req)
+	res, err := s.eng.ExecuteWorkflow(execCtx, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
@@ -280,28 +280,28 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 					return fmt.Errorf("failed to persist paused job in KV store: %w", putErr)
 				}
 			}
-			cbErr := s.fireJobSuspendedCallback(execCtx, req, stepOutputJSON, lastStepId, err.Error())
+			cbErr := s.fireJobSuspendedCallback(execCtx, req, res)
 			if cbErr != nil {
 				logger.Error("System", "Failed to fire job suspended callback: %v", cbErr)
 			}
 			return nil
 		}
 		logger.Error("System", "Workflow execution failed: %v", err)
-		return s.fireCallback(execCtx, req, stepOutputJSON, err.Error(), lastStepId)
+		return s.fireCallback(execCtx, req, res)
 	}
 
 	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
-	if err := engine.MergeStateContext(req, stepOutputJSON, ""); err != nil {
+	if err := engine.MergeStateContext(req, res.OutputJSON, ""); err != nil {
 		logger.Error("Server", "Failed to merge final state context: %v", err)
 	}
-	err = s.fireCallback(execCtx, req, stepOutputJSON, "", lastStepId)
+	err = s.fireCallback(execCtx, req, res)
 	if err != nil {
 		return fmt.Errorf("failed to fire callback for successful workflow: %w", err)
 	}
 	return nil
 }
 
-func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, lastStepId string, reason string) error {
+func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, res *engine.StepResult) error {
 	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
 		return nil
@@ -310,12 +310,17 @@ func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *
 	if err != nil {
 		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
 	}
+	var contractBytes []byte
+	if res != nil && res.ErrorContract != nil {
+		contractBytes, _ = proto.Marshal(res.ErrorContract)
+	}
+
 	evt := &events.WebhookEvent{
-		ReqBytes:       reqBytes,
-		StepOutputJSON: stepOutputJSON,
-		LastStepId:     lastStepId,
-		IsSuspended:    true,
-		SuspendReason:  reason,
+		ReqBytes:           reqBytes,
+		StepOutputJSON:     res.OutputJSON,
+		LastStepId:         res.StepId,
+		IsSuspended:        true,
+		ErrorContractBytes: contractBytes,
 	}
 	err = s.pub.PublishWebhook(ctx, evt)
 	if err != nil {
@@ -324,13 +329,10 @@ func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *
 	return nil
 }
 
-func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, stepOutputJSON string, errMsg string, lastStepId string) error {
+func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest, res *engine.StepResult) error {
 	cbAddress := req.CallbackAddress
 	if cbAddress == "" {
 		logger.Info("System", "No callback address provided, skipping callback")
-		if errMsg != "" {
-			s.handleCallbackError(ctx, errMsg, req)
-		}
 		return nil
 	}
 
@@ -339,20 +341,21 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
 	}
 
+	var contractBytes []byte
+	if res != nil && res.ErrorContract != nil {
+		contractBytes, _ = proto.Marshal(res.ErrorContract)
+	}
+
 	evt := &events.WebhookEvent{
-		ReqBytes:       reqBytes,
-		StepOutputJSON: stepOutputJSON,
-		ErrMsg:         errMsg,
-		LastStepId:     lastStepId,
+		ReqBytes:           reqBytes,
+		StepOutputJSON:     res.OutputJSON,
+		ErrorContractBytes: contractBytes,
+		LastStepId:         res.StepId,
 	}
 
 	err = s.pub.PublishWebhook(ctx, evt)
 	if err != nil {
 		return fmt.Errorf("failed to publish webhook event: %w", err)
-	}
-
-	if errMsg != "" {
-		s.handleCallbackError(ctx, errMsg, req)
 	}
 
 	return nil
@@ -389,7 +392,7 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	}
 
 	// Immediately fire webhook callback instead of publishing to JetStream priority queue
-	err = s.fireCallback(ctx, stepReq, req.GetCorrectedJson(), "", stepReq.StepId)
+	err = s.fireCallback(ctx, stepReq, &engine.StepResult{OutputJSON: req.GetCorrectedJson(), StepId: stepReq.StepId})
 	if err != nil {
 		logger.Error("System", "Failed to fire callback for resumed job: %v", err)
 		return nil, fmt.Errorf("failed to fire callback for resumed job: %w", err)
@@ -535,24 +538,30 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	}
 	stepOutStruct, _ := structpb.NewStruct(stepOutMap)
 
+	var errorContract *pb.ErrorContract
+	if len(evt.ErrorContractBytes) > 0 {
+		errorContract = &pb.ErrorContract{}
+		proto.Unmarshal(evt.ErrorContractBytes, errorContract)
+	}
+
 	var err error
 	if evt.IsSuspended {
 		_, err = client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
 			SuspendedStepId: evt.LastStepId,
-			Reason:          evt.SuspendReason,
 			Identity:        req.Identity,
 			Metadata:        req.Metadata,
 			GlobalState:     req.GlobalState,
 			NodeOutput:      stepOutStruct,
+			ErrorContract:   errorContract,
 		})
-	} else if evt.ErrMsg != "" {
+	} else if errorContract != nil {
 		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
-			Identity:     req.Identity,
-			FailedStepId: evt.LastStepId,
-			ErrorMessage: evt.ErrMsg,
-			Metadata:     req.Metadata,
-			GlobalState:  req.GlobalState,
-			NodeOutput:   stepOutStruct,
+			Identity:      req.Identity,
+			FailedStepId:  evt.LastStepId,
+			Metadata:      req.Metadata,
+			GlobalState:   req.GlobalState,
+			NodeOutput:    stepOutStruct,
+			ErrorContract: errorContract,
 		})
 	} else {
 		var stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteClient

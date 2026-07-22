@@ -213,7 +213,7 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	}
 
 	if !resp.GetSuccess() {
-		return nil, fmt.Errorf("ai_service returned failure: %s", resp.GetErrorMessage())
+		return nil, fmt.Errorf("ai_service returned failure: %s", resp.GetErrorContract().GetMessage())
 	}
 
 	return resp, nil

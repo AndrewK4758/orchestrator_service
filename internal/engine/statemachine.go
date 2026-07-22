@@ -36,6 +36,15 @@ type AIClient interface {
 	PerformAction(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
 }
 
+type StepResult struct {
+	FinalJSON        string
+	OutputJSON       string
+	StepName         string
+	StepId           string
+	ErrorContract    *pb.ErrorContract
+	IsTransientError bool
+}
+
 type EngState struct {
 	Req   *pb.ExecuteWorkflowNodeRequest
 	JobId string
@@ -240,17 +249,22 @@ func cleanJSON(input string) string {
 	return input
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (string, string, string, string, error) {
+func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
 	if req == nil || req.NodeConfig == nil {
-		return "", "", "", "", fmt.Errorf("invalid request")
+		return nil, fmt.Errorf("invalid request")
 	}
 
 	lastStepName := req.NodeConfig.NodeName
 	lastStepId := req.StepId
 
-	assembledJson, err := e.executeGenericStep(ctx, req)
+	res, err := e.executeGenericStep(ctx, req)
 	if err != nil {
-		return "", "", lastStepName, lastStepId, fmt.Errorf("failed to execute generic step: %w", err)
+		if res == nil {
+			res = &StepResult{}
+		}
+		res.StepName = lastStepName
+		res.StepId = lastStepId
+		return res, fmt.Errorf("failed to execute generic step: %w", err)
 	}
 
 	var finalJSON []byte
@@ -258,13 +272,17 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 		finalJSON, _ = req.GlobalState.MarshalJSON()
 	}
 
-	return string(finalJSON), assembledJson, lastStepName, lastStepId, nil
+	res.FinalJSON = string(finalJSON)
+	res.StepName = lastStepName
+	res.StepId = lastStepId
+
+	return res, nil
 }
 
-func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (string, error) {
+func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
 	subject := req.NodeConfig.TargetWorkerSubject
 	if subject == "" {
-		return "", fmt.Errorf("target worker subject is empty")
+		return nil, fmt.Errorf("target worker subject is empty")
 	}
 
 	maxRetriesStr := os.Getenv("MAX_INFERENCE_RETRIES")
@@ -289,17 +307,17 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	if schemaStr != "" {
 		var err error
 		if err = compiler.AddResource("schema.json", strings.NewReader(schemaStr)); err != nil {
-			return "", fmt.Errorf("invalid expected schema format: %w", err)
+			return nil, fmt.Errorf("invalid expected schema format: %w", err)
 		}
 		schema, err = compiler.Compile("schema.json")
 		if err != nil {
-			return "", fmt.Errorf("failed to compile expected schema: %w", err)
+			return nil, fmt.Errorf("failed to compile expected schema: %w", err)
 		}
 	}
 
 	reqBytes, err := proto.Marshal(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	replySubj := fmt.Sprintf("worker.response.%s.%s", e.clientID, uuid.New().String())
@@ -309,6 +327,8 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 
 	var lastErr error
 	var rawJson string
+	var lastContract *pb.ErrorContract
+	var lastTransient bool
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		msgID := uuid.New().String()
@@ -329,7 +349,7 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return "", fmt.Errorf("context cancelled during worker execution wait: %w", ctx.Err())
+			return nil, fmt.Errorf("context cancelled during worker execution wait: %w", ctx.Err())
 		case <-timer.C:
 			timer.Stop()
 			logger.Warn("Engine", "Timeout waiting for worker response on attempt %d", attempt)
@@ -344,10 +364,22 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 				rawJson = cleanJSON(string(respMsg.Data()))
 			} else {
 				if !resp.Success {
-					logger.Warn("Engine", "Worker returned error on attempt %d: %s", attempt, resp.ErrorMessage)
-					lastErr = fmt.Errorf("worker error: %s", resp.ErrorMessage)
-					if !resp.GetIsTransientError() {
-						return "", fmt.Errorf("%w: deterministic fatal error from worker: %w", ErrPendingHumanValidation, lastErr)
+					contract := resp.GetErrorContract()
+					errMsg := "unknown worker error"
+					if contract != nil && contract.GetMessage() != "" {
+						errMsg = contract.GetMessage()
+					}
+					logger.Warn("Engine", "Worker returned error on attempt %d: %s", attempt, errMsg)
+					
+					lastErr = fmt.Errorf("worker error: %s", errMsg)
+					lastContract = contract
+					lastTransient = resp.GetIsTransientError()
+					
+					if !lastTransient {
+						return &StepResult{
+							ErrorContract:    lastContract,
+							IsTransientError: lastTransient,
+						}, fmt.Errorf("%w: deterministic fatal error from worker: %w", ErrPendingHumanValidation, lastErr)
 					}
 					continue
 				}
@@ -358,19 +390,24 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 				var doc any
 				if err := json.Unmarshal([]byte(rawJson), &doc); err != nil {
 					logger.Warn("Engine", "Failed to unmarshal worker JSON on attempt %d: %v", attempt, err)
-					return "", fmt.Errorf("failed to unmarshal result: %w", err)
+					return nil, fmt.Errorf("failed to unmarshal result: %w", err)
 				}
 
 				if err := schema.Validate(doc); err != nil {
 					logger.Warn("Engine", "JSON validation failed on attempt %d: %v", attempt, err)
-					return "", fmt.Errorf("schema validation failed: %w", err)
+					return nil, fmt.Errorf("schema validation failed: %w", err)
 				}
 			}
 
-			return rawJson, nil
+			return &StepResult{
+				OutputJSON: rawJson,
+			}, nil
 		}
 	}
 
 	logger.Error("Engine", "Generic step failed after %d retries. Last error: %v", maxRetries, lastErr)
-	return "", fmt.Errorf("%w: max inference retries reached: %w", ErrPendingHumanValidation, lastErr)
+	return &StepResult{
+		ErrorContract:    lastContract,
+		IsTransientError: lastTransient,
+	}, fmt.Errorf("%w: max inference retries reached: %w", ErrPendingHumanValidation, lastErr)
 }

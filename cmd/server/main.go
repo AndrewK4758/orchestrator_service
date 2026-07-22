@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -41,7 +40,7 @@ func main() {
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("Failed to listen on port %s: %v", port, err)
+		logger.Fatal("Orchestrator", "Failed to listen on port %s: %v", port, err)
 	}
 
 	// Connect to NATS JetStream
@@ -56,13 +55,13 @@ func main() {
 
 	aiClient, err := ai_client.NewClient(ctx, natsURL)
 	if err != nil {
-		log.Fatalf("Failed to create AI client: %v", err)
+		logger.Fatal("Orchestrator", "Failed to create AI client: %v", err)
 	}
 	defer aiClient.Close()
 
 	pub, err := events.NewPublisher(ctx, natsURL)
 	if err != nil {
-		log.Fatalf("Failed to create NATS publisher: %v", err)
+		logger.Fatal("Orchestrator", "Failed to create NATS publisher: %v", err)
 	}
 	defer pub.Close()
 
@@ -81,14 +80,14 @@ func main() {
 
 	traceConn, err := grpc.NewClient(traceabilityAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 	if err != nil {
-		log.Fatalf("Failed to connect to Traceability Service: %v", err)
+		logger.Fatal("Orchestrator", "Failed to connect to Traceability Service: %v", err)
 	}
 	defer traceConn.Close()
 	traceClient := pb.NewTraceabilityQueryClient(traceConn)
 
 	v, err := protovalidate.New()
 	if err != nil {
-		log.Fatalf("Failed to initialize protovalidate: %v", err)
+		logger.Fatal("Orchestrator", "Failed to initialize protovalidate: %v", err)
 	}
 
 	grpcServer := grpc.NewServer(
@@ -113,13 +112,13 @@ func main() {
 	reflection.Register(grpcServer)
 
 	go func() {
-		log.Printf("Orchestrator Service starting on port %s...", port)
+		logger.Info("Orchestrator", "Orchestrator Service starting on port %s...", port)
 		if err := grpcServer.Serve(listener); err != nil {
-			log.Fatalf("Failed to serve gRPC server: %v", err)
+			logger.Fatal("Orchestrator", "Failed to serve gRPC server: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("Shutting down Orchestrator Service gracefully...")
+	logger.Info("Orchestrator", "%v", "Shutting down Orchestrator Service gracefully...")
 	grpcServer.GracefulStop()
 }

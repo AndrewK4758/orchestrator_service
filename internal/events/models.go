@@ -48,10 +48,9 @@ type TraceabilityEvent struct {
 // WebhookEvent holds the payload necessary for the Orchestrator to securely relay callbacks
 // via a resilient JetStream retry queue without storing Protobuf references directly.
 type WebhookEvent struct {
-	ReqBytes       []byte `json:"req_bytes"`
-	StepOutputJSON string `json:"step_output_json"`
-	ErrMsg         string `json:"err_msg"`
-	LastStepId     string `json:"last_step_id"`
-	IsSuspended    bool   `json:"is_suspended"`
-	SuspendReason  string `json:"suspend_reason"`
+	ReqBytes           []byte `json:"req_bytes"`
+	StepOutputJSON     string `json:"step_output_json"`
+	ErrorContractBytes []byte `json:"error_contract_bytes"`
+	LastStepId         string `json:"last_step_id"`
+	IsSuspended        bool   `json:"is_suspended"`
 }

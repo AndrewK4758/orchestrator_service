@@ -6,18 +6,20 @@ import (
 )
 
 func TestProcessingState_Initialization(t *testing.T) {
-	ps := &pb.WorkflowContext{
-		JobId: "test_job_1",
-		Metadata: map[string]string{
-			"tenant_id": "test_tenant",
+	req := &pb.ExecuteWorkflowNodeRequest{
+		StepId: "step-1",
+		Identity: &pb.InfrastructureIdentity{
+			TenantId: "test_tenant",
+			AppId:    "test_app",
+			JobId:    "test_job_1",
 		},
 	}
 
-	if ps.JobId != "test_job_1" {
-		t.Errorf("Expected jobID test_job_1, got %s", ps.JobId)
+	if req.Identity.JobId != "test_job_1" {
+		t.Errorf("Expected jobID test_job_1, got %s", req.Identity.JobId)
 	}
 
-	if ps.Metadata["tenant_id"] != "test_tenant" {
-		t.Errorf("Expected metadata tenant_id, got %s", ps.Metadata["tenant_id"])
+	if req.Identity.TenantId != "test_tenant" {
+		t.Errorf("Expected tenant_id test_tenant, got %s", req.Identity.TenantId)
 	}
 }
