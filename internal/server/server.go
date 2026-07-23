@@ -81,7 +81,12 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
 	}
 
-	eng, err := engine.NewEngine(ctx, aiClient, cacheClient, pub)
+	kvStore, err := pub.GetActiveJobsKV(ctx)
+	if err != nil {
+		logger.Error("System", "Failed to initialize active_jobs KV store: %v", err)
+	}
+
+	eng, err := engine.NewEngine(ctx, aiClient, cacheClient, pub, kvStore)
 	if err != nil {
 		logger.Error("System", "Failed to initialize engine: %v", err)
 		panic(fmt.Errorf("failed to initialize engine: %w", err))
@@ -96,11 +101,6 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		logger.Warn("System", "failed to connect to document processing service: %v", err)
 	} else {
 		eng.SetChunkingClient(pb.NewDocumentProcessingServiceClient(docConn))
-	}
-
-	kvStore, err := pub.GetActiveJobsKV(ctx)
-	if err != nil {
-		logger.Error("System", "Failed to initialize active_jobs KV store: %v", err)
 	}
 
 	srv := &OrchestratorServer{
@@ -263,11 +263,21 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
 	}
 
+	// Save request to KV store for async hydration
+	reqBytes, marshalErr := proto.Marshal(req)
+	if marshalErr == nil && s.kvStore != nil {
+		_, _ = s.kvStore.Put(execCtx, jobID, reqBytes)
+	}
+
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
 
 	res, err := s.eng.ExecuteWorkflow(execCtx, req)
 
 	if err != nil {
+		if errors.Is(err, engine.ErrAsyncPending) {
+			logger.Info("System", "Workflow step %s is pending async execution via JetStream queue", req.NodeConfig.NodeName)
+			return nil
+		}
 		if errors.Is(err, engine.ErrPendingHumanValidation) {
 			logger.Info("System", "Job %s paused for human validation", jobID)
 			if s.kvStore != nil {
@@ -280,20 +290,32 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 					return fmt.Errorf("failed to persist paused job in KV store: %w", putErr)
 				}
 			}
-			cbErr := s.fireJobSuspendedCallback(execCtx, req, res)
-			if cbErr != nil {
-				logger.Error("System", "Failed to fire job suspended callback: %v", cbErr)
+			s.handleCallbackError(execCtx, err.Error(), req)
+			
+			// We MUST fire the Job Suspended webhook here explicitly
+			var contractBytes []byte
+			if res != nil && res.ErrorContract != nil {
+				contractBytes, _ = proto.Marshal(res.ErrorContract)
 			}
+			evt := &events.WebhookEvent{
+				ReqBytes:           reqBytes,
+				StepOutputJSON:     "{}",
+				ErrorContractBytes: contractBytes,
+				JobId:              jobID,
+				LastStepId:         req.StepId,
+				IsSuspended:        true,
+			}
+			_ = s.pub.PublishWebhook(execCtx, evt)
+
 			return nil
 		}
-		logger.Error("System", "Workflow execution failed: %v", err)
+		
+		s.handleCallbackError(execCtx, err.Error(), req)
 		return s.fireCallback(execCtx, req, res)
 	}
 
-	logger.Info("System", "Workflow completed successfully for step %s. Firing callback.", req.NodeConfig.NodeName)
-	if err := engine.MergeStateContext(req, res.OutputJSON, ""); err != nil {
-		logger.Error("Server", "Failed to merge final state context: %v", err)
-	}
+	// This block runs if executeGenericStep somehow returns success synchronously (e.g. mock or fallback).
+	s.handleCallbackError(execCtx, "", req)
 	err = s.fireCallback(execCtx, req, res)
 	if err != nil {
 		return fmt.Errorf("failed to fire callback for successful workflow: %w", err)

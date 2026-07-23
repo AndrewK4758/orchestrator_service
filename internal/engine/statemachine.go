@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,22 +13,22 @@ import (
 	"orchestrator_service/internal/events"
 	"github.com/AndrewK4758/shared_utils/logger"
 
-	"github.com/AndrewK4758/shared_utils/schemautil"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/santhosh-tekuri/jsonschema/v5"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
+var ErrAsyncPending = errors.New("async execution pending")
 
 type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 	PublishCacheStore(ctx context.Context, data []byte) error
+	PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error
 }
 
 type AIClient interface {
@@ -61,10 +60,10 @@ type Engine struct {
 	js       jetstream.JetStream
 	clientID string
 	sub      jetstream.ConsumeContext
-	pending  sync.Map
+	kvStore  jetstream.KeyValue
 }
 
-func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher) (*Engine, error) {
+func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher, kvStore jetstream.KeyValue) (*Engine, error) {
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = "nats://localhost:4222"
@@ -90,6 +89,7 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 		nc:          nc,
 		js:          js,
 		clientID:    clientID,
+		kvStore:     kvStore,
 	}
 
 	setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -120,15 +120,88 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		replySubj := msg.Subject()
-		if ch, ok := e.pending.Load(replySubj); ok {
-			select {
-			case ch.(chan jetstream.Msg) <- msg:
-			default:
-				msg.Ack()
-			}
-		} else {
+		
+		parts := strings.Split(replySubj, ".")
+		if len(parts) < 4 {
 			msg.Ack()
+			return
 		}
+		jobID := parts[3]
+
+		if e.kvStore == nil {
+			msg.Ack()
+			return
+		}
+
+		entry, err := e.kvStore.Get(context.Background(), jobID)
+		if err != nil {
+			logger.Warn("Engine", "Job %s not found in KV store for async response, ignoring", jobID)
+			msg.Ack()
+			return
+		}
+
+		req := &pb.ExecuteWorkflowNodeRequest{}
+		if err := proto.Unmarshal(entry.Value(), req); err != nil {
+			logger.Error("Engine", "Failed to unmarshal request from KV store for job %s: %v", jobID, err)
+			msg.Ack()
+			return
+		}
+
+		msg.Ack()
+
+		var resp pb.PerformActionResponse
+		var rawJson string
+		var errContract *pb.ErrorContract
+
+		if err := proto.Unmarshal(msg.Data(), &resp); err != nil {
+			rawJson = cleanJSON(string(msg.Data()))
+		} else {
+			if !resp.Success {
+				errContract = resp.GetErrorContract()
+				logger.Warn("Engine", "Worker returned error asynchronously: %v", errContract)
+			} else {
+				rawJson = cleanJSON(resp.GetActionResultJson())
+			}
+		}
+
+		_ = MergeStateContext(req, rawJson, "")
+
+		eventType := events.EventActionCompleted
+		var errMsg string
+		if errContract != nil {
+			eventType = events.EventActionFailed
+			errMsg = errContract.GetMessage()
+		}
+		
+		_ = e.pub.PublishTrace(context.Background(), events.TraceabilityEvent{
+			EventID:   uuid.New().String(),
+			EventType: eventType,
+			Timestamp: time.Now(),
+			TenantID:  req.Identity.GetTenantId(),
+			AppID:     req.Identity.GetAppId(),
+			JobID:     req.Identity.GetJobId(),
+			JobAction: req.NodeConfig.NodeName,
+			Error:     errMsg,
+		})
+
+		if req.CallbackAddress != "" {
+			reqBytes, _ := proto.Marshal(req)
+			var contractBytes []byte
+			if errContract != nil {
+				contractBytes, _ = proto.Marshal(errContract)
+			}
+			evt := &events.WebhookEvent{
+				ReqBytes:           reqBytes,
+				StepOutputJSON:     rawJson,
+				ErrorContractBytes: contractBytes,
+				JobId:              req.GetIdentity().GetJobId(),
+				LastStepId:         req.StepId,
+			}
+			_ = e.pub.PublishWebhook(context.Background(), evt)
+		}
+		
+		_ = e.kvStore.Delete(context.Background(), jobID)
+
 	}, jetstream.PullMaxMessages(100))
 	if err != nil {
 		logger.Error("System", "Failed to consume JS messages: %v", err)
@@ -277,6 +350,9 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 
 	res, err := e.executeGenericStep(ctx, req)
 	if err != nil {
+		if errors.Is(err, ErrAsyncPending) {
+			return nil, err
+		}
 		if res == nil {
 			res = &StepResult{}
 		}
@@ -325,133 +401,25 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 		return nil, fmt.Errorf("target worker subject is empty")
 	}
 
-	maxRetriesStr := os.Getenv("MAX_INFERENCE_RETRIES")
-	maxRetries := 3
-	if maxRetriesStr != "" {
-		if val, err := strconv.Atoi(maxRetriesStr); err == nil {
-			maxRetries = val
-		}
-	}
-
-	timeoutSecStr := os.Getenv("WORKER_RESPONSE_TIMEOUT_SEC")
-	timeoutSec := 300
-	if timeoutSecStr != "" {
-		if val, err := strconv.Atoi(timeoutSecStr); err == nil {
-			timeoutSec = val
-		}
-	}
-
-	schemaStr := req.NodeConfig.ExpectedSchema
-	compiler := schemautil.SetupRelaxedCompiler()
-	var schema *jsonschema.Schema
-	if schemaStr != "" {
-		var err error
-		if err = compiler.AddResource("schema.json", strings.NewReader(schemaStr)); err != nil {
-			return nil, fmt.Errorf("invalid expected schema format: %w", err)
-		}
-		schema, err = compiler.Compile("schema.json")
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile expected schema: %w", err)
-		}
-	}
-
 	reqBytes, err := proto.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	replySubj := fmt.Sprintf("orchestrator.response.%s.%s", e.clientID, uuid.New().String())
-	ch := make(chan jetstream.Msg, 1)
-	e.pending.Store(replySubj, ch)
-	defer e.pending.Delete(replySubj)
+	replySubj := fmt.Sprintf("orchestrator.response.%s.%s", e.clientID, req.Identity.GetJobId())
 
-	var lastErr error
-	var rawJson string
-	var lastContract *pb.ErrorContract
-	var lastTransient bool
+	msgID := uuid.New().String()
+	nMsg := nats.NewMsg(subject)
+	nMsg.Reply = replySubj
+	nMsg.Header = make(nats.Header)
+	nMsg.Header.Set("Reply-Subject", replySubj)
+	nMsg.Data = reqBytes
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		msgID := uuid.New().String()
-		nMsg := nats.NewMsg(subject)
-		nMsg.Reply = replySubj
-		nMsg.Header = make(nats.Header)
-		nMsg.Header.Set("Reply-Subject", replySubj)
-		nMsg.Data = reqBytes
-
-		_, err := e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
-		if err != nil {
-			logger.Error("Engine", "Failed to publish to %s on attempt %d: %v", subject, attempt, err)
-			lastErr = err
-			continue
-		}
-
-		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("context cancelled during worker execution wait: %w", ctx.Err())
-		case <-timer.C:
-			timer.Stop()
-			logger.Warn("Engine", "Timeout waiting for worker response on attempt %d", attempt)
-			lastErr = fmt.Errorf("timeout waiting for worker response")
-			continue
-		case respMsg := <-ch:
-			timer.Stop()
-			respMsg.Ack()
-
-			var resp pb.PerformActionResponse
-			if err := proto.Unmarshal(respMsg.Data(), &resp); err != nil {
-				rawJson = cleanJSON(string(respMsg.Data()))
-			} else {
-				if !resp.Success {
-					contract := resp.GetErrorContract()
-					errMsg := "unknown worker error"
-					if contract != nil && contract.GetMessage() != "" {
-						errMsg = contract.GetMessage()
-					}
-					logger.Warn("Engine", "Worker returned error on attempt %d: %s", attempt, errMsg)
-					
-					lastErr = fmt.Errorf("worker error: %s", errMsg)
-					lastContract = contract
-					lastTransient = resp.GetIsTransientError()
-					
-					if !lastTransient {
-						return &StepResult{
-							ErrorContract:    lastContract,
-							IsTransientError: lastTransient,
-						}, fmt.Errorf("%w: deterministic fatal error from worker: %w", ErrPendingHumanValidation, lastErr)
-					}
-					continue
-				}
-				rawJson = cleanJSON(resp.GetActionResultJson())
-			}
-
-			if schema != nil {
-				var doc any
-				if err := json.Unmarshal([]byte(rawJson), &doc); err != nil {
-					logger.Warn("Engine", "Failed to unmarshal worker JSON on attempt %d: %v", attempt, err)
-					lastErr = fmt.Errorf("failed to unmarshal result: %w", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-
-				if err := schema.Validate(doc); err != nil {
-					logger.Warn("Engine", "JSON validation failed on attempt %d: %v", attempt, err)
-					lastErr = fmt.Errorf("schema validation failed: %w", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-			}
-
-			return &StepResult{
-				OutputJSON: rawJson,
-			}, nil
-		}
+	_, err = e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
+	if err != nil {
+		logger.Error("Engine", "Failed to publish to %s: %v", subject, err)
+		return nil, fmt.Errorf("failed to publish to worker: %w", err)
 	}
 
-	logger.Error("Engine", "Generic step failed after %d retries. Last error: %v", maxRetries, lastErr)
-	return &StepResult{
-		ErrorContract:    lastContract,
-		IsTransientError: lastTransient,
-	}, fmt.Errorf("%w: max inference retries reached: %w", ErrPendingHumanValidation, lastErr)
+	return nil, ErrAsyncPending
 }
