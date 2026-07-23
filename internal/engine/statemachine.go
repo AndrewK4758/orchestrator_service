@@ -95,20 +95,20 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 	setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	streamName := "WORKER_RESPONSES"
+	streamName := "ORCHESTRATOR_RESPONSES"
 	_, err = js.Stream(setupCtx, streamName)
 	if err != nil {
 		_, err = js.CreateStream(setupCtx, jetstream.StreamConfig{
 			Name:     streamName,
-			Subjects: []string{"worker.response.>"},
+			Subjects: []string{"orchestrator.response.>"},
 		})
 		if err != nil {
-			logger.Warn("System", "Failed to create WORKER_RESPONSES stream: %v", err)
-			return nil, fmt.Errorf("failed to create WORKER_RESPONSES stream: %w", err)
+			logger.Warn("System", "Failed to create ORCHESTRATOR_RESPONSES stream: %v", err)
+			return nil, fmt.Errorf("failed to create ORCHESTRATOR_RESPONSES stream: %w", err)
 		}
 	}
 
-	subSubject := fmt.Sprintf("worker.response.%s.>", clientID)
+	subSubject := fmt.Sprintf("orchestrator.response.%s.>", clientID)
 	cons, err := js.CreateOrUpdateConsumer(setupCtx, streamName, jetstream.ConsumerConfig{
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		FilterSubject: subSubject,
@@ -159,7 +159,7 @@ func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targe
 	}
 
 	if jsonStr != "" {
-		var parsed map[string]any
+		var parsed any
 		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
 			return fmt.Errorf("malformed JSON in global state merge: %w", err)
 		}
@@ -170,14 +170,22 @@ func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targe
 
 		m := req.GlobalState.AsMap()
 		if targetKey != "" {
-			if existing, ok := m[targetKey].(map[string]any); ok {
-				deepMerge(existing, parsed)
-				m[targetKey] = existing
+			if parsedMap, isParsedMap := parsed.(map[string]any); isParsedMap {
+				if existing, ok := m[targetKey].(map[string]any); ok {
+					deepMerge(existing, parsedMap)
+					m[targetKey] = existing
+				} else {
+					m[targetKey] = parsedMap
+				}
 			} else {
 				m[targetKey] = parsed
 			}
 		} else {
-			deepMerge(m, parsed)
+			if parsedMap, isParsedMap := parsed.(map[string]any); isParsedMap {
+				deepMerge(m, parsedMap)
+			} else {
+				return fmt.Errorf("cannot merge non-object JSON into global root state without a targetKey")
+			}
 		}
 
 		newState, err := structpb.NewStruct(m)
@@ -257,6 +265,16 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 	lastStepName := req.NodeConfig.NodeName
 	lastStepId := req.StepId
 
+	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:   uuid.New().String(),
+		EventType: events.EventActionStarted,
+		Timestamp: time.Now(),
+		TenantID:  req.Identity.GetTenantId(),
+		AppID:     req.Identity.GetAppId(),
+		JobID:     req.Identity.GetJobId(),
+		JobAction: lastStepName,
+	})
+
 	res, err := e.executeGenericStep(ctx, req)
 	if err != nil {
 		if res == nil {
@@ -264,6 +282,18 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 		}
 		res.StepName = lastStepName
 		res.StepId = lastStepId
+		
+		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+			EventID:   uuid.New().String(),
+			EventType: events.EventActionFailed,
+			Timestamp: time.Now(),
+			TenantID:  req.Identity.GetTenantId(),
+			AppID:     req.Identity.GetAppId(),
+			JobID:     req.Identity.GetJobId(),
+			JobAction: lastStepName,
+			Error:     err.Error(),
+		})
+
 		return res, fmt.Errorf("failed to execute generic step: %w", err)
 	}
 
@@ -275,6 +305,16 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 	res.FinalJSON = string(finalJSON)
 	res.StepName = lastStepName
 	res.StepId = lastStepId
+
+	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
+		EventID:   uuid.New().String(),
+		EventType: events.EventActionCompleted,
+		Timestamp: time.Now(),
+		TenantID:  req.Identity.GetTenantId(),
+		AppID:     req.Identity.GetAppId(),
+		JobID:     req.Identity.GetJobId(),
+		JobAction: lastStepName,
+	})
 
 	return res, nil
 }
@@ -320,7 +360,7 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	replySubj := fmt.Sprintf("worker.response.%s.%s", e.clientID, uuid.New().String())
+	replySubj := fmt.Sprintf("orchestrator.response.%s.%s", e.clientID, uuid.New().String())
 	ch := make(chan jetstream.Msg, 1)
 	e.pending.Store(replySubj, ch)
 	defer e.pending.Delete(replySubj)
@@ -390,12 +430,16 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 				var doc any
 				if err := json.Unmarshal([]byte(rawJson), &doc); err != nil {
 					logger.Warn("Engine", "Failed to unmarshal worker JSON on attempt %d: %v", attempt, err)
-					return nil, fmt.Errorf("failed to unmarshal result: %w", err)
+					lastErr = fmt.Errorf("failed to unmarshal result: %w", err)
+					time.Sleep(1 * time.Second)
+					continue
 				}
 
 				if err := schema.Validate(doc); err != nil {
 					logger.Warn("Engine", "JSON validation failed on attempt %d: %v", attempt, err)
-					return nil, fmt.Errorf("schema validation failed: %w", err)
+					lastErr = fmt.Errorf("schema validation failed: %w", err)
+					time.Sleep(1 * time.Second)
+					continue
 				}
 			}
 

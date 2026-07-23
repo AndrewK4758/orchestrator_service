@@ -22,6 +22,7 @@ const (
 	StreamTraceEvents   = "TRACE_EVENTS"
 	StreamWebhooks      = "WEBHOOKS"
 	StreamCacheRequests = "CACHE_REQUESTS"
+	StreamWorkers       = "WORKERS"
 
 	KVActiveJobs         = "active_jobs"
 	KVCacheRequestsStore = "cache.requests.store"
@@ -73,11 +74,22 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update webhooks stream: %w", err)
 	}
 
+	// Ensure the Workers Stream exists
+	workersStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      StreamWorkers,
+		Subjects:  []string{"worker.>", "ai.action.>"},
+		Retention: jetstream.WorkQueuePolicy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update workers stream: %w", err)
+	}
+
 	if os.Getenv("PURGE_QUEUE_ON_STARTUP") == "true" {
-		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, and WEBHOOKS streams on startup...")
+		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, WEBHOOKS, and WORKERS streams on startup...")
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
 		_ = webhooksStream.Purge(ctx)
+		_ = workersStream.Purge(ctx)
 		_ = js.DeleteKeyValue(ctx, KVActiveJobs)
 	}
 
@@ -199,7 +211,7 @@ func (p *Publisher) LogQueueSizeAsync(parentCtx context.Context, action string, 
 func (p *Publisher) PurgeQueues(ctx context.Context) error {
 	logger.Info("Publisher", "Purging all relevant JetStream queues...")
 
-	streams := []string{StreamJobs, StreamTraceEvents, StreamCacheRequests}
+	streams := []string{StreamJobs, StreamTraceEvents, StreamCacheRequests, StreamWorkers}
 	for _, streamName := range streams {
 		stream, err := p.js.Stream(ctx, streamName)
 		if err == nil {
@@ -384,7 +396,15 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 		return fmt.Errorf("failed to marshal webhook payload: %w", err)
 	}
 
-	_, err = p.js.Publish(ctx, "webhooks.callback", data)
+	msgId := fmt.Sprintf("%s-%s", payload.JobId, payload.LastStepId)
+	msg := &nats.Msg{
+		Subject: "webhooks.callback",
+		Data:    data,
+		Header:  nats.Header{},
+	}
+	msg.Header.Set(nats.MsgIdHdr, msgId)
+
+	_, err = p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish webhook to jetstream: %w", err)
 	}

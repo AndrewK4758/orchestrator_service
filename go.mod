@@ -1,6 +1,6 @@
 module orchestrator_service
 
-go 1.26.4
+go 1.23.0
 
 require (
 	buf.build/go/protovalidate v1.2.0

@@ -51,6 +51,7 @@ type WebhookEvent struct {
 	ReqBytes           []byte `json:"req_bytes"`
 	StepOutputJSON     string `json:"step_output_json"`
 	ErrorContractBytes []byte `json:"error_contract_bytes"`
+	JobId              string `json:"job_id"`
 	LastStepId         string `json:"last_step_id"`
 	IsSuspended        bool   `json:"is_suspended"`
 }

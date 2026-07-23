@@ -318,6 +318,7 @@ func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *
 	evt := &events.WebhookEvent{
 		ReqBytes:           reqBytes,
 		StepOutputJSON:     res.OutputJSON,
+		JobId:              req.GetIdentity().GetJobId(),
 		LastStepId:         res.StepId,
 		IsSuspended:        true,
 		ErrorContractBytes: contractBytes,
@@ -350,6 +351,7 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		ReqBytes:           reqBytes,
 		StepOutputJSON:     res.OutputJSON,
 		ErrorContractBytes: contractBytes,
+		JobId:              req.GetIdentity().GetJobId(),
 		LastStepId:         res.StepId,
 	}
 
