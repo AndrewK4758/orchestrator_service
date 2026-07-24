@@ -18,6 +18,8 @@ import (
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
 
+	"github.com/santhosh-tekuri/jsonschema/v5"
+
 	pb "github.com/AndrewK4758/shared_protos"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -249,15 +251,36 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		if err != nil {
 			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", jobID, req.StepId, err)
 		} else if cacheResp.Hit {
-			logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
-			if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
-				logger.Error("Server", "Failed to merge cache state context: %v", err)
+			validCacheHit := true
+			if req.NodeConfig != nil && req.NodeConfig.ExpectedSchema != "" {
+				compiler := jsonschema.NewCompiler()
+				if err := compiler.AddResource("schema.json", strings.NewReader(req.NodeConfig.ExpectedSchema)); err == nil {
+					if schema, err := compiler.Compile("schema.json"); err == nil {
+						var v interface{}
+						if err := json.Unmarshal([]byte(cacheResp.ExtractedPayload), &v); err == nil {
+							if err := schema.Validate(v); err != nil {
+								logger.Warn("Server", "[JobID: %s | StepID: %s] CACHE HIT payload failed schema validation: %v. Treating as cache miss.", jobID, req.StepId, err)
+								validCacheHit = false
+							}
+						} else {
+							logger.Warn("Server", "[JobID: %s | StepID: %s] CACHE HIT payload is not valid JSON. Treating as cache miss.", jobID, req.StepId)
+							validCacheHit = false
+						}
+					}
+				}
 			}
-			err := s.fireCallback(execCtx, req, &engine.StepResult{OutputJSON: cacheResp.ExtractedPayload, StepId: req.StepId})
-			if err != nil {
-				return fmt.Errorf("failed to fire callback for cache hit: %w", err)
+
+			if validCacheHit {
+				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
+				if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
+					logger.Error("Server", "Failed to merge cache state context: %v", err)
+				}
+				err := s.fireCallback(execCtx, req, &engine.StepResult{OutputJSON: cacheResp.ExtractedPayload, StepId: req.StepId})
+				if err != nil {
+					return fmt.Errorf("failed to fire callback for cache hit: %w", err)
+				}
+				return nil
 			}
-			return nil
 		}
 
 		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)

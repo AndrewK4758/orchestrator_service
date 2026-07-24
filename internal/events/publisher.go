@@ -15,6 +15,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -179,6 +180,20 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, identity *pb.Infrast
 	}
 	p.LogQueueSizeAsync(ctx, "Enqueue", "orchestrator_priority_consumer")
 	return nil
+}
+
+// PublishAction sends a job request back to a worker queue.
+func (p *Publisher) PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error {
+	subject := req.NodeConfig.TargetWorkerSubject
+	if subject == "" {
+		return fmt.Errorf("TargetWorkerSubject is empty")
+	}
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest: %w", err)
+	}
+	_, err = p.js.Publish(ctx, subject, reqBytes)
+	return err
 }
 
 func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {

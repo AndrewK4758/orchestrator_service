@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v5"
 
 	"orchestrator_service/internal/events"
 	"github.com/AndrewK4758/shared_utils/logger"
@@ -28,7 +31,8 @@ var ErrAsyncPending = errors.New("async execution pending")
 type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 	PublishCacheStore(ctx context.Context, data []byte) error
-	PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error
+	PublishWebhook(ctx context.Context, event *events.WebhookEvent) error
+	PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error
 }
 
 type AIClient interface {
@@ -161,6 +165,41 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 				logger.Warn("Engine", "Worker returned error asynchronously: %v", errContract)
 			} else {
 				rawJson = cleanJSON(resp.GetActionResultJson())
+			}
+		}
+
+		if errContract == nil && req.NodeConfig != nil && req.NodeConfig.ExpectedSchema != "" {
+			compiler := jsonschema.NewCompiler()
+			if err := compiler.AddResource("schema.json", strings.NewReader(req.NodeConfig.ExpectedSchema)); err == nil {
+				if schema, err := compiler.Compile("schema.json"); err == nil {
+					var v interface{}
+					if err := json.Unmarshal([]byte(rawJson), &v); err == nil {
+						if err := schema.Validate(v); err != nil {
+							req.InferenceRetryCount++
+							maxRetries := int32(3)
+							if envMax := os.Getenv("MAX_INFERENCE_RETRIES"); envMax != "" {
+								if m, e := strconv.Atoi(envMax); e == nil {
+									maxRetries = int32(m)
+								}
+							}
+							
+							if req.InferenceRetryCount < maxRetries {
+								logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
+								req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
+								
+								if reqBytes, err := proto.Marshal(req); err == nil {
+									_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
+								}
+								_ = e.pub.PublishAction(context.Background(), req)
+								return
+							} else {
+								logger.Error("Engine", "Validation retry exhausted: %v", err)
+								errContract = &pb.ErrorContract{Code: "400", Message: "ValidationRetryExhausted: " + err.Error()}
+								resp.Success = false
+							}
+						}
+					}
+				}
 			}
 		}
 
