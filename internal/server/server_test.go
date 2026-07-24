@@ -59,6 +59,9 @@ func (m *mockPublisher) PublishTrace(ctx context.Context, event events.Traceabil
 	return nil
 }
 func (m *mockPublisher) PublishCacheStore(ctx context.Context, data []byte) error { return nil }
+func (m *mockPublisher) PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error {
+	return nil
+}
 func (m *mockPublisher) PublishJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
@@ -296,6 +299,16 @@ func (m *mockCacheClient) SeedCache(ctx context.Context, in *pb.SeedCacheRequest
 	return &pb.SeedCacheResponse{Success: true}, nil
 }
 
+func (m *mockCacheClient) RegisterBlankDocument(ctx context.Context, in *pb.RegisterBlankDocumentRequest, opts ...grpc.CallOption) (*pb.RegisterBlankDocumentResponse, error) {
+	return &pb.RegisterBlankDocumentResponse{
+		Success: true,
+	}, nil
+}
+
+func (m *mockCacheClient) QueryBlankDocument(ctx context.Context, in *pb.QueryBlankDocumentRequest, opts ...grpc.CallOption) (*pb.QueryBlankDocumentResponse, error) {
+	return &pb.QueryBlankDocumentResponse{}, nil
+}
+
 func (m *mockCacheClient) CheckMetadataExists(ctx context.Context, in *pb.CheckMetadataRequest, opts ...grpc.CallOption) (*pb.CheckMetadataResponse, error) {
 	return &pb.CheckMetadataResponse{Exists: true}, nil
 }
@@ -412,10 +425,10 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 			correctedJson: `{"unknown_top_level": {"nested": "value"}, "list_field": [1,2,3]}`,
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
-					Identity:    &pb.InfrastructureIdentity{JobId: "job_merge", TenantId: "tenant_1", AppId: "app_1"},
-					StepId:      "step_merge",
+					Identity:        &pb.InfrastructureIdentity{JobId: "job_merge", TenantId: "tenant_1", AppId: "app_1"},
+					StepId:          "step_merge",
 					CallbackAddress: "localhost",
-					GlobalState: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+					GlobalState:     &structpb.Struct{Fields: map[string]*structpb.Value{}},
 				}
 				initialReqBytes, _ := proto.Marshal(initialReq)
 				kv.getFn = func(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
@@ -436,8 +449,8 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 			correctedJson: `{"msg": "success"}`,
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
-					Identity:   &pb.InfrastructureIdentity{JobId: "job_success", TenantId: "tenant_1", AppId: "app_1"},
-					StepId:     "step_success",
+					Identity:        &pb.InfrastructureIdentity{JobId: "job_success", TenantId: "tenant_1", AppId: "app_1"},
+					StepId:          "step_success",
 					CallbackAddress: "localhost",
 				}
 				initialReqBytes, _ := proto.Marshal(initialReq)
@@ -502,11 +515,11 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 
 func TestOrchestratorServer_PurgeSystemState(t *testing.T) {
 	tests := []struct {
-		name          string
-		appID         string
-		purgeQueues   bool
-		setupActive   func(*OrchestratorServer) *bool
-		validate      func(*testing.T, *OrchestratorServer, *pb.PurgeSystemStateResponse, *bool)
+		name        string
+		appID       string
+		purgeQueues bool
+		setupActive func(*OrchestratorServer) *bool
+		validate    func(*testing.T, *OrchestratorServer, *pb.PurgeSystemStateResponse, *bool)
 	}{
 		{
 			name:        "TestPurgeSystemState_WithActiveExecs",

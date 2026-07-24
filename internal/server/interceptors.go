@@ -26,10 +26,10 @@ func ValidationInterceptor(v protovalidate.Validator) grpc.UnaryServerIntercepto
 			var valErr *protovalidate.ValidationError
 			if errors.As(err, &valErr) {
 				st := status.New(codes.InvalidArgument, "Request validation failed")
-				
+
 				// Map protovalidate violations to gRPC errdetails.BadRequest
 				badReq := &errdetails.BadRequest{}
-				
+
 				for _, violation := range valErr.Violations {
 					badReq.FieldViolations = append(badReq.FieldViolations, &errdetails.BadRequest_FieldViolation{
 						Field:       string(violation.FieldDescriptor.Name()),

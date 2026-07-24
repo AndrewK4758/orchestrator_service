@@ -7,12 +7,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/AndrewK4758/shared_utils/envutil"
+
 	"github.com/AndrewK4758/shared_utils/logger"
 
 	"strconv"
 	"time"
 
-	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
@@ -31,9 +32,9 @@ import (
 func main() {
 	logger.InitLogger()
 	// Attempt to load .env, ignore error if it doesn't exist
-	_ = godotenv.Load()
+	envutil.LoadEnv(".env", "orchestrator_service/.env", "../.env", "../../.env")
 
-	port := os.Getenv("PORT")
+	port := envutil.GetStringOrDefault("PORT", "")
 	if port == "" {
 		port = "50052" // Using 50052 since ai_service uses 50051
 	}
@@ -44,7 +45,7 @@ func main() {
 	}
 
 	// Connect to NATS JetStream
-	natsURL := os.Getenv("NATS_URL")
+	natsURL := envutil.GetStringOrDefault("NATS_URL", "")
 	if natsURL == "" {
 		natsURL = "nats://localhost:4222"
 	}
@@ -66,13 +67,13 @@ func main() {
 	defer pub.Close()
 
 	// Connect to Traceability Service
-	traceabilityAddr := os.Getenv("TRACEABILITY_SERVICE_ADDRESS")
+	traceabilityAddr := envutil.GetStringOrDefault("TRACEABILITY_SERVICE_ADDRESS", "")
 	if traceabilityAddr == "" {
 		traceabilityAddr = "localhost:50053" // Default for local
 	}
 
 	maxMsgSizeMb := 100
-	if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+	if envVal := envutil.GetStringOrDefault("GRPC_MAX_MESSAGE_SIZE_MB", ""); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			maxMsgSizeMb = parsed
 		}

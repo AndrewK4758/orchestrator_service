@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"github.com/AndrewK4758/shared_utils/envutil"
 	"github.com/AndrewK4758/shared_utils/logger"
-	"os"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,7 +78,7 @@ func sanitizeMsgId(id string) string {
 }
 
 func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
-	cacheClient, _, err := cache_client.NewClient(os.Getenv("SEMANTIC_CACHE_SERVICE_ADDRESS"))
+	cacheClient, _, err := cache_client.NewClient(envutil.GetStringOrDefault("SEMANTIC_CACHE_SERVICE_ADDRESS", ""))
 	if err != nil {
 		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
 	}
@@ -94,7 +94,7 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		panic(fmt.Errorf("failed to initialize engine: %w", err))
 	}
 
-	docProcAddr := os.Getenv("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
+	docProcAddr := envutil.GetStringOrDefault("DOCUMENT_PROCESSING_SERVICE_ADDRESS", "")
 	if docProcAddr == "" {
 		docProcAddr = "127.0.0.1:50054"
 	}
@@ -232,7 +232,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, req.StepId, req.NodeConfig.Cache.CollectionName)
 
 		timeoutSecs := 120
-		if envVal := os.Getenv("CACHE_TIMEOUT_SECONDS"); envVal != "" {
+		if envVal := envutil.GetStringOrDefault("CACHE_TIMEOUT_SECONDS", ""); envVal != "" {
 			if parsed, err := strconv.Atoi(envVal); err == nil {
 				timeoutSecs = parsed
 			}
@@ -286,9 +286,13 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
 	}
 
-	// Save request to KV store for async hydration
+	// Save request to KV store for async hydration (with deduplication check)
 	reqBytes, marshalErr := proto.Marshal(req)
 	if marshalErr == nil && s.kvStore != nil {
+		if _, err := s.kvStore.Get(execCtx, jobID); err == nil {
+			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for job already waiting in KV store. Ignoring.", jobID, req.StepId)
+			return nil
+		}
 		_, _ = s.kvStore.Put(execCtx, jobID, reqBytes)
 	}
 
@@ -314,7 +318,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 				}
 			}
 			s.handleCallbackError(execCtx, err.Error(), req)
-			
+
 			// We MUST fire the Job Suspended webhook here explicitly
 			var contractBytes []byte
 			if res != nil && res.ErrorContract != nil {
@@ -332,7 +336,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 
 			return nil
 		}
-		
+
 		s.handleCallbackError(execCtx, err.Error(), req)
 		return s.fireCallback(execCtx, req, res)
 	}
@@ -549,7 +553,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		conn, ok = s.webhookConns[cbAddress]
 		if !ok {
 			maxMsgSizeMb := 100
-			if envVal := os.Getenv("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
+			if envVal := envutil.GetStringOrDefault("GRPC_MAX_MESSAGE_SIZE_MB", ""); envVal != "" {
 				if parsed, err := strconv.Atoi(envVal); err == nil {
 					maxMsgSizeMb = parsed
 				}
@@ -568,7 +572,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	client := pb.NewOrchestratorCallbackServiceClient(conn)
 
 	timeoutSecs := 10
-	if envVal := os.Getenv("GRPC_TIMEOUT_SECONDS"); envVal != "" {
+	if envVal := envutil.GetStringOrDefault("GRPC_TIMEOUT_SECONDS", ""); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			timeoutSecs = parsed
 		}

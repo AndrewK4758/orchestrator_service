@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"orchestrator_service/internal/events"
 	"github.com/nats-io/nats.go/jetstream"
+	"orchestrator_service/internal/events"
 )
 
 func main() {

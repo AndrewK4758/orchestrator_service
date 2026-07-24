@@ -14,8 +14,9 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
 	"orchestrator_service/internal/events"
-	"github.com/AndrewK4758/shared_utils/logger"
 
+	"github.com/AndrewK4758/shared_utils/logger"
+	"github.com/AndrewK4758/shared_utils/natsutil"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/google/uuid"
@@ -48,10 +49,7 @@ type StepResult struct {
 	IsTransientError bool
 }
 
-type EngState struct {
-	Req   *pb.ExecuteWorkflowNodeRequest
-	JobId string
-}
+
 
 type Engine struct {
 	aiClient         AIClient
@@ -123,8 +121,15 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 	}
 
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		startTime := time.Now()
+		meta, _ := msg.Metadata()
+		var attempt uint64 = 1
+		if meta != nil {
+			attempt = meta.NumDelivered
+		}
+
 		replySubj := msg.Subject()
-		
+
 		parts := strings.Split(replySubj, ".")
 		if len(parts) < 4 {
 			msg.Ack()
@@ -151,7 +156,33 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 			return
 		}
 
+		t, a, j := natsutil.ExtractIdentity(req.Identity)
+		natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+			Component: "Orchestrator",
+			Event:     "DEQUEUED",
+			Stream:    "ORCHESTRATOR_RESPONSES",
+			Subject:   replySubj,
+			Consumer:  e.clientID,
+			TenantID:  t,
+			AppID:     a,
+			JobID:     j,
+			SizeBytes: len(msg.Data()),
+			Attempt:   attempt,
+		})
+
 		msg.Ack()
+		natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+			Component:  "Orchestrator",
+			Event:      "ACKNOWLEDGED",
+			Stream:     "ORCHESTRATOR_RESPONSES",
+			Subject:    replySubj,
+			Consumer:   e.clientID,
+			TenantID:   t,
+			AppID:      a,
+			JobID:      j,
+			Attempt:    attempt,
+			DurationMs: time.Since(startTime).Milliseconds(),
+		})
 
 		var resp pb.PerformActionResponse
 		var rawJson string
@@ -172,7 +203,7 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 			compiler := jsonschema.NewCompiler()
 			if err := compiler.AddResource("schema.json", strings.NewReader(req.NodeConfig.ExpectedSchema)); err == nil {
 				if schema, err := compiler.Compile("schema.json"); err == nil {
-					var v interface{}
+					var v any
 					if err := json.Unmarshal([]byte(rawJson), &v); err == nil {
 						if err := schema.Validate(v); err != nil {
 							req.InferenceRetryCount++
@@ -182,11 +213,11 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 									maxRetries = int32(m)
 								}
 							}
-							
+
 							if req.InferenceRetryCount < maxRetries {
 								logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
 								req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
-								
+
 								if reqBytes, err := proto.Marshal(req); err == nil {
 									_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
 								}
@@ -211,7 +242,7 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 			eventType = events.EventActionFailed
 			errMsg = errContract.GetMessage()
 		}
-		
+
 		_ = e.pub.PublishTrace(context.Background(), events.TraceabilityEvent{
 			EventID:   uuid.New().String(),
 			EventType: eventType,
@@ -238,9 +269,9 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 			}
 			_ = e.pub.PublishWebhook(context.Background(), evt)
 		}
-		
-		_ = e.kvStore.Delete(context.Background(), jobID)
 
+		_ = e.kvStore.Delete(context.Background(), jobID)
+		msg.Ack()
 	}, jetstream.PullMaxMessages(100))
 	if err != nil {
 		logger.Error("System", "Failed to consume JS messages: %v", err)
@@ -397,7 +428,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 		}
 		res.StepName = lastStepName
 		res.StepId = lastStepId
-		
+
 		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 			EventID:   uuid.New().String(),
 			EventType: events.EventActionFailed,
@@ -447,7 +478,7 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 
 	replySubj := fmt.Sprintf("orchestrator.response.%s.%s", e.clientID, req.Identity.GetJobId())
 
-	msgID := uuid.New().String()
+	msgID := fmt.Sprintf("%s-%s", req.Identity.GetJobId(), req.StepId)
 	nMsg := nats.NewMsg(subject)
 	nMsg.Reply = replySubj
 	nMsg.Header = make(nats.Header)
@@ -455,6 +486,19 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	nMsg.Data = reqBytes
 
 	_, err = e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
+	t, a, j := natsutil.ExtractIdentity(req.Identity)
+	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+		Component: "Orchestrator",
+		Event:     "ENQUEUED",
+		Stream:    "WORKERS",
+		Subject:   subject,
+		TenantID:  t,
+		AppID:     a,
+		JobID:     j,
+		MsgID:     msgID,
+		SizeBytes: len(reqBytes),
+		Error:     err,
+	})
 	if err != nil {
 		logger.Error("Engine", "Failed to publish to %s: %v", subject, err)
 		return nil, fmt.Errorf("failed to publish to worker: %w", err)

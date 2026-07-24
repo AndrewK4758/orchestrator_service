@@ -3,12 +3,14 @@ package ai_client
 import (
 	"context"
 	"fmt"
-	"github.com/AndrewK4758/shared_utils/logger"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AndrewK4758/shared_utils/envutil"
+	"github.com/AndrewK4758/shared_utils/logger"
+	"github.com/AndrewK4758/shared_utils/natsutil"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
@@ -31,7 +33,7 @@ type Client struct {
 func NewClient(ctx context.Context, natsURL string) (*Client, error) {
 	logger.Info("System", "Connecting to NATS at %s for AI Service...", natsURL)
 
-	nc, err := nats.Connect(natsURL)
+	nc, err := natsutil.ConnectWithRetries(natsURL, "Orchestrator")
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
@@ -180,12 +182,24 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	msg.Data = reqBytes
 
 	_, err = c.js.PublishMsg(ctx, msg)
+	t, a, j := natsutil.ExtractIdentity(workflowCtx.GetIdentity())
+	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+		Component: "Orchestrator",
+		Event:     "ENQUEUED",
+		Stream:    "WORKERS",
+		Subject:   subject,
+		TenantID:  t,
+		AppID:     a,
+		JobID:     j,
+		SizeBytes: len(reqBytes),
+		Error:     err,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish to JetStream %s: %w", subject, err)
 	}
 
 	timeoutSecs := 300 // 5 minutes default
-	if envVal := os.Getenv("NATS_TIMEOUT_SECONDS"); envVal != "" {
+	if envVal := envutil.GetStringOrDefault("NATS_TIMEOUT_SECONDS", ""); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			timeoutSecs = parsed
 		}
@@ -203,8 +217,27 @@ func (c *Client) PerformAction(ctx context.Context, workflowCtx *aipb.ExecuteWor
 	}
 
 	// Acknowledge the JetStream message
+	meta, _ := respMsg.Metadata()
+	var attempt uint64 = 1
+	if meta != nil {
+		attempt = meta.NumDelivered
+	}
+	respT, respA, respJ := natsutil.ExtractIdentityFromAiResponseSubject(respMsg.Subject())
 	if err := respMsg.Ack(); err != nil {
 		logger.Warn("System", "failed to ack AI response message: %v", err)
+	} else {
+		natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+			Component: "Orchestrator",
+			Event:     "ACKNOWLEDGED",
+			Stream:    "AI_RESPONSES",
+			Subject:   respMsg.Subject(),
+			Consumer:  c.clientID,
+			TenantID:  respT,
+			AppID:     respA,
+			JobID:     respJ,
+			SizeBytes: len(respMsg.Data()),
+			Attempt:   attempt,
+		})
 	}
 
 	resp := &aipb.PerformActionResponse{}
