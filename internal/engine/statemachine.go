@@ -266,6 +266,7 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 				ErrorContractBytes: contractBytes,
 				JobId:              req.GetIdentity().GetJobId(),
 				LastStepId:         req.StepId,
+				IsSuspended:        errContract != nil && strings.HasPrefix(errContract.Message, "ValidationRetryExhausted"),
 			}
 			_ = e.pub.PublishWebhook(context.Background(), evt)
 		}

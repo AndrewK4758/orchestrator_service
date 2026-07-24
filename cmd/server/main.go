@@ -30,9 +30,9 @@ import (
 )
 
 func main() {
-	logger.InitLogger()
 	// Attempt to load .env, ignore error if it doesn't exist
 	envutil.LoadEnv(".env", "orchestrator_service/.env", "../.env", "../../.env")
+	logger.InitLogger()
 
 	port := envutil.GetStringOrDefault("PORT", "")
 	if port == "" {
