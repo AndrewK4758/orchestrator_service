@@ -21,11 +21,13 @@ import (
 )
 
 const (
-	StreamJobs          = "JOBS"
-	StreamTraceEvents   = "TRACE_EVENTS"
-	StreamWebhooks      = "WEBHOOKS"
-	StreamCacheRequests = "CACHE_REQUESTS"
-	StreamWorkers       = "WORKERS"
+	StreamJobs                  = "JOBS"
+	StreamTraceEvents           = "TRACE_EVENTS"
+	StreamWebhooks              = "WEBHOOKS"
+	StreamCacheRequests         = "CACHE_REQUESTS"
+	StreamWorkers               = "WORKERS"
+	StreamAiResponses           = "AI_RESPONSES"
+	StreamOrchestratorResponses = "ORCHESTRATOR_RESPONSES"
 
 	KVActiveJobs         = "active_jobs"
 	KVCacheRequestsStore = "cache.requests.store"
@@ -87,12 +89,40 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update workers stream: %w", err)
 	}
 
+	// Ensure the AI_RESPONSES Stream exists
+	aiResponsesStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     StreamAiResponses,
+		Subjects: []string{"ai.responses.>", "ai.response.>"},
+		MaxAge:   1 * time.Hour,
+		MaxBytes: 1024 * 1024 * 1024,
+		MaxMsgs:  100000,
+		Discard:  jetstream.DiscardOld,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update ai_responses stream: %w", err)
+	}
+
+	// Ensure the ORCHESTRATOR_RESPONSES Stream exists
+	orchestratorResponsesStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     StreamOrchestratorResponses,
+		Subjects: []string{"orchestrator.responses.>", "orchestrator.response.>"},
+		MaxAge:   1 * time.Hour,
+		MaxBytes: 1024 * 1024 * 1024,
+		MaxMsgs:  100000,
+		Discard:  jetstream.DiscardOld,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update orchestrator_responses stream: %w", err)
+	}
+
 	if envutil.GetStringOrDefault("PURGE_QUEUE_ON_STARTUP", "") == "true" {
-		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, WEBHOOKS, and WORKERS streams on startup...")
+		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, WEBHOOKS, WORKERS, AI_RESPONSES, and ORCHESTRATOR_RESPONSES streams on startup...")
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
 		_ = webhooksStream.Purge(ctx)
 		_ = workersStream.Purge(ctx)
+		_ = aiResponsesStream.Purge(ctx)
+		_ = orchestratorResponsesStream.Purge(ctx)
 		_ = js.DeleteKeyValue(ctx, KVActiveJobs)
 	}
 

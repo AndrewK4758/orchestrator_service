@@ -96,16 +96,17 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 	defer cancel()
 
 	streamName := "ORCHESTRATOR_RESPONSES"
-	_, err = js.Stream(setupCtx, streamName)
+	_, err = js.CreateOrUpdateStream(setupCtx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{"orchestrator.responses.>", "orchestrator.response.>"},
+		MaxAge:   1 * time.Hour,
+		MaxBytes: 1024 * 1024 * 1024,
+		MaxMsgs:  100000,
+		Discard:  jetstream.DiscardOld,
+	})
 	if err != nil {
-		_, err = js.CreateStream(setupCtx, jetstream.StreamConfig{
-			Name:     streamName,
-			Subjects: []string{"orchestrator.response.>"},
-		})
-		if err != nil {
-			logger.Warn("System", "Failed to create ORCHESTRATOR_RESPONSES stream: %v", err)
-			return nil, fmt.Errorf("failed to create ORCHESTRATOR_RESPONSES stream: %w", err)
-		}
+		logger.Warn("System", "Failed to create or update ORCHESTRATOR_RESPONSES stream: %v", err)
+		return nil, fmt.Errorf("failed to create or update ORCHESTRATOR_RESPONSES stream: %w", err)
 	}
 
 	subSubject := fmt.Sprintf("orchestrator.response.%s.>", clientID)

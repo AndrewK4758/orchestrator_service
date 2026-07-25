@@ -49,17 +49,18 @@ func NewClient(ctx context.Context, natsURL string) (*Client, error) {
 
 	// Ensure AI_RESPONSES stream exists
 	streamName := "AI_RESPONSES"
-	_, err = js.Stream(initCtx, streamName)
+	_, err = js.CreateOrUpdateStream(initCtx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{"ai.responses.>", "ai.response.>"},
+		MaxAge:   1 * time.Hour,
+		MaxBytes: 1024 * 1024 * 1024,
+		MaxMsgs:  100000,
+		Discard:  jetstream.DiscardOld,
+	})
 	if err != nil {
-		_, err = js.CreateStream(initCtx, jetstream.StreamConfig{
-			Name:     streamName,
-			Subjects: []string{"ai.response.>"},
-		})
-		if err != nil {
-			logger.Warn("System", "failed to create AI_RESPONSES stream (might already exist): %v", err)
-		} else {
-			logger.Info("System", "Successfully created JetStream stream: %s", streamName)
-		}
+		logger.Warn("System", "failed to create or update AI_RESPONSES stream: %v", err)
+	} else {
+		logger.Info("System", "Successfully created/updated JetStream stream: %s", streamName)
 	}
 
 	clientID := uuid.New().String()
