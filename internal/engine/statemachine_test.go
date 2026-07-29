@@ -33,10 +33,7 @@ func (m *MockTracePublisher) PublishWebhook(ctx context.Context, event *events.W
 	return args.Error(0)
 }
 
-func (m *MockTracePublisher) PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error {
-	args := m.Called(ctx, req)
-	return args.Error(0)
-}
+
 
 type MockMsg struct {
 	mock.Mock
@@ -99,16 +96,17 @@ type MockKVEntry struct {
 	val []byte
 }
 
-func (m MockKVEntry) Bucket() string       { return "" }
-func (m MockKVEntry) Key() string          { return "" }
-func (m MockKVEntry) Value() []byte        { return m.val }
-func (m MockKVEntry) Revision() uint64     { return 1 }
-func (m MockKVEntry) Created() time.Time   { return time.Now() }
-func (m MockKVEntry) Delta() uint64        { return 0 }
+func (m MockKVEntry) Bucket() string                  { return "" }
+func (m MockKVEntry) Key() string                     { return "" }
+func (m MockKVEntry) Value() []byte                   { return m.val }
+func (m MockKVEntry) Revision() uint64                { return 1 }
+func (m MockKVEntry) Created() time.Time              { return time.Now() }
+func (m MockKVEntry) Delta() uint64                   { return 0 }
 func (m MockKVEntry) Operation() jetstream.KeyValueOp { return jetstream.KeyValuePut }
 
 func TestProcessJetStreamMessage_WebhookFailure_DoesNotAck(t *testing.T) {
 	mockPub := new(MockTracePublisher)
+	mockPub.On("PublishTrace", mock.Anything, mock.Anything).Return(nil)
 	mockKV := new(MockKV)
 	mockMsg := new(MockMsg)
 
@@ -116,11 +114,14 @@ func TestProcessJetStreamMessage_WebhookFailure_DoesNotAck(t *testing.T) {
 		pub:      mockPub,
 		kvStore:  mockKV,
 		clientID: "test-client",
+		maxInferenceRetries: 3,
+		publishMaxRetries: 3,
 	}
 
 	jobID := "job123"
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: jobID},
+		
+		Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: jobID},
 		CallbackAddress: "http://webhook",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName: "Test Node",
@@ -136,7 +137,7 @@ func TestProcessJetStreamMessage_WebhookFailure_DoesNotAck(t *testing.T) {
 
 	// Setup msg
 	mockMsg.On("Subject").Return("orchestrator.response.client." + jobID)
-	
+
 	resp := &pb.PerformActionResponse{
 		Success:          true,
 		ActionResultJson: `{"key":"value"}`,
@@ -158,6 +159,8 @@ func TestProcessJetStreamMessage_WebhookFailure_DoesNotAck(t *testing.T) {
 
 func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 	mockPub := new(MockTracePublisher)
+	mockPub.On("PublishTrace", mock.Anything, mock.Anything).Return(nil)
+	mockPub.On("PublishWebhook", mock.Anything, mock.Anything).Return(nil)
 	mockKV := new(MockKV)
 	mockMsg := new(MockMsg)
 
@@ -165,11 +168,14 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 		pub:      mockPub,
 		kvStore:  mockKV,
 		clientID: "test-client",
+		maxInferenceRetries: 3,
+		publishMaxRetries: 3,
 	}
 
 	jobID := "job123"
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: jobID},
+		
+		Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: jobID},
 		CallbackAddress: "http://webhook",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:            "Test Node",
@@ -184,7 +190,7 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 
 	// In the retry block, it puts the new request in KV and publishes to Action
 	mockKV.On("Put", mock.Anything, jobID, mock.Anything).Return(uint64(2), nil)
-	mockPub.On("PublishAction", mock.Anything, mock.Anything).Return(nil)
+
 
 	// Setup msg with BAD schema (missing 'name' string)
 	mockMsg.On("Subject").Return("orchestrator.response.client." + jobID)
@@ -197,19 +203,23 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 
 	// It should Ack the bad response to remove it from the response stream
 	mockMsg.On("Ack").Return(nil)
+	mockMsg.On("NakWithDelay", mock.Anything).Return(nil)
+	mockMsg.On("Term").Return(nil)
 
 	engine.ProcessJetStreamMessage(mockMsg)
 
 	// Assert KV Put was called to save the incremented retry count
 	mockKV.AssertCalled(t, "Put", mock.Anything, jobID, mock.Anything)
 	// Assert it re-published to worker
-	mockPub.AssertCalled(t, "PublishAction", mock.Anything, mock.Anything)
+
 	// Assert it acked the BAD message so it doesn't loop forever
 	mockMsg.AssertCalled(t, "Ack")
 }
 
 func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T) {
 	mockPub := new(MockTracePublisher)
+	mockPub.On("PublishTrace", mock.Anything, mock.Anything).Return(nil)
+	mockPub.On("PublishWebhook", mock.Anything, mock.Anything).Return(nil)
 	mockKV := new(MockKV)
 	mockMsg := new(MockMsg)
 
@@ -217,11 +227,14 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 		pub:      mockPub,
 		kvStore:  mockKV,
 		clientID: "test-client",
+		maxInferenceRetries: 3,
+		publishMaxRetries: 3,
 	}
 
 	jobID := "job123"
 	req := &pb.ExecuteWorkflowNodeRequest{
-		Identity:        &pb.InfrastructureIdentity{JobId: jobID},
+		
+		Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: jobID},
 		CallbackAddress: "http://webhook",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:            "Test Node",
@@ -235,6 +248,7 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 	mockKV.On("Get", mock.Anything, jobID).Return(MockKVEntry{val: reqBytes}, nil)
 
 	mockPub.On("PublishTrace", mock.Anything, mock.Anything).Return(nil)
+	mockPub.On("PublishWebhook", mock.Anything, mock.Anything).Return(nil)
 	mockPub.On("PublishWebhook", mock.Anything, mock.MatchedBy(func(evt *events.WebhookEvent) bool {
 		return evt.IsSuspended == true
 	})).Return(nil)
@@ -252,6 +266,8 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 	mockMsg.On("Data").Return(respBytes)
 
 	mockMsg.On("Ack").Return(nil)
+	mockMsg.On("NakWithDelay", mock.Anything).Return(nil)
+	mockMsg.On("Term").Return(nil)
 
 	engine.ProcessJetStreamMessage(mockMsg)
 

@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"github.com/AndrewK4758/shared_utils/envutil"
 	"github.com/AndrewK4758/shared_utils/logger"
+	"github.com/AndrewK4758/shared_utils/workflowparser"
 	"io"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"orchestrator_service/internal/ai_client"
+
 	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
@@ -26,7 +26,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
@@ -44,7 +43,6 @@ type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
 
 	eng      *engine.Engine
-	aiClient *ai_client.Client
 	pub      JobPublisher
 
 	kvStore      jetstream.KeyValue
@@ -56,6 +54,10 @@ type OrchestratorServer struct {
 
 	webhookConnMu sync.RWMutex
 	webhookConns  map[string]*grpc.ClientConn
+
+	cacheTimeoutSecs     int
+	grpcMaxMessageSizeMb int
+	grpcTimeoutSecs      int
 }
 
 type JobPublisher interface {
@@ -77,8 +79,12 @@ func sanitizeMsgId(id string) string {
 	return id
 }
 
-func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
-	cacheClient, _, err := cache_client.NewClient(envutil.GetStringOrDefault("SEMANTIC_CACHE_SERVICE_ADDRESS", ""))
+func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
+	cacheTimeout := envutil.MustGetInt("CACHE_TIMEOUT_SECONDS")
+	grpcMaxMsg := envutil.MustGetInt("GRPC_MAX_MESSAGE_SIZE_MB")
+	grpcTimeout := envutil.MustGetInt("GRPC_TIMEOUT_SECONDS")
+
+	cacheClient, _, err := cache_client.NewClient(envutil.MustGetString("SEMANTIC_CACHE_SERVICE_ADDRESS"))
 	if err != nil {
 		logger.Warn("System", "failed to connect to cache service, cache will be disabled: %v", err)
 	}
@@ -88,15 +94,15 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 		logger.Error("System", "Failed to initialize active_jobs KV store: %v", err)
 	}
 
-	eng, err := engine.NewEngine(ctx, aiClient, cacheClient, pub, kvStore)
+	eng, err := engine.NewEngine(ctx, cacheClient, pub, kvStore)
 	if err != nil {
 		logger.Error("System", "Failed to initialize engine: %v", err)
 		panic(fmt.Errorf("failed to initialize engine: %w", err))
 	}
 
-	docProcAddr := envutil.GetStringOrDefault("DOCUMENT_PROCESSING_SERVICE_ADDRESS", "")
+	docProcAddr := envutil.MustGetString("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
 	if docProcAddr == "" {
-		docProcAddr = "127.0.0.1:50054"
+		panic("DOCUMENT_PROCESSING_SERVICE_ADDRESS environment variable is required")
 	}
 	docConn, err := grpc.NewClient(docProcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -107,13 +113,15 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 
 	srv := &OrchestratorServer{
 		eng:          eng,
-		aiClient:     aiClient,
 		pub:          pub,
 		kvStore:      kvStore,
 		activeExecs:  make(map[string]*JobExecInfo),
-		traceClient:  traceClient,
-		cacheClient:  cacheClient,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		traceClient:          traceClient,
+		cacheClient:          cacheClient,
+		webhookConns:         make(map[string]*grpc.ClientConn),
+		cacheTimeoutSecs:     cacheTimeout,
+		grpcMaxMessageSizeMb: grpcMaxMsg,
+		grpcTimeoutSecs:      grpcTimeout,
 	}
 
 	// Load pending jobs from Traceability Service
@@ -132,7 +140,10 @@ func NewServer(ctx context.Context, aiClient *ai_client.Client, pub JobPublisher
 
 func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.ExecuteWorkflowNodeResponse, error) {
 	if req.GlobalState == nil {
-		req.GlobalState, _ = structpb.NewStruct(map[string]any{})
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = GlobalState is strictly required")
+	}
+	if req.NodeConfig == nil {
+		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = NodeConfig is strictly required")
 	}
 
 	if req.Identity == nil {
@@ -187,19 +198,27 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		return fmt.Errorf("failed to unmarshal ExecuteWorkflowNodeRequest: %w", err)
 	}
 
-	jobID := ""
-	appID := ""
-	if req.Identity != nil {
-		jobID = req.Identity.JobId
-		appID = req.Identity.AppId
+	if req.Identity == nil {
+		return fmt.Errorf("missing Identity for job message")
 	}
+	if req.NodeConfig == nil {
+		return fmt.Errorf("missing NodeConfig for job %s", req.Identity.JobId)
+	}
+
+	parser := workflowparser.NewNodeRequestParser(req)
+	if err := parser.Validate(); err != nil {
+		logger.Error("System", "Job message missing valid InfrastructureIdentity. Terminating message: %v", err)
+		msg.Term()
+		return nil
+	}
+	_, appID, jobID := parser.ExtractIdentity()
 
 	if s.traceClient != nil { //move 2 to environment variable
 		ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
-		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: req.Identity})
+		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: parser.GetIdentity()})
 		cancelTrace()
 		if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == StatusCompleted || resp.Job.Status == StatusFailed) {
-			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, req.StepId)
+			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for fully terminated job. Ignoring.", jobID, parser.GetStepId())
 			return nil
 		}
 	}
@@ -207,7 +226,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	s.activeExecMu.Lock()
 	if _, exists := s.activeExecs[jobID]; exists {
 		s.activeExecMu.Unlock()
-		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", jobID, req.StepId)
+		logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for step in progress. Ignoring.", jobID, parser.GetStepId())
 		return nil
 	}
 
@@ -223,28 +242,19 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		s.activeExecMu.Unlock()
 	}()
 
-	if req.NodeConfig == nil {
-		return fmt.Errorf("node config is missing from request for job %s", jobID)
-	}
 
 	// ZERO-SHOT CACHE BYPASS (remove tracker references, use execCtx)
-	if req.NodeConfig.Cache != nil && req.NodeConfig.Cache.Enabled && s.cacheClient != nil {
-		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, req.StepId, req.NodeConfig.Cache.CollectionName)
+	cacheConfig := parser.GetCacheContract()
+	if cacheConfig != nil && cacheConfig.Enabled && s.cacheClient != nil {
+		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, parser.GetStepId(), cacheConfig.CollectionName)
 
-		timeoutSecs := 120
-		if envVal := envutil.GetStringOrDefault("CACHE_TIMEOUT_SECONDS", ""); envVal != "" {
-			if parsed, err := strconv.Atoi(envVal); err == nil {
-				timeoutSecs = parsed
-			}
-		}
-
-		ctxCache, cancelCache := context.WithTimeout(execCtx, time.Duration(timeoutSecs)*time.Second)
+		ctxCache, cancelCache := context.WithTimeout(execCtx, time.Duration(s.cacheTimeoutSecs)*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
-			CollectionName: req.NodeConfig.Cache.CollectionName,
-			Text:           req.NodeConfig.Cache.LookupInput,
-			Identity:       req.GetIdentity(),
-			Threshold:      req.NodeConfig.Cache.ConfidenceThreshold,
-			Metadata:       req.NodeConfig.Cache.Metadata,
+			CollectionName: cacheConfig.CollectionName,
+			Text:           cacheConfig.LookupInput,
+			Identity:       parser.GetIdentity(),
+			Threshold:      cacheConfig.Confidence,
+			Metadata:       parser.GetMetadata(),
 		})
 		cancelCache()
 
@@ -271,11 +281,11 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			}
 
 			if validCacheHit {
-				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.NodeConfig.Cache.ConfidenceThreshold)
-				if err := engine.MergeStateContext(req, cacheResp.ExtractedPayload, ""); err != nil {
-					logger.Error("Server", "Failed to merge cache state context: %v", err)
+				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.Cache.Confidence)
+				if cacheResp.ExtractedPayload != "" {
+					req.NodeOutputJson = cacheResp.ExtractedPayload
 				}
-				err := s.fireCallback(execCtx, req, &engine.StepResult{OutputJSON: cacheResp.ExtractedPayload, StepId: req.StepId})
+				err := s.fireCallback(execCtx, req, &engine.StepResult{Request: req, NodeOutputJson: req.NodeOutputJson})
 				if err != nil {
 					return fmt.Errorf("failed to fire callback for cache hit: %w", err)
 				}
@@ -320,17 +330,14 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			s.handleCallbackError(execCtx, err.Error(), req)
 
 			// We MUST fire the Job Suspended webhook here explicitly
-			var contractBytes []byte
-			if res != nil && res.ErrorContract != nil {
-				contractBytes, _ = proto.Marshal(res.ErrorContract)
+			var errContract *pb.ErrorContract
+			if res != nil {
+				errContract = res.ErrorContract
 			}
 			evt := &events.WebhookEvent{
-				ReqBytes:           reqBytes,
-				StepOutputJSON:     "{}",
-				ErrorContractBytes: contractBytes,
-				JobId:              jobID,
-				LastStepId:         req.StepId,
-				IsSuspended:        true,
+				Request:       req,
+				ErrorContract: errContract,
+				IsSuspended:   true,
 			}
 			_ = s.pub.PublishWebhook(execCtx, evt)
 
@@ -355,24 +362,17 @@ func (s *OrchestratorServer) fireJobSuspendedCallback(ctx context.Context, req *
 	if cbAddress == "" {
 		return nil
 	}
-	reqBytes, err := proto.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
-	}
-	var contractBytes []byte
-	if res != nil && res.ErrorContract != nil {
-		contractBytes, _ = proto.Marshal(res.ErrorContract)
+	var errContract *pb.ErrorContract
+	if res != nil {
+		errContract = res.ErrorContract
 	}
 
 	evt := &events.WebhookEvent{
-		ReqBytes:           reqBytes,
-		StepOutputJSON:     res.OutputJSON,
-		JobId:              req.GetIdentity().GetJobId(),
-		LastStepId:         res.StepId,
-		IsSuspended:        true,
-		ErrorContractBytes: contractBytes,
+		Request:       req,
+		ErrorContract: errContract,
+		IsSuspended:   true,
 	}
-	err = s.pub.PublishWebhook(ctx, evt)
+	err := s.pub.PublishWebhook(ctx, evt)
 	if err != nil {
 		return fmt.Errorf("failed to publish webhook event: %w", err)
 	}
@@ -386,25 +386,17 @@ func (s *OrchestratorServer) fireCallback(ctx context.Context, req *pb.ExecuteWo
 		return nil
 	}
 
-	reqBytes, err := proto.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request for webhook payload: %w", err)
-	}
-
-	var contractBytes []byte
-	if res != nil && res.ErrorContract != nil {
-		contractBytes, _ = proto.Marshal(res.ErrorContract)
+	var errContract *pb.ErrorContract
+	if res != nil {
+		errContract = res.ErrorContract
 	}
 
 	evt := &events.WebhookEvent{
-		ReqBytes:           reqBytes,
-		StepOutputJSON:     res.OutputJSON,
-		ErrorContractBytes: contractBytes,
-		JobId:              req.GetIdentity().GetJobId(),
-		LastStepId:         res.StepId,
+		Request:       req,
+		ErrorContract: errContract,
 	}
 
-	err = s.pub.PublishWebhook(ctx, evt)
+	err := s.pub.PublishWebhook(ctx, evt)
 	if err != nil {
 		return fmt.Errorf("failed to publish webhook event: %w", err)
 	}
@@ -438,12 +430,12 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	logger.Info("System", "Resuming job %s after human correction", jobID)
 
 	// Merge the corrected JSON into the original state context
-	if err := engine.MergeStateContext(stepReq, req.GetCorrectedJson(), ""); err != nil {
-		return nil, fmt.Errorf("failed to merge corrected JSON: %w", err)
+	if req.GetCorrectedJson() != "" {
+		stepReq.NodeOutputJson = req.GetCorrectedJson()
 	}
 
 	// Immediately fire webhook callback instead of publishing to JetStream priority queue
-	err = s.fireCallback(ctx, stepReq, &engine.StepResult{OutputJSON: req.GetCorrectedJson(), StepId: stepReq.StepId})
+	err = s.fireCallback(ctx, stepReq, &engine.StepResult{Request: stepReq, NodeOutputJson: stepReq.NodeOutputJson})
 	if err != nil {
 		logger.Error("System", "Failed to fire callback for resumed job: %v", err)
 		return nil, fmt.Errorf("failed to fire callback for resumed job: %w", err)
@@ -461,10 +453,8 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 }
 
 func (s *OrchestratorServer) handleCallbackError(ctx context.Context, errMsg string, req *pb.ExecuteWorkflowNodeRequest) {
-	jobID := ""
-	if req.Identity != nil {
-		jobID = req.Identity.JobId
-	}
+	parser := workflowparser.NewNodeRequestParser(req)
+	jobID := parser.GetIdentity().GetJobId()
 	logger.Info("System", "Job %s complete or failed. Teared down cache.", jobID)
 
 	if s.traceClient != nil {
@@ -476,7 +466,7 @@ func (s *OrchestratorServer) handleCallbackError(ctx context.Context, errMsg str
 			ctxTrace, cancelTrace := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelTrace()
 			_, _ = s.traceClient.SaveJobState(ctxTrace, &pb.SaveJobStateRequest{
-				Identity: req.Identity,
+				Identity: parser.GetIdentity(),
 				Status:   status,
 			})
 		}()
@@ -533,10 +523,10 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		return nil // Invalid payload, don't retry
 	}
 
-	req := &pb.ExecuteWorkflowNodeRequest{}
-	if err := proto.Unmarshal(evt.ReqBytes, req); err != nil {
-		logger.Error("System", "Failed to unmarshal proto for webhook: %v", err)
-		return nil // Invalid proto, don't retry
+	req := evt.Request
+	if req == nil {
+		logger.Error("System", "Webhook event missing Request payload")
+		return nil // Invalid payload, don't retry
 	}
 
 	cbAddress := req.CallbackAddress
@@ -552,12 +542,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		s.webhookConnMu.Lock()
 		conn, ok = s.webhookConns[cbAddress]
 		if !ok {
-			maxMsgSizeMb := 100
-			if envVal := envutil.GetStringOrDefault("GRPC_MAX_MESSAGE_SIZE_MB", ""); envVal != "" {
-				if parsed, err := strconv.Atoi(envVal); err == nil {
-					maxMsgSizeMb = parsed
-				}
-			}
+			maxMsgSizeMb := s.grpcMaxMessageSizeMb
 			var err error
 			conn, err = grpc.NewClient(cbAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))
 			if err != nil {
@@ -571,60 +556,26 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 
 	client := pb.NewOrchestratorCallbackServiceClient(conn)
 
-	timeoutSecs := 10
-	if envVal := envutil.GetStringOrDefault("GRPC_TIMEOUT_SECONDS", ""); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			timeoutSecs = parsed
-		}
-	}
+	timeoutSecs := s.grpcTimeoutSecs
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	var stepOutMap map[string]any
-	if evt.StepOutputJSON != "" {
-		json.Unmarshal([]byte(evt.StepOutputJSON), &stepOutMap)
-	}
-	if stepOutMap == nil {
-		stepOutMap = make(map[string]any)
-	}
-	stepOutStruct, _ := structpb.NewStruct(stepOutMap)
-
-	var errorContract *pb.ErrorContract
-	if len(evt.ErrorContractBytes) > 0 {
-		errorContract = &pb.ErrorContract{}
-		proto.Unmarshal(evt.ErrorContractBytes, errorContract)
-	}
+	req.NodeOutputJson = evt.Request.NodeOutputJson
+	req.ErrorContract = evt.ErrorContract
 
 	var err error
 	if evt.IsSuspended {
-		_, err = client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
-			SuspendedStepId: evt.LastStepId,
-			Identity:        req.Identity,
-			Metadata:        req.Metadata,
-			GlobalState:     req.GlobalState,
-			NodeOutput:      stepOutStruct,
-			ErrorContract:   errorContract,
-		})
-	} else if errorContract != nil {
-		_, err = client.OnJobFailed(ctx, &pb.JobFailedRequest{
-			Identity:      req.Identity,
-			FailedStepId:  evt.LastStepId,
-			Metadata:      req.Metadata,
-			GlobalState:   req.GlobalState,
-			NodeOutput:    stepOutStruct,
-			ErrorContract: errorContract,
-		})
+		req.Success = false
+		_, err = client.OnJobSuspended(ctx, req)
+	} else if req.ErrorContract != nil {
+		req.Success = false
+		_, err = client.OnJobFailed(ctx, req)
 	} else {
+		req.Success = true
 		var stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteClient
 		stream, err = client.OnNodeExecutionComplete(ctx)
 		if err == nil {
-			err = stream.Send(&pb.NodeExecutionCompleteRequest{
-				Identity:        req.Identity,
-				CompletedStepId: evt.LastStepId,
-				GlobalState:     req.GlobalState,
-				NodeOutput:      stepOutStruct,
-				Metadata:        req.Metadata,
-			})
+			err = stream.Send(req)
 			if err == nil {
 				stream.CloseSend()
 				_, err = stream.Recv()

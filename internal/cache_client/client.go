@@ -17,7 +17,7 @@ func NewClient(addr string) (pb.SemanticCacheServiceClient, *grpc.ClientConn, er
 	}
 
 	maxMsgSizeMb := 100
-	if envVal := envutil.GetStringOrDefault("GRPC_MAX_MESSAGE_SIZE_MB", ""); envVal != "" {
+	if envVal := envutil.MustGetString("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			maxMsgSizeMb = parsed
 		}

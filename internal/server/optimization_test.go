@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"testing"
 
-	"orchestrator_service/internal/ai_client"
 )
 
 func BenchmarkActiveJobsLockContention(b *testing.B) {
 	pub := &mockPublisher{}
-	srv := NewServer(context.Background(), &ai_client.Client{}, pub, nil)
+	srv := NewServer(context.Background(), pub, nil)
 
 	// Pre-fill activeExecs to simulate load
 	for i := range 10000 {

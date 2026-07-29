@@ -5,8 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"strconv"
+	"github.com/AndrewK4758/shared_utils/envutil"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +14,8 @@ import (
 
 	"orchestrator_service/internal/events"
 
+
+	"github.com/AndrewK4758/shared_utils/jsonclean"
 	"github.com/AndrewK4758/shared_utils/logger"
 	"github.com/AndrewK4758/shared_utils/natsutil"
 
@@ -22,8 +23,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
@@ -33,24 +34,21 @@ type TracePublisher interface {
 	PublishTrace(ctx context.Context, event events.TraceabilityEvent) error
 	PublishCacheStore(ctx context.Context, data []byte) error
 	PublishWebhook(ctx context.Context, event *events.WebhookEvent) error
-	PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error
+
 }
 
-type AIClient interface {
-	PerformAction(ctx context.Context, workflowCtx *pb.ExecuteWorkflowNodeRequest, currentAction *pb.ActionDefinition, inputBytes []byte, inputText string, modelChoice pb.ModelChoice) (*pb.PerformActionResponse, error)
-}
+
 
 type StepResult struct {
-	FinalJSON        string
-	OutputJSON       string
-	StepName         string
-	StepId           string
+	Request          *pb.ExecuteWorkflowNodeRequest
+	NodeOutputJson   string
 	ErrorContract    *pb.ErrorContract
 	IsTransientError bool
 }
 
 type Engine struct {
-	aiClient         AIClient
+	maxInferenceRetries int32
+	publishMaxRetries   int
 	cacheClient      pb.SemanticCacheServiceClient
 	pub              TracePublisher
 	pendingCacheJobs sync.Map
@@ -63,11 +61,10 @@ type Engine struct {
 	kvStore  jetstream.KeyValue
 }
 
-func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher, kvStore jetstream.KeyValue) (*Engine, error) {
-	natsURL := os.Getenv("NATS_URL")
-	if natsURL == "" {
-		natsURL = "nats://localhost:4222"
-	}
+func NewEngine(ctx context.Context, cacheClient pb.SemanticCacheServiceClient, pub TracePublisher, kvStore jetstream.KeyValue) (*Engine, error) {
+	natsURL := envutil.MustGetString("NATS_URL")
+	m := envutil.MustGetInt("MAX_INFERENCE_RETRIES")
+	pm := envutil.MustGetInt("PUBLISH_MAX_RETRIES")
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
@@ -83,13 +80,14 @@ func NewEngine(ctx context.Context, aiClient AIClient, cacheClient pb.SemanticCa
 
 	clientID := uuid.New().String()
 	e := &Engine{
-		aiClient:    aiClient,
-		cacheClient: cacheClient,
-		pub:         pub,
-		nc:          nc,
-		js:          js,
-		clientID:    clientID,
-		kvStore:     kvStore,
+		cacheClient:         cacheClient,
+		pub:                 pub,
+		nc:                  nc,
+		js:                  js,
+		clientID:            clientID,
+		kvStore:             kvStore,
+		maxInferenceRetries: int32(m),
+		publishMaxRetries:   pm,
 	}
 
 	setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -167,7 +165,12 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 		return
 	}
 
-	t, a, j := natsutil.ExtractIdentity(req.Identity)
+	if req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
+		logger.Error("Engine", "Identity is missing from KV request for job %s", jobID)
+		msg.Ack()
+		return
+	}
+	t, a, j := req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
 		Component: "Orchestrator",
 		Event:     "DEQUEUED",
@@ -186,13 +189,13 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	var errContract *pb.ErrorContract
 
 	if err := proto.Unmarshal(msg.Data(), &resp); err != nil {
-		rawJson = cleanJSON(string(msg.Data()))
+		errContract = &pb.ErrorContract{Code: "400", Message: "PoisonPill: Failed to unmarshal protobuf: " + err.Error()}
 	} else {
 		if !resp.Success {
 			errContract = resp.GetErrorContract()
 			logger.Warn("Engine", "Worker returned error asynchronously: %v", errContract)
 		} else {
-			rawJson = cleanJSON(resp.GetActionResultJson())
+			rawJson = jsonclean.CleanJSON(resp.GetActionResultJson())
 		}
 	}
 
@@ -204,12 +207,7 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 				if err := json.Unmarshal([]byte(rawJson), &v); err == nil {
 					if err := schema.Validate(v); err != nil {
 						req.InferenceRetryCount++
-						maxRetries := int32(3)
-						if envMax := os.Getenv("MAX_INFERENCE_RETRIES"); envMax != "" {
-							if m, e := strconv.Atoi(envMax); e == nil {
-								maxRetries = int32(m)
-							}
-						}
+						maxRetries := e.maxInferenceRetries
 
 						if req.InferenceRetryCount < maxRetries {
 							logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
@@ -218,53 +216,48 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 							if reqBytes, err := proto.Marshal(req); err == nil {
 								_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
 							}
-							_ = e.pub.PublishAction(context.Background(), req)
+							_, _ = e.executeGenericStep(context.Background(), req)
 							msg.Ack()
 							return
-						} else {
-							logger.Error("Engine", "Validation retry exhausted: %v", err)
-							errContract = &pb.ErrorContract{Code: "400", Message: "ValidationRetryExhausted: " + err.Error()}
-							resp.Success = false
 						}
+
+						logger.Error("Engine", "Validation retry exhausted: %v", err)
+						errContract = &pb.ErrorContract{Code: "400", Message: "ValidationRetryExhausted: " + err.Error()}
+						resp.Success = false
 					}
 				}
 			}
 		}
 	}
 
-	_ = MergeStateContext(req, rawJson, "")
-
+	if rawJson != "" {
+		req.NodeOutputJson = rawJson
+	}
 	eventType := events.EventActionCompleted
-	var errMsg string
 	if errContract != nil {
 		eventType = events.EventActionFailed
-		errMsg = errContract.GetMessage()
 	}
 
+	marshaler := protojson.MarshalOptions{EmitUnpopulated: true}
+	reqSnapshotBytes, _ := marshaler.Marshal(req)
+
 	_ = e.pub.PublishTrace(context.Background(), events.TraceabilityEvent{
-		EventID:   uuid.New().String(),
-		EventType: eventType,
-		Timestamp: time.Now(),
-		TenantID:  req.Identity.GetTenantId(),
-		AppID:     req.Identity.GetAppId(),
-		JobID:     req.Identity.GetJobId(),
-		JobAction: req.NodeConfig.NodeName,
-		Error:     errMsg,
+		EventID:             uuid.New().String(),
+		EventType:           eventType,
+		Timestamp:           time.Now(),
+		Identity:            req.Identity,
+		JobNameID:           req.GetJobNameId(),
+		JobAction:           req.NodeConfig.GetNodeName(),
+		ErrorContract:       errContract,
+		NodeOutputJson:      req.NodeOutputJson,
+		RequestSnapshotJson: string(reqSnapshotBytes),
 	})
 
 	if req.CallbackAddress != "" {
-		reqBytes, _ := proto.Marshal(req)
-		var contractBytes []byte
-		if errContract != nil {
-			contractBytes, _ = proto.Marshal(errContract)
-		}
 		evt := &events.WebhookEvent{
-			ReqBytes:           reqBytes,
-			StepOutputJSON:     rawJson,
-			ErrorContractBytes: contractBytes,
-			JobId:              req.GetIdentity().GetJobId(),
-			LastStepId:         req.StepId,
-			IsSuspended:        errContract != nil && strings.HasPrefix(errContract.Message, "ValidationRetryExhausted"),
+			Request:       req,
+			ErrorContract: errContract,
+			IsSuspended:   errContract != nil && strings.HasPrefix(errContract.Message, "ValidationRetryExhausted"),
 		}
 		if err := e.pub.PublishWebhook(context.Background(), evt); err != nil {
 			logger.Error("Engine", "Failed to publish webhook for job %s: %v", jobID, err)
@@ -302,125 +295,19 @@ func (e *Engine) Close() {
 	}
 }
 
-func MergeStateContext(req *pb.ExecuteWorkflowNodeRequest, jsonStr string, targetKey string) error {
-	if req == nil {
-		return fmt.Errorf("request cannot be nil")
-	}
-
-	if jsonStr != "" {
-		var parsed any
-		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-			return fmt.Errorf("malformed JSON in global state merge: %w", err)
-		}
-
-		if req.GlobalState == nil {
-			req.GlobalState, _ = structpb.NewStruct(make(map[string]any))
-		}
-
-		m := req.GlobalState.AsMap()
-		if targetKey != "" {
-			if parsedMap, isParsedMap := parsed.(map[string]any); isParsedMap {
-				if existing, ok := m[targetKey].(map[string]any); ok {
-					deepMerge(existing, parsedMap)
-					m[targetKey] = existing
-				} else {
-					m[targetKey] = parsedMap
-				}
-			} else {
-				m[targetKey] = parsed
-			}
-		} else {
-			if parsedMap, isParsedMap := parsed.(map[string]any); isParsedMap {
-				deepMerge(m, parsedMap)
-			} else {
-				return fmt.Errorf("cannot merge non-object JSON into global root state without a targetKey")
-			}
-		}
-
-		newState, err := structpb.NewStruct(m)
-		if err != nil {
-			return fmt.Errorf("failed to update struct for global state: %w", err)
-		}
-		req.GlobalState = newState
-	}
-
-	return nil
-}
-
-func deepMerge(dst map[string]any, src map[string]any) {
-	if dst == nil || src == nil {
-		return
-	}
-	for k, vSrc := range src {
-		vDst, exists := dst[k]
-		if exists {
-			mapDst, okDst := vDst.(map[string]any)
-			mapSrc, okSrc := vSrc.(map[string]any)
-			if okDst && okSrc {
-				deepMerge(mapDst, mapSrc)
-				continue
-			}
-		}
-		dst[k] = vSrc
-	}
-}
-
-func cleanJSON(input string) string {
-	input = strings.TrimSpace(input)
-	if start := strings.Index(input, "```"); start != -1 {
-		if end := strings.LastIndex(input, "```"); end > start+2 {
-			content := input[start+3 : end]
-			content = strings.TrimSpace(content)
-			if strings.HasPrefix(strings.ToLower(content), "json") {
-				content = strings.TrimSpace(content[4:])
-			}
-			input = content
-		}
-	}
-	firstBrace := strings.Index(input, "{")
-	firstBracket := strings.Index(input, "[")
-	first := -1
-	if firstBrace != -1 && firstBracket != -1 {
-		first = min(firstBrace, firstBracket)
-	} else if firstBrace != -1 {
-		first = firstBrace
-	} else if firstBracket != -1 {
-		first = firstBracket
-	}
-	if first == -1 {
-		return input
-	}
-	lastBrace := strings.LastIndex(input, "}")
-	lastBracket := strings.LastIndex(input, "]")
-	last := -1
-	if lastBrace != -1 && lastBracket != -1 {
-		last = max(lastBrace, lastBracket)
-	} else if lastBrace != -1 {
-		last = lastBrace
-	} else if lastBracket != -1 {
-		last = lastBracket
-	}
-	if last != -1 && last > first {
-		return input[first : last+1]
-	}
-	return input
-}
-
 func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
 	if req == nil || req.NodeConfig == nil {
 		return nil, fmt.Errorf("invalid request")
 	}
 
 	lastStepName := req.NodeConfig.NodeName
-	lastStepId := req.StepId
 
 	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 		EventID:   uuid.New().String(),
 		EventType: events.EventActionStarted,
 		Timestamp: time.Now(),
-		TenantID:  req.Identity.GetTenantId(),
-		AppID:     req.Identity.GetAppId(),
-		JobID:     req.Identity.GetJobId(),
+		Identity:  req.Identity,
+		JobNameID: req.GetJobNameId(),
 		JobAction: lastStepName,
 	})
 
@@ -430,48 +317,51 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			return nil, err
 		}
 		if res == nil {
-			res = &StepResult{}
+			res = &StepResult{Request: req}
+		} else {
+			res.Request = req
 		}
-		res.StepName = lastStepName
-		res.StepId = lastStepId
 
 		_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
 			EventID:   uuid.New().String(),
 			EventType: events.EventActionFailed,
 			Timestamp: time.Now(),
-			TenantID:  req.Identity.GetTenantId(),
-			AppID:     req.Identity.GetAppId(),
-			JobID:     req.Identity.GetJobId(),
+			Identity:  req.Identity,
+			JobNameID: req.GetJobNameId(),
 			JobAction: lastStepName,
-			Error:     err.Error(),
+			ErrorContract: &pb.ErrorContract{
+				Code:    "500",
+				Message: err.Error(),
+			},
 		})
 
 		return res, fmt.Errorf("failed to execute generic step: %w", err)
 	}
 
-	var finalJSON []byte
-	if req.GlobalState != nil {
-		finalJSON, _ = req.GlobalState.MarshalJSON()
+	res.Request = req
+	if res.NodeOutputJson == "" {
+		res.NodeOutputJson = req.NodeOutputJson
 	}
 
-	res.FinalJSON = string(finalJSON)
-	res.StepName = lastStepName
-	res.StepId = lastStepId
-
 	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:   uuid.New().String(),
-		EventType: events.EventActionCompleted,
-		Timestamp: time.Now(),
-		TenantID:  req.Identity.GetTenantId(),
-		AppID:     req.Identity.GetAppId(),
-		JobID:     req.Identity.GetJobId(),
-		JobAction: lastStepName,
+		EventID:        uuid.New().String(),
+		EventType:      events.EventActionCompleted,
+		Timestamp:      time.Now(),
+		Identity:       req.Identity,
+		JobNameID:      req.GetJobNameId(),
+		JobAction:      lastStepName,
+		NodeOutputJson: res.NodeOutputJson,
 	})
 
 	return res, nil
 }
 
 func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
+	if req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
+		return nil, fmt.Errorf("infrastructure identity is strictly required")
+	}
+	t, a, j := req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId
+
 	subject := req.NodeConfig.TargetWorkerSubject
 	if subject == "" {
 		return nil, fmt.Errorf("target worker subject is empty")
@@ -491,9 +381,13 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	nMsg.Header.Set("Reply-Subject", replySubj)
 	nMsg.Data = reqBytes
 
-	maxRetries := 3
-	for i := 0; i < maxRetries; i++ {
-		_, err = e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
+	maxRetries := e.publishMaxRetries
+	for i := range maxRetries {
+		if e.js != nil {
+			_, err = e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
+		} else {
+			err = nil
+		}
 		if err == nil {
 			break
 		}
@@ -505,7 +399,6 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 		}
 	}
 
-	t, a, j := natsutil.ExtractIdentity(req.Identity)
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
 		Component: "Orchestrator",
 		Event:     "ENQUEUED",

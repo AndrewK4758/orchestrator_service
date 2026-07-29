@@ -17,7 +17,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/protobuf/proto"
+
 )
 
 const (
@@ -115,7 +115,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update orchestrator_responses stream: %w", err)
 	}
 
-	if envutil.GetStringOrDefault("PURGE_QUEUE_ON_STARTUP", "") == "true" {
+	if envutil.MustGetString("PURGE_QUEUE_ON_STARTUP") == "true" {
 		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, WEBHOOKS, WORKERS, AI_RESPONSES, and ORCHESTRATOR_RESPONSES streams on startup...")
 		_ = jobsStream.Purge(ctx)
 		_ = traceStream.Purge(ctx)
@@ -147,14 +147,15 @@ func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) e
 
 	// Use JetStream publish for guaranteed delivery
 	_, err = p.js.Publish(ctx, subject, eventBytes)
+	tenantID, appID, jobID := natsutil.ExtractIdentity(event.Identity)
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
 		Component: "Orchestrator",
 		Event:     "ENQUEUED",
 		Stream:    StreamTraceEvents,
 		Subject:   subject,
-		TenantID:  event.TenantID,
-		AppID:     event.AppID,
-		JobID:     event.JobID,
+		TenantID:  tenantID,
+		AppID:     appID,
+		JobID:     jobID,
 		SizeBytes: len(eventBytes),
 		Error:     err,
 	})
@@ -251,32 +252,6 @@ func (p *Publisher) PublishPriorityJob(ctx context.Context, identity *pb.Infrast
 	return nil
 }
 
-// PublishAction sends a job request back to a worker queue.
-func (p *Publisher) PublishAction(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) error {
-	subject := req.NodeConfig.TargetWorkerSubject
-	if subject == "" {
-		return fmt.Errorf("TargetWorkerSubject is empty")
-	}
-	reqBytes, err := proto.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to marshal ExecuteWorkflowNodeRequest: %w", err)
-	}
-	_, err = p.js.Publish(ctx, subject, reqBytes)
-	t, a, j := natsutil.ExtractIdentity(req.Identity)
-	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-		Component: "Orchestrator",
-		Event:     "ENQUEUED",
-		Stream:    StreamWorkers,
-		Subject:   subject,
-		TenantID:  t,
-		AppID:     a,
-		JobID:     j,
-		SizeBytes: len(reqBytes),
-		Error:     err,
-	})
-	return err
-}
-
 func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
 	subject := KVCacheRequestsStore
 	_, err := p.js.Publish(ctx, subject, data)
@@ -348,7 +323,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	normalAckPending := 100
 	priorityAckPending := 100
 
-	if envVal := envutil.GetStringOrDefault("NORMAL_MAX_ACK_PENDING", ""); envVal != "" {
+	if envVal := envutil.MustGetString("NORMAL_MAX_ACK_PENDING"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			normalAckPending = parsed
 		} else if err != nil {
@@ -356,7 +331,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	if envVal := envutil.GetStringOrDefault("PRIORITY_MAX_ACK_PENDING", ""); envVal != "" {
+	if envVal := envutil.MustGetString("PRIORITY_MAX_ACK_PENDING"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			priorityAckPending = parsed
 		} else if err != nil {
@@ -365,7 +340,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	normalPullMax := 100
-	if envVal := envutil.GetStringOrDefault("NORMAL_PULL_MAX_MESSAGES", ""); envVal != "" {
+	if envVal := envutil.MustGetString("NORMAL_PULL_MAX_MESSAGES"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			normalPullMax = parsed
 		} else if err != nil {
@@ -374,7 +349,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	priorityPullMax := 100
-	if envVal := envutil.GetStringOrDefault("PRIORITY_PULL_MAX_MESSAGES", ""); envVal != "" {
+	if envVal := envutil.MustGetString("PRIORITY_PULL_MAX_MESSAGES"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			priorityPullMax = parsed
 		} else if err != nil {
@@ -383,7 +358,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	ackWaitSecs := 120 // 2 minutes default
-	if envVal := envutil.GetStringOrDefault("NATS_TIMEOUT_SECONDS", ""); envVal != "" {
+	if envVal := envutil.MustGetString("NATS_TIMEOUT_SECONDS"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			ackWaitSecs = parsed
 		} else if err != nil {
@@ -392,7 +367,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 	}
 
 	maxDeliver := 3
-	if envVal := envutil.GetStringOrDefault("NATS_MAX_DELIVER", ""); envVal != "" {
+	if envVal := envutil.MustGetString("NATS_MAX_DELIVER"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
 			maxDeliver = parsed
 		} else if err != nil {
@@ -567,7 +542,20 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 		return fmt.Errorf("failed to marshal webhook payload: %w", err)
 	}
 
-	msgId := fmt.Sprintf("%s-%s", payload.JobId, payload.LastStepId)
+	jobID := ""
+	stepID := ""
+	var identity *pb.InfrastructureIdentity
+	if payload != nil && payload.Request != nil {
+		stepID = payload.Request.GetStepId()
+		identity = payload.Request.Identity
+	}
+
+	tenantID, appID, jobID := natsutil.ExtractIdentity(identity)
+	if tenantID == "" || appID == "" || jobID == "" {
+		return fmt.Errorf("invalid identity: tenantID, appID, and jobID are all required and cannot be empty")
+	}
+
+	msgId := fmt.Sprintf("%s-%s", jobID, stepID)
 	msg := &nats.Msg{
 		Subject: "webhooks.callback",
 		Data:    data,
@@ -581,9 +569,9 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 		Event:     "ENQUEUED",
 		Stream:    StreamWebhooks,
 		Subject:   "webhooks.callback",
-		TenantID:  "default",
-		AppID:     "default",
-		JobID:     payload.JobId,
+		TenantID:  tenantID,
+		AppID:     appID,
+		JobID:     jobID,
 		MsgID:     msgId,
 		SizeBytes: len(data),
 		Error:     err,
@@ -620,7 +608,7 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 	logger.Debug("System", "Consumer started on stream WEBHOOKS. Waiting for messages...")
 
 	maxConcurrency := 50
-	if envVal := envutil.GetStringOrDefault("WEBHOOKS_MAX_CONCURRENCY", ""); envVal != "" {
+	if envVal := envutil.MustGetString("WEBHOOKS_MAX_CONCURRENCY"); envVal != "" {
 		if parsed, err := strconv.Atoi(envVal); err == nil {
 			maxConcurrency = parsed
 		}
@@ -636,11 +624,11 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 			if meta != nil {
 				attempt = meta.NumDelivered
 			}
-			t, a, j := "default", "default", "default"
+			t, a, j := "", "", ""
 			var evt WebhookEvent
 			if err := json.Unmarshal(m.Data(), &evt); err == nil {
-				if evt.JobId != "" {
-					j = evt.JobId
+				if evt.Request != nil && evt.Request.Identity != nil {
+					t, a, j = natsutil.ExtractIdentity(evt.Request.Identity)
 				}
 			}
 

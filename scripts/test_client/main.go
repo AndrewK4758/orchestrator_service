@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -32,12 +33,17 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 		if req.Identity != nil {
 			jobID = req.Identity.JobId
 		}
-		fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.CompletedStepId, jobID)
+		fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.StepId, jobID)
 
-		bytes, _ := req.GlobalState.MarshalJSON()
-		outBytes, _ := req.NodeOutput.MarshalJSON()
-		fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, string(outBytes), string(bytes))
-		s.ResultChan <- string(bytes)
+		var bytes string
+		if req.GlobalState != nil {
+			if b, err := protojson.Marshal(req.GlobalState); err == nil {
+				bytes = string(b)
+			}
+		}
+		outBytes := req.GetNodeOutputJson()
+		fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, outBytes, bytes)
+		s.ResultChan <- bytes
 
 		if err := stream.Send(&pb.NodeExecutionCompleteResponse{Success: true}); err != nil {
 			return err
@@ -45,18 +51,18 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 	}
 }
 
-func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.JobSuspendedRequest) (*pb.JobSuspendedResponse, error) {
-	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.SuspendedStepId, req.Identity.JobId, req.GetErrorContract().GetMessage())
+func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobSuspendedResponse, error) {
+	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.StepId, req.Identity.JobId, req.GetErrorContract().GetMessage())
 	s.ResultChan <- "SUSPENDED: " + req.GetErrorContract().GetMessage()
 	return &pb.JobSuspendedResponse{Success: true}, nil
 }
 
-func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
+func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobFailedResponse, error) {
 	jobID := ""
 	if req.Identity != nil {
 		jobID = req.Identity.JobId
 	}
-	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.FailedStepId, jobID)
+	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.StepId, jobID)
 	fmt.Printf("[%s] Step Failed! Error: %s\n", jobID, req.GetErrorContract().GetMessage())
 	s.ResultChan <- "ERROR: " + req.GetErrorContract().GetMessage()
 
@@ -131,9 +137,15 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Println("\n[test_client] PHASE 1: Submitting Initial State...")
 
 	b64Doc := base64.StdEncoding.EncodeToString(pdfBytes)
-	initialState, _ := structpb.NewStruct(map[string]any{
+	funcStruct, err := structpb.NewStruct(map[string]interface{}{
 		"document_b64": b64Doc,
 	})
+	if err != nil {
+		logger.Fatal("Orchestrator", "Failed to create functional struct: %v", err)
+	}
+	globalState := pb.GlobalState{
+		Functional: funcStruct,
+	}
 
 	nodeReq := &pb.ExecuteWorkflowNodeRequest{
 		Identity: &pb.InfrastructureIdentity{
@@ -141,8 +153,9 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 			AppId:    "CLI_TEST_APP",
 			TenantId: "TEST_TENANT",
 		},
+		JobNameId:       42,
 		StepId:          "step_1",
-		GlobalState:     initialState,
+		GlobalState:     &globalState,
 		Metadata:        map[string]string{},
 		CallbackAddress: "localhost:50055",
 		NodeConfig: &pb.NodeConfiguration{

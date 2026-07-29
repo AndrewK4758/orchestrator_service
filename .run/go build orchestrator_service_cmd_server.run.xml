@@ -7,5 +7,5 @@
     <directory value="$PROJECT_DIR$" />
     <auto_managed_config_id value="$PROJECT_DIR$/orchestrator_service/cmd/server" />
     <method v="2" />
-  </configuration>
+  <output_directory value="$PROJECT_DIR$/orchestrator_service/bin" /></configuration>
 </component>

@@ -17,3 +17,6 @@ orchestrator_bin
 *_bin
 *_bin.exe
 /bin/orchestrator
+/bin/go_build_orchestrator_service_cmd_server
+bin/
+bin
