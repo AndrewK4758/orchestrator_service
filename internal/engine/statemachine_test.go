@@ -10,6 +10,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"orchestrator_service/internal/events"
 )
@@ -140,7 +141,11 @@ func TestProcessJetStreamMessage_WebhookFailure_DoesNotAck(t *testing.T) {
 
 	resp := &pb.PerformActionResponse{
 		Success:          true,
-		ActionResultJson: `{"key":"value"}`,
+		ActionResult: &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				"key": structpb.NewStringValue("value"),
+			},
+		},
 	}
 	respBytes, _ := proto.Marshal(resp)
 	mockMsg.On("Data").Return(respBytes)
@@ -179,7 +184,25 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 		CallbackAddress: "http://webhook",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:            "Test Node",
-			ExpectedSchema:      `{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`,
+			ExpectedSchemaStruct: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"type": structpb.NewStringValue("object"),
+					"properties": structpb.NewStructValue(&structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"name": structpb.NewStructValue(&structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"type": structpb.NewStringValue("string"),
+								},
+							}),
+						},
+					}),
+					"required": structpb.NewListValue(&structpb.ListValue{
+						Values: []*structpb.Value{
+							structpb.NewStringValue("name"),
+						},
+					}),
+				},
+			},
 			TargetWorkerSubject: "worker.test",
 		},
 		InferenceRetryCount: 0,
@@ -196,7 +219,11 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Retries(t *testing.T) {
 	mockMsg.On("Subject").Return("orchestrator.response.client." + jobID)
 	resp := &pb.PerformActionResponse{
 		Success:          true,
-		ActionResultJson: `{"invalid":"schema"}`,
+		ActionResult: &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				"invalid": structpb.NewStringValue("schema"),
+			},
+		},
 	}
 	respBytes, _ := proto.Marshal(resp)
 	mockMsg.On("Data").Return(respBytes)
@@ -238,7 +265,25 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 		CallbackAddress: "http://webhook",
 		NodeConfig: &pb.NodeConfiguration{
 			NodeName:            "Test Node",
-			ExpectedSchema:      `{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`,
+			ExpectedSchemaStruct: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"type": structpb.NewStringValue("object"),
+					"properties": structpb.NewStructValue(&structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"name": structpb.NewStructValue(&structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"type": structpb.NewStringValue("string"),
+								},
+							}),
+						},
+					}),
+					"required": structpb.NewListValue(&structpb.ListValue{
+						Values: []*structpb.Value{
+							structpb.NewStringValue("name"),
+						},
+					}),
+				},
+			},
 			TargetWorkerSubject: "worker.test",
 		},
 		InferenceRetryCount: 3, // Already at max!
@@ -260,7 +305,7 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 	mockMsg.On("Subject").Return("orchestrator.response.client." + jobID)
 	resp := &pb.PerformActionResponse{
 		Success:          true,
-		ActionResultJson: `{"invalid":"schema"}`,
+		ActionResult: &structpb.Struct{Fields: map[string]*structpb.Value{"invalid": structpb.NewStringValue("schema")}},
 	}
 	respBytes, _ := proto.Marshal(resp)
 	mockMsg.On("Data").Return(respBytes)

@@ -41,7 +41,12 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 				bytes = string(b)
 			}
 		}
-		outBytes := req.GetNodeOutputJson()
+		var outBytes string
+		if req.NodeOutput != nil {
+			if b, err := protojson.Marshal(req.NodeOutput); err == nil {
+				outBytes = string(b)
+			}
+		}
 		fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, outBytes, bytes)
 		s.ResultChan <- bytes
 
@@ -162,7 +167,25 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 			TargetWorkerSubject: "worker.human.validation",
 			NodeName:            "Extract Invoice Data",
 			SystemInstructions:  "Extract the invoice number and total amount.",
-			ExpectedSchema:      `{"type": "object", "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}}}`,
+			ExpectedSchemaStruct: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"type": structpb.NewStringValue("object"),
+					"properties": structpb.NewStructValue(&structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"invoice_number": structpb.NewStructValue(&structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"type": structpb.NewStringValue("string"),
+								},
+							}),
+							"total": structpb.NewStructValue(&structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"type": structpb.NewStringValue("number"),
+								},
+							}),
+						},
+					}),
+				},
+			},
 		},
 	}
 

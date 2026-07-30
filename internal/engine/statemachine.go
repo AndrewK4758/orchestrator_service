@@ -1,11 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/AndrewK4758/shared_utils/envutil"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +14,7 @@ import (
 
 	"orchestrator_service/internal/events"
 
-
-	"github.com/AndrewK4758/shared_utils/jsonclean"
+	"github.com/AndrewK4758/shared_utils/envutil"
 	"github.com/AndrewK4758/shared_utils/logger"
 	"github.com/AndrewK4758/shared_utils/natsutil"
 
@@ -25,6 +24,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var ErrPendingHumanValidation = errors.New("pending human validation")
@@ -41,7 +41,7 @@ type TracePublisher interface {
 
 type StepResult struct {
 	Request          *pb.ExecuteWorkflowNodeRequest
-	NodeOutputJson   string
+	NodeOutput       *structpb.Struct
 	ErrorContract    *pb.ErrorContract
 	IsTransientError bool
 }
@@ -185,7 +185,7 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	})
 
 	var resp pb.PerformActionResponse
-	var rawJson string
+	var actionResult *structpb.Struct
 	var errContract *pb.ErrorContract
 
 	if err := proto.Unmarshal(msg.Data(), &resp); err != nil {
@@ -195,43 +195,46 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 			errContract = resp.GetErrorContract()
 			logger.Warn("Engine", "Worker returned error asynchronously: %v", errContract)
 		} else {
-			rawJson = jsonclean.CleanJSON(resp.GetActionResultJson())
+			actionResult = resp.GetActionResult()
 		}
 	}
 
-	if errContract == nil && req.NodeConfig != nil && req.NodeConfig.ExpectedSchema != "" {
+	if errContract == nil && req.NodeConfig != nil && req.NodeConfig.ExpectedSchemaStruct != nil {
 		compiler := jsonschema.NewCompiler()
-		if err := compiler.AddResource("schema.json", strings.NewReader(req.NodeConfig.ExpectedSchema)); err == nil {
+		schemaBytes, _ := req.NodeConfig.ExpectedSchemaStruct.MarshalJSON()
+		if err := compiler.AddResource("schema.json", bytes.NewReader(schemaBytes)); err == nil {
 			if schema, err := compiler.Compile("schema.json"); err == nil {
 				var v any
-				if err := json.Unmarshal([]byte(rawJson), &v); err == nil {
-					if err := schema.Validate(v); err != nil {
-						req.InferenceRetryCount++
-						maxRetries := e.maxInferenceRetries
+				if resultBytes, err := actionResult.MarshalJSON(); err == nil {
+					if err := json.Unmarshal(resultBytes, &v); err == nil {
+						if err := schema.Validate(v); err != nil {
+							req.InferenceRetryCount++
+							maxRetries := e.maxInferenceRetries
 
-						if req.InferenceRetryCount < maxRetries {
-							logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
-							req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
+							if req.InferenceRetryCount < maxRetries {
+								logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
+								req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
 
-							if reqBytes, err := proto.Marshal(req); err == nil {
-								_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
+								if reqBytes, err := proto.Marshal(req); err == nil {
+									_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
+								}
+								_, _ = e.executeGenericStep(context.Background(), req)
+								msg.Ack()
+								return
 							}
-							_, _ = e.executeGenericStep(context.Background(), req)
-							msg.Ack()
-							return
-						}
 
-						logger.Error("Engine", "Validation retry exhausted: %v", err)
-						errContract = &pb.ErrorContract{Code: "400", Message: "ValidationRetryExhausted: " + err.Error()}
-						resp.Success = false
+							logger.Error("Engine", "Validation retry exhausted: %v", err)
+							errContract = &pb.ErrorContract{Code: "400", Message: "ValidationRetryExhausted: " + err.Error()}
+							resp.Success = false
+						}
 					}
 				}
 			}
 		}
 	}
 
-	if rawJson != "" {
-		req.NodeOutputJson = rawJson
+	if actionResult != nil {
+		req.NodeOutput = actionResult
 	}
 	eventType := events.EventActionCompleted
 	if errContract != nil {
@@ -241,6 +244,12 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	marshaler := protojson.MarshalOptions{EmitUnpopulated: true}
 	reqSnapshotBytes, _ := marshaler.Marshal(req)
 
+	var outputMap map[string]any
+	if req.NodeOutput != nil {
+		outputBytes, _ := req.NodeOutput.MarshalJSON()
+		json.Unmarshal(outputBytes, &outputMap)
+	}
+
 	_ = e.pub.PublishTrace(context.Background(), events.TraceabilityEvent{
 		EventID:             uuid.New().String(),
 		EventType:           eventType,
@@ -249,7 +258,7 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 		JobNameID:           req.GetJobNameId(),
 		JobAction:           req.NodeConfig.GetNodeName(),
 		ErrorContract:       errContract,
-		NodeOutputJson:      req.NodeOutputJson,
+		NodeOutput:          outputMap,
 		RequestSnapshotJson: string(reqSnapshotBytes),
 	})
 
@@ -339,18 +348,24 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 	}
 
 	res.Request = req
-	if res.NodeOutputJson == "" {
-		res.NodeOutputJson = req.NodeOutputJson
+	if res.NodeOutput == nil {
+		res.NodeOutput = req.NodeOutput
+	}
+
+	var finalOutputMap map[string]any
+	if res.NodeOutput != nil {
+		outputBytes, _ := res.NodeOutput.MarshalJSON()
+		json.Unmarshal(outputBytes, &finalOutputMap)
 	}
 
 	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:        uuid.New().String(),
-		EventType:      events.EventActionCompleted,
-		Timestamp:      time.Now(),
-		Identity:       req.Identity,
-		JobNameID:      req.GetJobNameId(),
-		JobAction:      lastStepName,
-		NodeOutputJson: res.NodeOutputJson,
+		EventID:    uuid.New().String(),
+		EventType:  events.EventActionCompleted,
+		Timestamp:  time.Now(),
+		Identity:   req.Identity,
+		JobNameID:  req.GetJobNameId(),
+		JobAction:  lastStepName,
+		NodeOutput: finalOutputMap,
 	})
 
 	return res, nil

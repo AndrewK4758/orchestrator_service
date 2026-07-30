@@ -43,7 +43,7 @@ type TraceabilityEvent struct {
 	Message             string            `json:"message,omitempty"`
 	ErrorContract       *pb.ErrorContract `json:"error_contract,omitempty"`
 	Metadata            map[string]any    `json:"metadata,omitempty"`
-	NodeOutputJson      string            `json:"node_output_json,omitempty"`
+	NodeOutput          map[string]any    `json:"node_output,omitempty"`
 	RequestSnapshotJson string            `json:"request_snapshot_json,omitempty"`
 	ExtractedData       string            `json:"extracted_data,omitempty"` // Only populated on completion if needed
 }

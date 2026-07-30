@@ -16,6 +16,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -280,7 +281,8 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 	assert.Equal(t, "job_fuzz_1", cbMock.receivedSuccess.Identity.JobId)
 
 	// Validate the generic state wasn't corrupted in the payload delivered back to the client
-	returnedState := cbMock.receivedSuccess.GlobalState.String()
+	returnedStateBytes, _ := protojson.Marshal(cbMock.receivedSuccess.GlobalState)
+	returnedState := string(returnedStateBytes)
 	assert.NotEmpty(t, returnedState)
 	assert.Contains(t, returnedState, "Value1")
 	assert.Contains(t, returnedState, "ArbitraryData")
@@ -428,14 +430,29 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 	tests := []struct {
 		name          string
 		jobID         string
-		correctedJson string
+		corrected     *structpb.Struct
 		setupKV       func(*testing.T, *mockKeyValue)
 		validate      func(*testing.T, *pb.ResumeJobResponse, *mockPublisher, bool)
 	}{
 		{
 			name:          "TestResumeJob_MergeArbitraryJson",
 			jobID:         "job_merge",
-			correctedJson: `{"unknown_top_level": {"nested": "value"}, "list_field": [1,2,3]}`,
+			corrected: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"unknown_top_level": structpb.NewStructValue(&structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"nested": structpb.NewStringValue("value"),
+						},
+					}),
+					"list_field": structpb.NewListValue(&structpb.ListValue{
+						Values: []*structpb.Value{
+							structpb.NewNumberValue(1),
+							structpb.NewNumberValue(2),
+							structpb.NewNumberValue(3),
+						},
+					}),
+				},
+			},
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
 					Identity:        &pb.InfrastructureIdentity{JobId: "job_merge", TenantId: "tenant_1", AppId: "app_1"},
@@ -459,7 +476,11 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 		{
 			name:          "TestResumeJob_Success",
 			jobID:         "job_success",
-			correctedJson: `{"msg": "success"}`,
+			corrected: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"msg": structpb.NewStringValue("success"),
+				},
+			},
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				initialReq := &pb.ExecuteWorkflowNodeRequest{
 					Identity:        &pb.InfrastructureIdentity{JobId: "job_success", TenantId: "tenant_1", AppId: "app_1"},
@@ -482,7 +503,9 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 		{
 			name:          "TestResumeJob_NotFound",
 			jobID:         "job_missing",
-			correctedJson: `{}`,
+			corrected: &structpb.Struct{
+				Fields: map[string]*structpb.Value{},
+			},
 			setupKV: func(t *testing.T, kv *mockKeyValue) {
 				kv.getFn = func(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
 					return nil, jetstream.ErrKeyNotFound
@@ -517,7 +540,7 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 
 			resumeReq := &pb.ResumeJobRequest{
 				Identity:      &pb.InfrastructureIdentity{JobId: tt.jobID, TenantId: "tenant_1", AppId: "app_1"},
-				CorrectedJson: tt.correctedJson,
+				Corrected: tt.corrected,
 			}
 
 			res, err := srv.ResumeJob(context.Background(), resumeReq)

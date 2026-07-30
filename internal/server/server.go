@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/types/known/structpb"
 
 
 	"orchestrator_service/internal/cache_client"
@@ -262,9 +265,10 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", jobID, req.StepId, err)
 		} else if cacheResp.Hit {
 			validCacheHit := true
-			if req.NodeConfig != nil && req.NodeConfig.ExpectedSchema != "" {
+			if req.NodeConfig != nil && req.NodeConfig.ExpectedSchemaStruct != nil {
 				compiler := jsonschema.NewCompiler()
-				if err := compiler.AddResource("schema.json", strings.NewReader(req.NodeConfig.ExpectedSchema)); err == nil {
+				schemaBytes, _ := req.NodeConfig.ExpectedSchemaStruct.MarshalJSON()
+				if err := compiler.AddResource("schema.json", bytes.NewReader(schemaBytes)); err == nil {
 					if schema, err := compiler.Compile("schema.json"); err == nil {
 						var v interface{}
 						if err := json.Unmarshal([]byte(cacheResp.ExtractedPayload), &v); err == nil {
@@ -283,9 +287,14 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			if validCacheHit {
 				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.Cache.Confidence)
 				if cacheResp.ExtractedPayload != "" {
-					req.NodeOutputJson = cacheResp.ExtractedPayload
+					var outputMap map[string]any
+					if err := json.Unmarshal([]byte(cacheResp.ExtractedPayload), &outputMap); err == nil {
+						if parsedStruct, err := structpb.NewStruct(outputMap); err == nil {
+							req.NodeOutput = parsedStruct
+						}
+					}
 				}
-				err := s.fireCallback(execCtx, req, &engine.StepResult{Request: req, NodeOutputJson: req.NodeOutputJson})
+				err := s.fireCallback(execCtx, req, &engine.StepResult{Request: req, NodeOutput: req.NodeOutput})
 				if err != nil {
 					return fmt.Errorf("failed to fire callback for cache hit: %w", err)
 				}
@@ -430,12 +439,12 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	logger.Info("System", "Resuming job %s after human correction", jobID)
 
 	// Merge the corrected JSON into the original state context
-	if req.GetCorrectedJson() != "" {
-		stepReq.NodeOutputJson = req.GetCorrectedJson()
+	if req.GetCorrected() != nil {
+		stepReq.NodeOutput = req.GetCorrected()
 	}
 
 	// Immediately fire webhook callback instead of publishing to JetStream priority queue
-	err = s.fireCallback(ctx, stepReq, &engine.StepResult{Request: stepReq, NodeOutputJson: stepReq.NodeOutputJson})
+	err = s.fireCallback(ctx, stepReq, &engine.StepResult{Request: stepReq, NodeOutput: stepReq.NodeOutput})
 	if err != nil {
 		logger.Error("System", "Failed to fire callback for resumed job: %v", err)
 		return nil, fmt.Errorf("failed to fire callback for resumed job: %w", err)
@@ -560,7 +569,7 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	req.NodeOutputJson = evt.Request.NodeOutputJson
+	req.NodeOutput = evt.Request.NodeOutput
 	req.ErrorContract = evt.ErrorContract
 
 	var err error

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	pb "github.com/AndrewK4758/shared_protos"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
@@ -29,7 +30,7 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 			Source:  "ai_worker",
 		},
 		Metadata:       map[string]any{"key1": "val1"},
-		NodeOutputJson: `{"result":"ok"}`,
+		NodeOutput:     map[string]any{"result": "ok"},
 		ExtractedData:  "sample extracted data",
 	}
 
@@ -72,8 +73,8 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 	if unmarshaled.ErrorContract.GetCode() != "ERR_001" {
 		t.Errorf("ErrorContract.Code mismatch: expected 'ERR_001', got %q", unmarshaled.ErrorContract.GetCode())
 	}
-	if unmarshaled.NodeOutputJson != `{"result":"ok"}` {
-		t.Errorf("NodeOutputJson mismatch: expected %q, got %q", `{"result":"ok"}`, unmarshaled.NodeOutputJson)
+	if val, ok := unmarshaled.NodeOutput["result"]; !ok || val != "ok" {
+		t.Errorf("NodeOutput mismatch: expected result: ok, got %+v", unmarshaled.NodeOutput)
 	}
 }
 
@@ -102,8 +103,8 @@ func TestTraceabilityEvent_NilFields(t *testing.T) {
 	if unmarshaled.ErrorContract != nil {
 		t.Errorf("Expected nil ErrorContract, got %+v", unmarshaled.ErrorContract)
 	}
-	if unmarshaled.NodeOutputJson != "" {
-		t.Errorf("Expected empty NodeOutputJson, got %+v", unmarshaled.NodeOutputJson)
+	if len(unmarshaled.NodeOutput) != 0 {
+		t.Errorf("Expected empty NodeOutput, got %+v", unmarshaled.NodeOutput)
 	}
 }
 
@@ -118,9 +119,17 @@ func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 			StepId: "step-42",
 			NodeConfig: &pb.NodeConfiguration{
 				TargetWorkerSubject: "worker.ai.inference",
-				ExpectedSchema:      `{"type":"object"}`,
+				ExpectedSchemaStruct: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"type": structpb.NewStringValue("object"),
+					},
+				},
 			},
-			NodeOutputJson: `{"status":"completed"}`,
+			NodeOutput: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"status": structpb.NewStringValue("completed"),
+				},
+			},
 		},
 		ErrorContract: &pb.ErrorContract{
 			Code:    "ERR_WEBHOOK",
@@ -147,8 +156,8 @@ func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 	if unmarshaled.Request == nil {
 		t.Fatalf("Request is nil after unmarshaling!")
 	}
-	if unmarshaled.Request.GetStepId() != "step-42" {
-		t.Errorf("Request.StepId mismatch: expected 'step-42', got %q", unmarshaled.Request.GetStepId())
+	if val := unmarshaled.Request.NodeOutput.Fields["status"].GetStringValue(); val != "completed" {
+		t.Errorf("NodeOutput mismatch: expected %q, got %q", "completed", val)
 	}
 	if unmarshaled.Request.Identity == nil {
 		t.Fatalf("Request.Identity is nil after unmarshaling!")
