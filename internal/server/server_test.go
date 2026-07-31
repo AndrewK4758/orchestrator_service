@@ -236,15 +236,15 @@ func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
 		Cache: &pb.CacheContract{
 			Enabled:        true,
 			CollectionName: "test_cache",
-			LookupInput:    "test",
 		},
 	}
 
 	srv.cacheClient = &mockCacheClient{
 		checkCacheFn: func(ctx context.Context, in *pb.CheckCacheRequest, opts ...grpc.CallOption) (*pb.CheckCacheResponse, error) {
-			// Validate identity was forwarded correctly
+			// Validate request was forwarded correctly
 			assert.NotNil(t, in.Identity)
 			assert.Equal(t, "job_fuzz_1", in.Identity.JobId)
+			assert.Equal(t, "test_cache", in.CollectionName)
 			return &pb.CheckCacheResponse{
 				Hit:              true,
 				Confidence:       1.0,
@@ -367,7 +367,6 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 		Cache: &pb.CacheContract{
 			Enabled:        true,
 			CollectionName: "test_cache",
-			LookupInput:    "test",
 		},
 	}
 

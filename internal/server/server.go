@@ -6,16 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/AndrewK4758/shared_utils/envutil"
-	"github.com/AndrewK4758/shared_utils/logger"
-	"github.com/AndrewK4758/shared_utils/workflowparser"
 	"io"
 	"strings"
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/types/known/structpb"
+	"github.com/AndrewK4758/shared_utils/envutil"
+	"github.com/AndrewK4758/shared_utils/logger"
+	"github.com/AndrewK4758/shared_utils/workflowparser"
 
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"orchestrator_service/internal/cache_client"
 	"orchestrator_service/internal/engine"
@@ -45,8 +45,8 @@ type JobExecInfo struct {
 type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
 
-	eng      *engine.Engine
-	pub      JobPublisher
+	eng *engine.Engine
+	pub JobPublisher
 
 	kvStore      jetstream.KeyValue
 	activeExecMu sync.RWMutex
@@ -115,10 +115,10 @@ func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.Traceabilit
 	}
 
 	srv := &OrchestratorServer{
-		eng:          eng,
-		pub:          pub,
-		kvStore:      kvStore,
-		activeExecs:  make(map[string]*JobExecInfo),
+		eng:                  eng,
+		pub:                  pub,
+		kvStore:              kvStore,
+		activeExecs:          make(map[string]*JobExecInfo),
 		traceClient:          traceClient,
 		cacheClient:          cacheClient,
 		webhookConns:         make(map[string]*grpc.ClientConn),
@@ -245,19 +245,23 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		s.activeExecMu.Unlock()
 	}()
 
-
 	// ZERO-SHOT CACHE BYPASS (remove tracker references, use execCtx)
 	cacheConfig := parser.GetCacheContract()
 	if cacheConfig != nil && cacheConfig.Enabled && s.cacheClient != nil {
 		logger.Info("Server", "[JobID: %s | StepID: %s] Cache bypass enabled. Querying collection: %s", jobID, parser.GetStepId(), cacheConfig.CollectionName)
+		logger.Info("Server", "[JobID: %s | StepID: %s] Cache Inputs -> MetadataLookup: %v | EmbeddingLookup provided: %t", 
+			jobID, parser.GetStepId(), cacheConfig.MetadataLookup, cacheConfig.EmbeddingLookup != nil)
+
 
 		ctxCache, cancelCache := context.WithTimeout(execCtx, time.Duration(s.cacheTimeoutSecs)*time.Second)
 		cacheResp, err := s.cacheClient.CheckCache(ctxCache, &pb.CheckCacheRequest{
-			CollectionName: cacheConfig.CollectionName,
-			Text:           cacheConfig.LookupInput,
-			Identity:       parser.GetIdentity(),
-			Threshold:      cacheConfig.Confidence,
-			Metadata:       parser.GetMetadata(),
+			Enabled:         cacheConfig.Enabled,
+			CollectionName:  cacheConfig.CollectionName,
+			CacheHit:        cacheConfig.CacheHit,
+			Confidence:      cacheConfig.Confidence,
+			EmbeddingLookup: cacheConfig.EmbeddingLookup,
+			MetadataLookup:  cacheConfig.MetadataLookup,
+			Identity:        parser.GetIdentity(),
 		})
 		cancelCache()
 
@@ -270,7 +274,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 				schemaBytes, _ := req.NodeConfig.ExpectedSchemaStruct.MarshalJSON()
 				if err := compiler.AddResource("schema.json", bytes.NewReader(schemaBytes)); err == nil {
 					if schema, err := compiler.Compile("schema.json"); err == nil {
-						var v interface{}
+						var v any
 						if err := json.Unmarshal([]byte(cacheResp.ExtractedPayload), &v); err == nil {
 							if err := schema.Validate(v); err != nil {
 								logger.Warn("Server", "[JobID: %s | StepID: %s] CACHE HIT payload failed schema validation: %v. Treating as cache miss.", jobID, req.StepId, err)
@@ -312,7 +316,10 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for job already waiting in KV store. Ignoring.", jobID, req.StepId)
 			return nil
 		}
-		_, _ = s.kvStore.Put(execCtx, jobID, reqBytes)
+		if _, err := s.kvStore.Put(execCtx, jobID, reqBytes); err != nil {
+			logger.Error("Server", "[JobID: %s] Failed to put job in KV store: %v", jobID, err)
+			return fmt.Errorf("failed to put job in KV store: %w", err)
+		}
 	}
 
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)

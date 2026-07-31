@@ -123,7 +123,9 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		_ = workersStream.Purge(ctx)
 		_ = aiResponsesStream.Purge(ctx)
 		_ = orchestratorResponsesStream.Purge(ctx)
-		_ = js.DeleteKeyValue(ctx, KVActiveJobs)
+		if kvStream, err := js.Stream(ctx, "KV_"+KVActiveJobs); err == nil {
+			_ = kvStream.Purge(ctx)
+		}
 	}
 
 	return &Publisher{
@@ -307,7 +309,8 @@ func (p *Publisher) GetActiveJobsKV(ctx context.Context) (jetstream.KeyValue, er
 	if err != nil {
 		if errors.Is(err, jetstream.ErrBucketNotFound) {
 			kv, err = p.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-				Bucket: KVActiveJobs,
+				Bucket:  KVActiveJobs,
+				Storage: jetstream.MemoryStorage,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to create active_jobs KV bucket: %w", err)

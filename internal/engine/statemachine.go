@@ -153,8 +153,13 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 
 	entry, err := e.kvStore.Get(context.Background(), jobID)
 	if err != nil {
-		logger.Warn("Engine", "Job %s not found in KV store for async response, ignoring", jobID)
-		msg.Ack()
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			logger.Warn("Engine", "Job %s not found in KV store for async response, ignoring", jobID)
+			msg.Ack()
+		} else {
+			logger.Error("Engine", "Failed to get job %s from KV store: %v", jobID, err)
+			msg.NakWithDelay(5 * time.Second)
+		}
 		return
 	}
 
@@ -216,7 +221,15 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 								req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
 
 								if reqBytes, err := proto.Marshal(req); err == nil {
-									_, _ = e.kvStore.Put(context.Background(), jobID, reqBytes)
+									if _, putErr := e.kvStore.Put(context.Background(), jobID, reqBytes); putErr != nil {
+										logger.Error("Engine", "Failed to put retried job in KV store: %v", putErr)
+										msg.NakWithDelay(5 * time.Second)
+										return
+									}
+								} else {
+									logger.Error("Engine", "Failed to marshal retried job for KV store: %v", err)
+									msg.NakWithDelay(5 * time.Second)
+									return
 								}
 								_, _ = e.executeGenericStep(context.Background(), req)
 								msg.Ack()
@@ -381,6 +394,10 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	if subject == "" {
 		return nil, fmt.Errorf("target worker subject is empty")
 	}
+
+	// Append Identity to Subject for Multi-Tenant Routing and Observability
+	// Format: subject.AppID.TenantID.JobID
+	subject = fmt.Sprintf("%s.%s.%s.%s", subject, a, t, j)
 
 	reqBytes, err := proto.Marshal(req)
 	if err != nil {
