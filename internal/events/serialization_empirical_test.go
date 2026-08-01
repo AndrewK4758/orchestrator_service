@@ -20,7 +20,8 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 			AppId:    "app-B",
 			JobId:    "job-C",
 		},
-		JobNameID: 42,
+		GraphID: "00000000-0000-0000-0000-000000000001",
+		InitialNodeID: "00000000-0000-0000-0000-000000000002",
 		Stage:     "execution",
 		JobAction: "ai_inference",
 		ChunkID:   "chunk-1",
@@ -64,8 +65,11 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 	if unmarshaled.Identity.GetJobId() != "job-C" {
 		t.Errorf("Identity.JobId mismatch: expected 'job-C', got %q", unmarshaled.Identity.GetJobId())
 	}
-	if unmarshaled.JobNameID != original.JobNameID {
-		t.Errorf("JobNameID mismatch: expected %d, got %d", original.JobNameID, unmarshaled.JobNameID)
+	if unmarshaled.GraphID != original.GraphID {
+		t.Errorf("GraphID mismatch: expected %s, got %s", original.GraphID, unmarshaled.GraphID)
+	}
+	if unmarshaled.InitialNodeID != original.InitialNodeID {
+		t.Errorf("InitialNodeID mismatch: expected %s, got %s", original.InitialNodeID, unmarshaled.InitialNodeID)
 	}
 	if unmarshaled.ErrorContract == nil {
 		t.Fatalf("ErrorContract is nil after unmarshaling!")

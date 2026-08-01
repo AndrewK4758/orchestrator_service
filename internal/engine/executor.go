@@ -49,10 +49,9 @@ type StepResult struct {
 type Engine struct {
 	maxInferenceRetries int32
 	publishMaxRetries   int
-	cacheClient      pb.SemanticCacheServiceClient
-	pub              TracePublisher
-	pendingCacheJobs sync.Map
-	chunkingClient   pb.DocumentProcessingServiceClient
+	cacheClient         pb.SemanticCacheServiceClient
+	pub                 TracePublisher
+	pendingCacheJobs    sync.Map
 
 	nc       *nats.Conn
 	js       jetstream.JetStream
@@ -93,13 +92,13 @@ func NewEngine(ctx context.Context, cacheClient pb.SemanticCacheServiceClient, p
 	setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	streamName := "ORCHESTRATOR_RESPONSES"
+	streamName := envutil.MustGetString("NATS_ORCHESTRATOR_RESPONSES_STREAM")
 	_, err = js.CreateOrUpdateStream(setupCtx, jetstream.StreamConfig{
 		Name:     streamName,
-		Subjects: []string{"orchestrator.responses.>", "orchestrator.response.>"},
-		MaxAge:   1 * time.Hour,
-		MaxBytes: 1024 * 1024 * 1024,
-		MaxMsgs:  100000,
+		Subjects: envutil.MustGetStringSlice("NATS_ORCHESTRATOR_RESPONSES_SUBJECTS"),
+		MaxAge:   time.Duration(envutil.MustGetInt("NATS_ORCHESTRATOR_RESPONSES_MAX_AGE_HOURS")) * time.Hour,
+		MaxBytes: int64(envutil.MustGetInt("NATS_ORCHESTRATOR_RESPONSES_MAX_BYTES")),
+		MaxMsgs:  int64(envutil.MustGetInt("NATS_ORCHESTRATOR_RESPONSES_MAX_MSGS")),
 		Discard:  jetstream.DiscardOld,
 	})
 	if err != nil {
@@ -140,11 +139,11 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	replySubj := msg.Subject()
 
 	parts := strings.Split(replySubj, ".")
-	if len(parts) < 4 {
+	if len(parts) < envutil.MustGetInt("NATS_REPLY_SUBJ_MIN_PARTS") {
 		msg.Ack()
 		return
 	}
-	jobID := parts[3]
+	jobID := parts[len(parts)-1]
 
 	if e.kvStore == nil {
 		msg.Ack()
@@ -158,7 +157,7 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 			msg.Ack()
 		} else {
 			logger.Error("Engine", "Failed to get job %s from KV store: %v", jobID, err)
-			msg.NakWithDelay(5 * time.Second)
+			msg.NakWithDelay(time.Duration(envutil.MustGetInt("NATS_NAK_DELAY_SECONDS")) * time.Second)
 		}
 		return
 	}
@@ -177,9 +176,9 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	}
 	t, a, j := req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-		Component: "Orchestrator",
-		Event:     "DEQUEUED",
-		Stream:    "ORCHESTRATOR_RESPONSES",
+		Component: envutil.MustGetString("LOG_COMPONENT_ORCHESTRATOR"),
+		Event:     envutil.MustGetString("LOG_EVENT_DEQUEUED"),
+		Stream:    envutil.MustGetString("NATS_ORCHESTRATOR_RESPONSES_STREAM"),
 		Subject:   replySubj,
 		Consumer:  e.clientID,
 		TenantID:  t,
@@ -218,17 +217,16 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 
 							if req.InferenceRetryCount < maxRetries {
 								logger.Warn("Engine", "JSON schema validation failed, retrying (count: %d): %v", req.InferenceRetryCount, err)
-								req.NodeConfig.SystemInstructions += "\n[VALIDATION FAILED]: " + err.Error()
 
 								if reqBytes, err := proto.Marshal(req); err == nil {
 									if _, putErr := e.kvStore.Put(context.Background(), jobID, reqBytes); putErr != nil {
 										logger.Error("Engine", "Failed to put retried job in KV store: %v", putErr)
-										msg.NakWithDelay(5 * time.Second)
+										msg.NakWithDelay(time.Duration(envutil.MustGetInt("NATS_NAK_DELAY_SECONDS")) * time.Second)
 										return
 									}
 								} else {
 									logger.Error("Engine", "Failed to marshal retried job for KV store: %v", err)
-									msg.NakWithDelay(5 * time.Second)
+									msg.NakWithDelay(time.Duration(envutil.MustGetInt("NATS_NAK_DELAY_SECONDS")) * time.Second)
 									return
 								}
 								_, _ = e.executeGenericStep(context.Background(), req)
@@ -268,7 +266,8 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 		EventType:           eventType,
 		Timestamp:           time.Now(),
 		Identity:            req.Identity,
-		JobNameID:           req.GetJobNameId(),
+		GraphID:             req.GetGraphId(),
+		InitialNodeID:       req.GetInitialNodeId(),
 		JobAction:           req.NodeConfig.GetNodeName(),
 		ErrorContract:       errContract,
 		NodeOutput:          outputMap,
@@ -292,7 +291,7 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	msg.Ack()
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
 		Component:  "Orchestrator",
-		Event:      "ACKNOWLEDGED",
+		Event:      envutil.MustGetString("LOG_EVENT_ACKNOWLEDGED"),
 		Stream:     "ORCHESTRATOR_RESPONSES",
 		Subject:    replySubj,
 		Consumer:   e.clientID,
@@ -304,10 +303,6 @@ func (e *Engine) ProcessJetStreamMessage(msg jetstream.Msg) {
 	})
 }
 
-func (e *Engine) SetChunkingClient(client pb.DocumentProcessingServiceClient) {
-	e.chunkingClient = client
-}
-
 func (e *Engine) Close() {
 	if e.sub != nil {
 		e.sub.Stop()
@@ -317,20 +312,25 @@ func (e *Engine) Close() {
 	}
 }
 
-func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
+func (e *Engine) ExecuteNode(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*StepResult, error) {
 	if req == nil || req.NodeConfig == nil {
 		return nil, fmt.Errorf("invalid request")
 	}
 
 	lastStepName := req.NodeConfig.NodeName
 
+	marshaler := protojson.MarshalOptions{EmitUnpopulated: true}
+	reqSnapshotBytes, _ := marshaler.Marshal(req)
+
 	_ = e.pub.PublishTrace(ctx, events.TraceabilityEvent{
-		EventID:   uuid.New().String(),
-		EventType: events.EventActionStarted,
-		Timestamp: time.Now(),
-		Identity:  req.Identity,
-		JobNameID: req.GetJobNameId(),
-		JobAction: lastStepName,
+		EventID:             uuid.New().String(),
+		EventType:           events.EventActionStarted,
+		Timestamp:           time.Now(),
+		Identity:            req.Identity,
+		GraphID:             req.GetGraphId(),
+		InitialNodeID:       req.GetInitialNodeId(),
+		JobAction:           lastStepName,
+		RequestSnapshotJson: string(reqSnapshotBytes),
 	})
 
 	res, err := e.executeGenericStep(ctx, req)
@@ -349,7 +349,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 			EventType: events.EventActionFailed,
 			Timestamp: time.Now(),
 			Identity:  req.Identity,
-			JobNameID: req.GetJobNameId(),
+			GraphID:       req.GetGraphId(),
+			InitialNodeID: req.GetInitialNodeId(),
 			JobAction: lastStepName,
 			ErrorContract: &pb.ErrorContract{
 				Code:    "500",
@@ -376,7 +377,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, req *pb.ExecuteWorkflowNod
 		EventType:  events.EventActionCompleted,
 		Timestamp:  time.Now(),
 		Identity:   req.Identity,
-		JobNameID:  req.GetJobNameId(),
+		GraphID:    req.GetGraphId(),
+		InitialNodeID: req.GetInitialNodeId(),
 		JobAction:  lastStepName,
 		NodeOutput: finalOutputMap,
 	})
@@ -432,9 +434,9 @@ func (e *Engine) executeGenericStep(ctx context.Context, req *pb.ExecuteWorkflow
 	}
 
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-		Component: "Orchestrator",
-		Event:     "ENQUEUED",
-		Stream:    "WORKERS",
+		Component: envutil.MustGetString("LOG_COMPONENT_ORCHESTRATOR"),
+		Event:     envutil.MustGetString("LOG_EVENT_ENQUEUED"),
+		Stream:    envutil.MustGetString("NATS_WORKERS_STREAM"),
 		Subject:   subject,
 		TenantID:  t,
 		AppID:     a,

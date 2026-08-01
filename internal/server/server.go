@@ -66,7 +66,6 @@ type OrchestratorServer struct {
 type JobPublisher interface {
 	engine.TracePublisher
 	PublishJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error
-	PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error
 	ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
 	PublishWebhook(ctx context.Context, payload *events.WebhookEvent) error
 	ConsumeWebhooks(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error
@@ -101,17 +100,6 @@ func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.Traceabilit
 	if err != nil {
 		logger.Error("System", "Failed to initialize engine: %v", err)
 		panic(fmt.Errorf("failed to initialize engine: %w", err))
-	}
-
-	docProcAddr := envutil.MustGetString("DOCUMENT_PROCESSING_SERVICE_ADDRESS")
-	if docProcAddr == "" {
-		panic("DOCUMENT_PROCESSING_SERVICE_ADDRESS environment variable is required")
-	}
-	docConn, err := grpc.NewClient(docProcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		logger.Warn("System", "failed to connect to document processing service: %v", err)
-	} else {
-		eng.SetChunkingClient(pb.NewDocumentProcessingServiceClient(docConn))
 	}
 
 	srv := &OrchestratorServer{
@@ -178,8 +166,11 @@ func (s *OrchestratorServer) ExecuteWorkflowNode(ctx context.Context, req *pb.Ex
 	msgId := fmt.Sprintf("%s-%s", jobID, req.StepId)
 	msgId = sanitizeMsgId(msgId)
 
-	//move 5 to env variable
-	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pubTimeoutSecs := envutil.MustGetInt("PUBLISH_TIMEOUT_SECONDS")
+	if pubTimeoutSecs <= 0 {
+		pubTimeoutSecs = 5
+	}
+	pubCtx, cancel := context.WithTimeout(ctx, time.Duration(pubTimeoutSecs)*time.Second)
 	defer cancel()
 
 	err = s.pub.PublishJob(pubCtx, req.Identity, msgId, payloadBytes)
@@ -216,8 +207,12 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 	}
 	_, appID, jobID := parser.ExtractIdentity()
 
-	if s.traceClient != nil { //move 2 to environment variable
-		ctxTrace, cancelTrace := context.WithTimeout(ctx, 2*time.Second)
+	if s.traceClient != nil {
+		traceTimeoutSecs := envutil.MustGetInt("TRACEABILITY_TIMEOUT_SECONDS")
+		if traceTimeoutSecs <= 0 {
+			traceTimeoutSecs = 2
+		}
+		ctxTrace, cancelTrace := context.WithTimeout(ctx, time.Duration(traceTimeoutSecs)*time.Second)
 		resp, err := s.traceClient.GetJobState(ctxTrace, &pb.GetJobStateRequest{Identity: parser.GetIdentity()})
 		cancelTrace()
 		if err == nil && resp.Found && resp.Job != nil && (resp.Job.Status == StatusCompleted || resp.Job.Status == StatusFailed) {
@@ -266,7 +261,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 		cancelCache()
 
 		if err != nil {
-			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard ReAct execution.", jobID, req.StepId, err)
+			logger.Warn("Server", "[JobID: %s | StepID: %s] Cache bypass query failed: %v. Falling back to standard step execution.", jobID, req.StepId, err)
 		} else if cacheResp.Hit {
 			validCacheHit := true
 			if req.NodeConfig != nil && req.NodeConfig.ExpectedSchemaStruct != nil {
@@ -289,7 +284,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			}
 
 			if validCacheHit {
-				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing ReAct Engine entirely.", jobID, req.StepId, cacheResp.Confidence, req.Cache.Confidence)
+				logger.Success("Server", "[JobID: %s | StepID: %s] CACHE HIT! Confidence: %.2f (Threshold: %.3f). Bypassing step execution via cache hit.", jobID, req.StepId, cacheResp.Confidence, req.Cache.Confidence)
 				if cacheResp.ExtractedPayload != "" {
 					var outputMap map[string]any
 					if err := json.Unmarshal([]byte(cacheResp.ExtractedPayload), &outputMap); err == nil {
@@ -306,7 +301,7 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			}
 		}
 
-		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard ReAct execution.", jobID, req.StepId)
+		logger.Info("Server", "[JobID: %s | StepID: %s] CACHE MISS. Proceeding with standard step execution.", jobID, req.StepId)
 	}
 
 	// Save request to KV store for async hydration (with deduplication check)
@@ -316,15 +311,25 @@ func (s *OrchestratorServer) handleJobMessage(ctx context.Context, msg jetstream
 			logger.Info("Server", "[JobID: %s | StepID: %s] Duplicate message received for job already waiting in KV store. Ignoring.", jobID, req.StepId)
 			return nil
 		}
-		if _, err := s.kvStore.Put(execCtx, jobID, reqBytes); err != nil {
-			logger.Error("Server", "[JobID: %s] Failed to put job in KV store: %v", jobID, err)
-			return fmt.Errorf("failed to put job in KV store: %w", err)
+		var putErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if _, putErr = s.kvStore.Put(execCtx, jobID, reqBytes); putErr == nil {
+				break
+			}
+			if attempt < 3 {
+				logger.Warn("Server", "[JobID: %s] Failed to put job in KV store (attempt %d). Retrying in 250ms... Error: %v", jobID, attempt, putErr)
+				time.Sleep(250 * time.Millisecond)
+			}
+		}
+		if putErr != nil {
+			logger.Error("Server", "[JobID: %s] Failed to put job in KV store after 3 attempts: %v", jobID, putErr)
+			return fmt.Errorf("failed to put job in KV store: %w", putErr)
 		}
 	}
 
 	logger.Info("System", "Executing step %s for job %s", req.NodeConfig.NodeName, jobID)
 
-	res, err := s.eng.ExecuteWorkflow(execCtx, req)
+	res, err := s.eng.ExecuteNode(execCtx, req)
 
 	if err != nil {
 		if errors.Is(err, engine.ErrAsyncPending) {

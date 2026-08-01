@@ -30,9 +30,10 @@ type TraceabilityEvent struct {
 	EventType EventType `json:"event_type"`
 	Timestamp time.Time `json:"timestamp"`
 
-	// Compliance & Security Metadata (Crucial for Title/Closing Attorneys)
+	// Compliance & Security Metadata
 	Identity  *pb.InfrastructureIdentity `json:"identity,omitempty"`
-	JobNameID int32                      `json:"job_name_id,omitempty"`
+	GraphID         string                     `json:"graph_id,omitempty"`
+	InitialNodeID   string                     `json:"initial_node_id,omitempty"`
 
 	Stage     string `json:"stage,omitempty"`
 	JobAction string `json:"job_action,omitempty"`

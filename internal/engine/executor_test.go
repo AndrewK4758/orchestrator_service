@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -319,4 +320,195 @@ func TestProcessJetStreamMessage_SchemaValidationFailure_Exhausted(t *testing.T)
 	// Assert it published a Suspended webhook
 	mockPub.AssertCalled(t, "PublishWebhook", mock.Anything, mock.Anything)
 	mockMsg.AssertCalled(t, "Ack")
+}
+
+func TestEngine_ProcessJetStreamMessage_WebhookCallback_TableDriven(t *testing.T) {
+	tests := []struct {
+		name                   string
+		jobID                  string
+		callbackAddress        string
+		inferenceRetryCount    int32
+		maxInferenceRetries    int32
+		expectedSchemaStruct   *structpb.Struct
+		workerResponse         *pb.PerformActionResponse
+		expectedEventType      events.EventType
+		expectedIsSuspended    bool
+		expectErrorContract    bool
+		expectedErrorCode      string
+		expectedErrorMsgPrefix string
+	}{
+		{
+			name:                 "Successful worker execution triggers success webhook event",
+			jobID:                "job-success-123",
+			callbackAddress:      "http://client-callback.internal/webhook",
+			inferenceRetryCount:  0,
+			maxInferenceRetries:  3,
+			expectedSchemaStruct: nil,
+			workerResponse: &pb.PerformActionResponse{
+				Success: true,
+				ActionResult: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"status": structpb.NewStringValue("completed"),
+					},
+				},
+			},
+			expectedEventType:   events.EventActionCompleted,
+			expectedIsSuspended: false,
+			expectErrorContract: false,
+		},
+		{
+			name:                 "Worker error contract triggers failure webhook event",
+			jobID:                "job-err-456",
+			callbackAddress:      "http://client-callback.internal/webhook",
+			inferenceRetryCount:  0,
+			maxInferenceRetries:  3,
+			expectedSchemaStruct: nil,
+			workerResponse: &pb.PerformActionResponse{
+				Success: false,
+				ErrorContract: &pb.ErrorContract{
+					Code:    "500",
+					Message: "Worker internal failure",
+				},
+			},
+			expectedEventType:      events.EventActionFailed,
+			expectedIsSuspended:    false,
+			expectErrorContract:    true,
+			expectedErrorCode:      "500",
+			expectedErrorMsgPrefix: "Worker internal failure",
+		},
+		{
+			name:                 "Validation retry exhaustion triggers job suspension event",
+			jobID:                "job-exhausted-789",
+			callbackAddress:      "http://client-callback.internal/webhook",
+			inferenceRetryCount:  3, // Already at max retries (3 >= 3)
+			maxInferenceRetries:  3,
+			expectedSchemaStruct: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"type": structpb.NewStringValue("object"),
+					"properties": structpb.NewStructValue(&structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"required_field": structpb.NewStructValue(&structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"type": structpb.NewStringValue("string"),
+								},
+							}),
+						},
+					}),
+					"required": structpb.NewListValue(&structpb.ListValue{
+						Values: []*structpb.Value{
+							structpb.NewStringValue("required_field"),
+						},
+					}),
+				},
+			},
+			workerResponse: &pb.PerformActionResponse{
+				Success: true,
+				ActionResult: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"unexpected_field": structpb.NewStringValue("invalid_payload"),
+					},
+				},
+			},
+			expectedEventType:      events.EventActionFailed,
+			expectedIsSuspended:    true,
+			expectErrorContract:    true,
+			expectedErrorCode:      "400",
+			expectedErrorMsgPrefix: "ValidationRetryExhausted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockPub := new(MockTracePublisher)
+			mockKV := new(MockKV)
+			mockMsg := new(MockMsg)
+
+			engine := &Engine{
+				pub:                 mockPub,
+				kvStore:             mockKV,
+				clientID:            "test-client-id",
+				maxInferenceRetries: tt.maxInferenceRetries,
+				publishMaxRetries:   3,
+			}
+
+			req := &pb.ExecuteWorkflowNodeRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "tenant-1",
+					AppId:    "app-1",
+					JobId:    tt.jobID,
+				},
+				CallbackAddress:     tt.callbackAddress,
+				InferenceRetryCount: tt.inferenceRetryCount,
+				NodeConfig: &pb.NodeConfiguration{
+					NodeName:             "Test_Node",
+					ExpectedSchemaStruct: tt.expectedSchemaStruct,
+					TargetWorkerSubject:  "worker.test",
+				},
+			}
+			reqBytes, err := proto.Marshal(req)
+			if err != nil {
+				t.Fatalf("failed to marshal request: %v", err)
+			}
+
+			respBytes, err := proto.Marshal(tt.workerResponse)
+			if err != nil {
+				t.Fatalf("failed to marshal worker response: %v", err)
+			}
+
+			// Mock KV Setup
+			mockKV.On("Get", mock.Anything, tt.jobID).Return(MockKVEntry{val: reqBytes}, nil)
+			mockKV.On("Delete", mock.Anything, tt.jobID, mock.Anything).Return(nil)
+
+			// Mock Trace & Webhook Publisher Setup
+			mockPub.On("PublishTrace", mock.Anything, mock.MatchedBy(func(evt events.TraceabilityEvent) bool {
+				return evt.EventType == tt.expectedEventType && evt.Identity.JobId == tt.jobID
+			})).Return(nil)
+
+			mockPub.On("PublishWebhook", mock.Anything, mock.MatchedBy(func(evt *events.WebhookEvent) bool {
+				if evt.Request.CallbackAddress != tt.callbackAddress {
+					return false
+				}
+				if evt.IsSuspended != tt.expectedIsSuspended {
+					return false
+				}
+				if tt.expectErrorContract {
+					if evt.ErrorContract == nil {
+						return false
+					}
+					if tt.expectedErrorCode != "" && evt.ErrorContract.Code != tt.expectedErrorCode {
+						return false
+					}
+					if tt.expectedErrorMsgPrefix != "" && !strings.HasPrefix(evt.ErrorContract.Message, tt.expectedErrorMsgPrefix) {
+						return false
+					}
+				} else {
+					if evt.ErrorContract != nil {
+						return false
+					}
+				}
+				return true
+			})).Return(nil)
+
+			// Mock JetStream Msg Setup
+			mockMsg.On("Subject").Return("orchestrator.response.test-client-id." + tt.jobID)
+			mockMsg.On("Data").Return(respBytes)
+			mockMsg.On("Ack").Return(nil)
+
+			// Execute ProcessJetStreamMessage
+			engine.ProcessJetStreamMessage(mockMsg)
+
+			// Assertions: Webhook, Trace, KV Cleanup, Ack
+			mockPub.AssertCalled(t, "PublishWebhook", mock.Anything, mock.Anything)
+			mockPub.AssertCalled(t, "PublishTrace", mock.Anything, mock.Anything)
+			mockKV.AssertCalled(t, "Get", mock.Anything, tt.jobID)
+			mockKV.AssertCalled(t, "Delete", mock.Anything, tt.jobID, mock.Anything)
+			mockMsg.AssertCalled(t, "Ack")
+
+			// Structural Assertions: Zero Graph Traversal or Next-Step Lookups
+			mockKV.AssertNotCalled(t, "Put", mock.Anything, mock.Anything, mock.Anything)
+			mockMsg.AssertNotCalled(t, "Nak")
+			mockMsg.AssertNotCalled(t, "NakWithDelay", mock.Anything)
+			mockPub.AssertNotCalled(t, "PublishCacheStore", mock.Anything, mock.Anything)
+		})
+	}
 }

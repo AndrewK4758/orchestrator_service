@@ -80,7 +80,7 @@ func main() {
 	}
 	inputPath := os.Args[1]
 
-	lis, err := net.Listen("tcp", ":50055")
+	lis, err := net.Listen("tcp", ":11115")
 	if err != nil {
 		logger.Fatal("Orchestrator", "Failed to listen for callbacks: %v", err)
 	}
@@ -91,7 +91,7 @@ func main() {
 	pb.RegisterOrchestratorCallbackServiceServer(grpcServer, artemisServer)
 
 	go func() {
-		fmt.Println("🎧 Callback Server listening on :50055")
+		fmt.Println("🎧 Callback Server listening on :11115")
 		if err := grpcServer.Serve(lis); err != nil {
 			logger.Fatal("Orchestrator", "Failed to serve callbacks: %v", err)
 		}
@@ -99,7 +99,7 @@ func main() {
 
 	time.Sleep(1 * time.Second)
 
-	conn, err := grpc.NewClient("localhost:50052", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("localhost:11112", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		logger.Fatal("Orchestrator", "Failed to connect to orchestrator: %v", err)
 	}
@@ -158,21 +158,21 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 			AppId:    "CLI_TEST_APP",
 			TenantId: "TEST_TENANT",
 		},
-		JobNameId:       42,
+		GraphId: "00000000-0000-0000-0000-000000000001", InitialNodeId: "00000000-0000-0000-0000-000000000002",
 		StepId:          "step_1",
 		GlobalState:     &globalState,
 		Metadata:        map[string]string{},
-		CallbackAddress: "localhost:50055",
+		CallbackAddress: "localhost:11115",
 		NodeConfig: &pb.NodeConfiguration{
 			TargetWorkerSubject: "worker.human.validation",
-			NodeName:            "Extract Invoice Data",
-			SystemInstructions:  "Extract the invoice number and total amount.",
+			NodeName:            "Generic Extraction Worker",
+			SystemInstructions:  "Extract required target fields.",
 			ExpectedSchemaStruct: &structpb.Struct{
 				Fields: map[string]*structpb.Value{
 					"type": structpb.NewStringValue("object"),
 					"properties": structpb.NewStructValue(&structpb.Struct{
 						Fields: map[string]*structpb.Value{
-							"invoice_number": structpb.NewStructValue(&structpb.Struct{
+							"field_1": structpb.NewStructValue(&structpb.Struct{
 								Fields: map[string]*structpb.Value{
 									"type": structpb.NewStringValue("string"),
 								},
@@ -201,7 +201,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 
 	result := <-artemis.ResultChan
 
-	fmt.Printf("\n[%s] PHASE 4: ReAct Decision (Evaluating Output)\n", jobID)
+	fmt.Printf("\n[%s] PHASE 4: Step Output Evaluation\n", jobID)
 	fmt.Printf("Decision Engine analyzed output: %s\n", result)
 	fmt.Println("Decision: Next path selected based on classification. End of demo loop.")
 }

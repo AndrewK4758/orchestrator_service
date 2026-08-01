@@ -2,7 +2,6 @@ package cache_client
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/AndrewK4758/shared_utils/envutil"
 
@@ -12,15 +11,10 @@ import (
 )
 
 func NewClient(addr string) (pb.SemanticCacheServiceClient, *grpc.ClientConn, error) {
-	if addr == "" {
-		addr = "localhost:50055"
-	}
 
-	maxMsgSizeMb := 100
-	if envVal := envutil.MustGetString("GRPC_MAX_MESSAGE_SIZE_MB"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			maxMsgSizeMb = parsed
-		}
+	maxMsgSizeMb := envutil.MustGetInt("GRPC_MAX_MESSAGE_SIZE_MB")
+	if maxMsgSizeMb <= 0 {
+		maxMsgSizeMb = 4
 	}
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))

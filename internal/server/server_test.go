@@ -22,8 +22,7 @@ import (
 )
 
 func init() {
-	os.Setenv("SEMANTIC_CACHE_SERVICE_ADDRESS", "localhost:50055")
-	os.Setenv("DOCUMENT_PROCESSING_SERVICE_ADDRESS", "localhost:50054")
+	os.Setenv("SEMANTIC_CACHE_SERVICE_ADDRESS", "localhost:11115")
 	os.Setenv("GRPC_MAX_MESSAGE_SIZE_MB", "4")
 	os.Setenv("CACHE_TIMEOUT_SECONDS", "5")
 	os.Setenv("GRPC_TIMEOUT_SECONDS", "30")
@@ -77,12 +76,7 @@ func (m *mockPublisher) PublishJob(ctx context.Context, identity *pb.Infrastruct
 	m.publishedMsgs = append(m.publishedMsgs, payload)
 	return nil
 }
-func (m *mockPublisher) PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.publishedMsgs = append(m.publishedMsgs, payload)
-	return nil
-}
+
 func (m *mockPublisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
 	return nil
 }
@@ -168,18 +162,38 @@ func TestIdempotentExecution_Concurrent(t *testing.T) {
 
 type mockCallbackServer struct {
 	pb.UnimplementedOrchestratorCallbackServiceServer
-	mu              sync.Mutex
-	receivedSuccess *pb.ExecuteWorkflowNodeRequest
-	receivedFail    *pb.ExecuteWorkflowNodeRequest
+	mu                      sync.Mutex
+	receivedSuccess         *pb.ExecuteWorkflowNodeRequest
+	receivedFail            *pb.ExecuteWorkflowNodeRequest
+	receivedSuspend         *pb.ExecuteWorkflowNodeRequest
+	receivedSuccessRequests []*pb.ExecuteWorkflowNodeRequest
+	receivedFailRequests    []*pb.ExecuteWorkflowNodeRequest
+	receivedSuspendRequests []*pb.ExecuteWorkflowNodeRequest
+	onSuccessCount          int
+	onFailCount             int
+	onSuspendCount          int
+	streamError             error
+	failError               error
+	suspendError            error
 }
 
 func (s *mockCallbackServer) OnNodeExecutionComplete(stream grpc.BidiStreamingServer[pb.ExecuteWorkflowNodeRequest, pb.NodeExecutionCompleteResponse]) error {
+	s.mu.Lock()
+	if s.streamError != nil {
+		err := s.streamError
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
 	req, err := stream.Recv()
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.receivedSuccess = req
+	s.receivedSuccessRequests = append(s.receivedSuccessRequests, req)
+	s.onSuccessCount++
 	s.mu.Unlock()
 	return stream.Send(&pb.NodeExecutionCompleteResponse{Success: true})
 }
@@ -187,8 +201,86 @@ func (s *mockCallbackServer) OnNodeExecutionComplete(stream grpc.BidiStreamingSe
 func (s *mockCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobFailedResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failError != nil {
+		return nil, s.failError
+	}
 	s.receivedFail = req
+	s.receivedFailRequests = append(s.receivedFailRequests, req)
+	s.onFailCount++
 	return &pb.JobFailedResponse{Success: true}, nil
+}
+
+func (s *mockCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobSuspendedResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.suspendError != nil {
+		return nil, s.suspendError
+	}
+	s.receivedSuspend = req
+	s.receivedSuspendRequests = append(s.receivedSuspendRequests, req)
+	s.onSuspendCount++
+	return &pb.JobSuspendedResponse{Success: true}, nil
+}
+
+func (s *mockCallbackServer) GetSuccessRequests() []*pb.ExecuteWorkflowNodeRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]*pb.ExecuteWorkflowNodeRequest, len(s.receivedSuccessRequests))
+	copy(cp, s.receivedSuccessRequests)
+	return cp
+}
+
+func (s *mockCallbackServer) GetFailRequests() []*pb.ExecuteWorkflowNodeRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]*pb.ExecuteWorkflowNodeRequest, len(s.receivedFailRequests))
+	copy(cp, s.receivedFailRequests)
+	return cp
+}
+
+func (s *mockCallbackServer) GetSuspendRequests() []*pb.ExecuteWorkflowNodeRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]*pb.ExecuteWorkflowNodeRequest, len(s.receivedSuspendRequests))
+	copy(cp, s.receivedSuspendRequests)
+	return cp
+}
+
+func (s *mockCallbackServer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receivedSuccess = nil
+	s.receivedFail = nil
+	s.receivedSuspend = nil
+	s.receivedSuccessRequests = nil
+	s.receivedFailRequests = nil
+	s.receivedSuspendRequests = nil
+	s.onSuccessCount = 0
+	s.onFailCount = 0
+	s.onSuspendCount = 0
+	s.streamError = nil
+	s.failError = nil
+	s.suspendError = nil
+}
+
+func setupMockCallbackServer(t *testing.T) (*mockCallbackServer, string, func()) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+
+	grpcServer := grpc.NewServer()
+	cbMock := &mockCallbackServer{}
+	pb.RegisterOrchestratorCallbackServiceServer(grpcServer, cbMock)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	cleanup := func() {
+		grpcServer.Stop()
+		lis.Close()
+	}
+
+	return cbMock, lis.Addr().String(), cleanup
 }
 
 func TestOrchestratorServer_GenericStateFuzzing(t *testing.T) {
@@ -387,7 +479,7 @@ func TestOrchestratorServer_CacheServiceTimeoutFallback(t *testing.T) {
 	msgBytes, _ := proto.Marshal(req)
 	err := srv.handleJobMessage(context.Background(), mockMsg{data: msgBytes})
 
-	// The ReAct engine will fail because there is no API key / mock AI setup in this basic test,
+	// The step executor engine will fail because there is no API key / mock AI setup in this basic test,
 	// but it should NOT return an error specifically from the cache service.
 	assert.NoError(t, err) // handleJobMessage itself returns nil but fires failure callback
 	assert.True(t, timeoutTriggered, "Cache service should have been queried and timed out")
@@ -606,4 +698,236 @@ func TestOrchestratorServer_PurgeSystemState(t *testing.T) {
 			tt.validate(t, srv, res, cancelCalled)
 		})
 	}
+}
+
+type webhookRoutingTestCase struct {
+	name            string
+	jobID           string
+	stepID          string
+	isSuspended     bool
+	errorContract   *pb.ErrorContract
+	overrideAddr    string // if empty, defaults to the running mock server address
+	expectError     bool
+	expectedSuccess bool
+	expectOnSuccess int
+	expectOnFail    int
+	expectOnSuspend int
+	validatePayload func(t *testing.T, req *pb.ExecuteWorkflowNodeRequest)
+}
+
+func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T) {
+	cbMock, cbAddr, cleanup := setupMockCallbackServer(t)
+	defer cleanup()
+
+	pub := &mockPublisher{}
+	srv := &OrchestratorServer{
+		pub:                  pub,
+		webhookConns:         make(map[string]*grpc.ClientConn),
+		grpcTimeoutSecs:      30,
+		grpcMaxMessageSizeMb: 4,
+	}
+
+	tests := []webhookRoutingTestCase{
+		{
+			name:            "Success_InvokesOnNodeExecutionComplete",
+			jobID:           "job_success_100",
+			stepID:          "step_parse_doc",
+			isSuspended:     false,
+			errorContract:   nil,
+			expectError:     false,
+			expectedSuccess: true,
+			expectOnSuccess: 1,
+			expectOnFail:    0,
+			expectOnSuspend: 0,
+			validatePayload: func(t *testing.T, req *pb.ExecuteWorkflowNodeRequest) {
+				assert.Equal(t, "job_success_100", req.Identity.JobId)
+				assert.Equal(t, "step_parse_doc", req.StepId)
+				assert.True(t, req.Success)
+				assert.Nil(t, req.ErrorContract)
+			},
+		},
+		{
+			name:        "Failure_InvokesOnJobFailed",
+			jobID:       "job_failed_200",
+			stepID:      "step_llm_inference",
+			isSuspended: false,
+			errorContract: &pb.ErrorContract{
+				Code:    "ERR_LLM_TIMEOUT",
+				Message: "LLM service timed out after 30s",
+			},
+			expectError:     false,
+			expectedSuccess: false,
+			expectOnSuccess: 0,
+			expectOnFail:    1,
+			expectOnSuspend: 0,
+			validatePayload: func(t *testing.T, req *pb.ExecuteWorkflowNodeRequest) {
+				assert.Equal(t, "job_failed_200", req.Identity.JobId)
+				assert.Equal(t, "step_llm_inference", req.StepId)
+				assert.False(t, req.Success)
+				assert.NotNil(t, req.ErrorContract)
+				assert.Equal(t, "ERR_LLM_TIMEOUT", req.ErrorContract.Code)
+			},
+		},
+		{
+			name:            "Suspended_InvokesOnJobSuspended",
+			jobID:           "job_suspended_300",
+			stepID:          "step_human_validation",
+			isSuspended:     true,
+			errorContract:   nil,
+			expectError:     false,
+			expectedSuccess: false,
+			expectOnSuccess: 0,
+			expectOnFail:    0,
+			expectOnSuspend: 1,
+			validatePayload: func(t *testing.T, req *pb.ExecuteWorkflowNodeRequest) {
+				assert.Equal(t, "job_suspended_300", req.Identity.JobId)
+				assert.Equal(t, "step_human_validation", req.StepId)
+				assert.False(t, req.Success)
+			},
+		},
+		{
+			name:            "EmptyCallbackAddress_SkippedWithNoError",
+			jobID:           "job_empty_cb",
+			stepID:          "step_1",
+			isSuspended:     false,
+			errorContract:   nil,
+			overrideAddr:    "",
+			expectError:     false,
+			expectedSuccess: false,
+			expectOnSuccess: 0,
+			expectOnFail:    0,
+			expectOnSuspend: 0,
+		},
+		{
+			name:            "UnreachableCallbackAddress_ReturnsErrorForNack",
+			jobID:           "job_unreachable",
+			stepID:          "step_1",
+			isSuspended:     false,
+			errorContract:   nil,
+			overrideAddr:    "127.0.0.1:9999",
+			expectError:     true,
+			expectOnSuccess: 0,
+			expectOnFail:    0,
+			expectOnSuspend: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cbMock.Reset()
+
+			targetAddr := cbAddr
+			if tt.overrideAddr != "" || tt.name == "EmptyCallbackAddress_SkippedWithNoError" {
+				targetAddr = tt.overrideAddr
+			}
+
+			evt := &events.WebhookEvent{
+				Request: &pb.ExecuteWorkflowNodeRequest{
+					Identity: &pb.InfrastructureIdentity{
+						TenantId: "tenant_test",
+						AppId:    "app_test",
+						JobId:    tt.jobID,
+					},
+					StepId:          tt.stepID,
+					CallbackAddress: targetAddr,
+				},
+				ErrorContract: tt.errorContract,
+				IsSuspended:   tt.isSuspended,
+			}
+
+			evtBytes, err := json.Marshal(evt)
+			assert.NoError(t, err)
+
+			msg := mockMsg{data: evtBytes}
+			err = srv.processWebhookMsg(context.Background(), msg)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, tt.expectOnSuccess, cbMock.onSuccessCount, "OnNodeExecutionComplete call count mismatch")
+			assert.Equal(t, tt.expectOnFail, cbMock.onFailCount, "OnJobFailed call count mismatch")
+			assert.Equal(t, tt.expectOnSuspend, cbMock.onSuspendCount, "OnJobSuspended call count mismatch")
+
+			if tt.expectOnSuccess > 0 {
+				reqs := cbMock.GetSuccessRequests()
+				assert.Len(t, reqs, tt.expectOnSuccess)
+				if tt.validatePayload != nil {
+					tt.validatePayload(t, reqs[0])
+				}
+			}
+			if tt.expectOnFail > 0 {
+				reqs := cbMock.GetFailRequests()
+				assert.Len(t, reqs, tt.expectOnFail)
+				if tt.validatePayload != nil {
+					tt.validatePayload(t, reqs[0])
+				}
+			}
+			if tt.expectOnSuspend > 0 {
+				reqs := cbMock.GetSuspendRequests()
+				assert.Len(t, reqs, tt.expectOnSuspend)
+				if tt.validatePayload != nil {
+					tt.validatePayload(t, reqs[0])
+				}
+			}
+		})
+	}
+}
+
+func TestServer_ProcessWebhookMsg_DirectClientPoolRouting_MultiServer(t *testing.T) {
+	// Verifies that gRPC client pool dials req.CallbackAddress directly without graph resolution
+	mockServerA, addrA, cleanupA := setupMockCallbackServer(t)
+	defer cleanupA()
+
+	mockServerB, addrB, cleanupB := setupMockCallbackServer(t)
+	defer cleanupB()
+
+	pub := &mockPublisher{}
+	srv := &OrchestratorServer{
+		pub:                  pub,
+		webhookConns:         make(map[string]*grpc.ClientConn),
+		grpcTimeoutSecs:      30,
+		grpcMaxMessageSizeMb: 4,
+	}
+
+	// Message 1 -> Server A
+	evt1 := &events.WebhookEvent{
+		Request: &pb.ExecuteWorkflowNodeRequest{
+			Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_a"},
+			StepId:          "step_a",
+			CallbackAddress: addrA,
+		},
+	}
+	evt1Bytes, _ := json.Marshal(evt1)
+	err1 := srv.processWebhookMsg(context.Background(), mockMsg{data: evt1Bytes})
+	assert.NoError(t, err1)
+
+	// Message 2 -> Server B
+	evt2 := &events.WebhookEvent{
+		Request: &pb.ExecuteWorkflowNodeRequest{
+			Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_b"},
+			StepId:          "step_b",
+			CallbackAddress: addrB,
+		},
+	}
+	evt2Bytes, _ := json.Marshal(evt2)
+	err2 := srv.processWebhookMsg(context.Background(), mockMsg{data: evt2Bytes})
+	assert.NoError(t, err2)
+
+	// Assertions for strict routing isolation
+	assert.Equal(t, 1, mockServerA.onSuccessCount, "Server A should receive exactly 1 call")
+	assert.Equal(t, 0, mockServerA.onFailCount)
+	assert.Equal(t, "job_server_a", mockServerA.GetSuccessRequests()[0].Identity.JobId)
+
+	assert.Equal(t, 1, mockServerB.onSuccessCount, "Server B should receive exactly 1 call")
+	assert.Equal(t, 0, mockServerB.onFailCount)
+	assert.Equal(t, "job_server_b", mockServerB.GetSuccessRequests()[0].Identity.JobId)
+
+	// Verify gRPC connection pool caching
+	srv.webhookConnMu.RLock()
+	defer srv.webhookConnMu.RUnlock()
+	assert.Contains(t, srv.webhookConns, addrA, "Client pool must cache connection to Server A")
+	assert.Contains(t, srv.webhookConns, addrB, "Client pool must cache connection to Server B")
 }

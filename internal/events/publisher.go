@@ -17,7 +17,6 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-
 )
 
 const (
@@ -82,7 +81,7 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 	// Ensure the Workers Stream exists
 	workersStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      StreamWorkers,
-		Subjects:  []string{"worker.>", "ai.action.>"},
+		Subjects:  []string{"worker.>"},
 		Retention: jetstream.WorkQueuePolicy,
 	})
 	if err != nil {
@@ -220,40 +219,6 @@ func (p *Publisher) PublishJob(ctx context.Context, identity *pb.InfrastructureI
 	return nil
 }
 
-// PublishPriorityJob publishes an active job continuation to the priority JetStream subject.
-func (p *Publisher) PublishPriorityJob(ctx context.Context, identity *pb.InfrastructureIdentity, msgId string, payload []byte) error {
-	tenantId := sanitizeSubjectToken(identity.GetTenantId())
-	appId := sanitizeSubjectToken(identity.GetAppId())
-	jobId := sanitizeSubjectToken(identity.GetJobId())
-	subject := fmt.Sprintf("jobs.%s.%s.%s.priority", tenantId, appId, jobId)
-	msg := &nats.Msg{
-		Subject: subject,
-		Data:    payload,
-		Header:  nats.Header{},
-	}
-	msg.Header.Set(nats.MsgIdHdr, msgId)
-
-	_, err := p.js.PublishMsg(ctx, msg)
-	t, a, j := natsutil.ExtractIdentity(identity)
-	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-		Component: "Orchestrator",
-		Event:     "ENQUEUED",
-		Stream:    StreamJobs,
-		Subject:   subject,
-		TenantID:  t,
-		AppID:     a,
-		JobID:     j,
-		MsgID:     msgId,
-		SizeBytes: len(payload),
-		Error:     err,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to publish priority job to jetstream: %w", err)
-	}
-	p.LogQueueSizeAsync(ctx, "Enqueue", "orchestrator_priority_consumer")
-	return nil
-}
-
 func (p *Publisher) PublishCacheStore(ctx context.Context, data []byte) error {
 	subject := KVCacheRequestsStore
 	_, err := p.js.Publish(ctx, subject, data)
@@ -360,24 +325,14 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	ackWaitSecs := 120 // 2 minutes default
-	if envVal := envutil.MustGetString("NATS_TIMEOUT_SECONDS"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil {
-			ackWaitSecs = parsed
-		} else if err != nil {
-			return fmt.Errorf("failed to parse NATS_TIMEOUT_SECONDS: %w", err)
-		}
+	ackWaitSecs, errNatsTimeout := strconv.Atoi(envutil.MustGetString("NATS_TIMEOUT_SECONDS")) // 2 minutes default
+	if errNatsTimeout != nil {
+		return fmt.Errorf("failed to parse NATS_TIMEOUT_SECONDS: %w", errNatsTimeout)
 	}
-
-	maxDeliver := 3
-	if envVal := envutil.MustGetString("NATS_MAX_DELIVER"); envVal != "" {
-		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
-			maxDeliver = parsed
-		} else if err != nil {
-			return fmt.Errorf("failed to parse NATS_MAX_DELIVER: %w", err)
-		}
+	maxDeliver, errNatsMaxDel := strconv.Atoi(envutil.MustGetString("NATS_MAX_DELIVER"))
+	if errNatsMaxDel != nil {
+		return fmt.Errorf("failed to parse NATS_MAX_DELIVER: %w", errNatsMaxDel)
 	}
-
 	const (
 		DurablePriorityConsumerName = "orchestrator_priority_consumer"
 		DurableNormalConsumerName   = "orchestrator_jobs_consumer"
@@ -591,7 +546,8 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 	cons, err := p.js.CreateOrUpdateConsumer(ctx, StreamWebhooks, jetstream.ConsumerConfig{
 		Durable:       "orchestrator_webhooks_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
-		MaxDeliver:    20,
+		MaxAckPending: envutil.MustGetInt("WEBHOOKS_MAX_ACK_PENDING"),
+		MaxDeliver:    envutil.MustGetInt("WEBHOOKS_MAX_DELIVER"),
 		FilterSubject: "webhooks.callback",
 		BackOff: []time.Duration{
 			10 * time.Second,
