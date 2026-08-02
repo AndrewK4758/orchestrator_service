@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,18 @@ import (
 
 	"orchestrator_service/internal/events"
 )
+
+func TestMain(m *testing.M) {
+	os.Setenv("NATS_REPLY_SUBJ_MIN_PARTS", "4")
+	os.Setenv("LOG_COMPONENT_ORCHESTRATOR", "orchestrator")
+	os.Setenv("LOG_EVENT_DEQUEUED", "dequeued")
+	os.Setenv("LOG_EVENT_ACKNOWLEDGED", "acknowledged")
+	os.Setenv("LOG_EVENT_ENQUEUED", "enqueued")
+	os.Setenv("NATS_ORCHESTRATOR_RESPONSES_STREAM", "ORCHESTRATOR_RESPONSES")
+	os.Setenv("NATS_WORKERS_STREAM", "WORKERS")
+	os.Setenv("NATS_NAK_DELAY_SECONDS", "1")
+	os.Exit(m.Run())
+}
 
 type MockTracePublisher struct {
 	mock.Mock
