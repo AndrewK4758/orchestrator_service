@@ -1,12 +1,13 @@
 package engine
 
 import (
-	pb "github.com/AndrewK4758/shared_protos"
 	"testing"
+
+	pb "github.com/AndrewK4758/shared_protos"
 )
 
 func TestProcessingState_Initialization(t *testing.T) {
-	req := &pb.ExecuteWorkflowNodeRequest{
+	req := &pb.ExecuteTaskRequest{
 		StepId: "step-1",
 		Identity: &pb.InfrastructureIdentity{
 			TenantId: "test_tenant",

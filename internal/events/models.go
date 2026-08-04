@@ -52,7 +52,7 @@ type TraceabilityEvent struct {
 // WebhookEvent holds the payload necessary for the Orchestrator to securely relay callbacks
 // via a resilient JetStream retry queue without storing raw byte slices or duplicate string IDs.
 type WebhookEvent struct {
-	Request       *pb.ExecuteWorkflowNodeRequest `json:"request,omitempty"`
+	Request       *pb.ExecuteTaskRequest `json:"request,omitempty"`
 	ErrorContract *pb.ErrorContract              `json:"error_contract,omitempty"`
 	IsSuspended   bool                           `json:"is_suspended"`
 }

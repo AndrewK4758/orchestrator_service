@@ -114,22 +114,15 @@ func TestTraceabilityEvent_NilFields(t *testing.T) {
 
 func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 	original := WebhookEvent{
-		Request: &pb.ExecuteWorkflowNodeRequest{
+		Request: &pb.ExecuteTaskRequest{
 			Identity: &pb.InfrastructureIdentity{
 				TenantId: "tenant-X",
 				AppId:    "app-Y",
 				JobId:    "job-Z",
 			},
-			StepId: "step-42",
-			NodeConfig: &pb.NodeConfiguration{
-				TargetWorkerSubject: "worker.ai.inference",
-				ExpectedSchemaStruct: &structpb.Struct{
-					Fields: map[string]*structpb.Value{
-						"type": structpb.NewStringValue("object"),
-					},
-				},
-			},
-			NodeOutput: &structpb.Struct{
+			StepId:      "step-42",
+			TaskSubject: "worker.ai.inference",
+			Payload: &structpb.Struct{
 				Fields: map[string]*structpb.Value{
 					"status": structpb.NewStringValue("completed"),
 				},
@@ -160,8 +153,8 @@ func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 	if unmarshaled.Request == nil {
 		t.Fatalf("Request is nil after unmarshaling!")
 	}
-	if val := unmarshaled.Request.NodeOutput.Fields["status"].GetStringValue(); val != "completed" {
-		t.Errorf("NodeOutput mismatch: expected %q, got %q", "completed", val)
+	if val := unmarshaled.Request.Payload.Fields["status"].GetStringValue(); val != "completed" {
+		t.Errorf("Payload mismatch: expected %q, got %q", "completed", val)
 	}
 	if unmarshaled.Request.Identity == nil {
 		t.Fatalf("Request.Identity is nil after unmarshaling!")

@@ -1,42 +1,38 @@
 package server
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
+	"google.golang.org/grpc"
 )
 
-func BenchmarkActiveJobsLockContention(b *testing.B) {
-	pub := &mockPublisher{}
-	srv := NewServer(context.Background(), pub, nil)
+func BenchmarkWebhookConnsLockContention(b *testing.B) {
+	srv := &OrchestratorServer{
+		webhookConns: make(map[string]*grpc.ClientConn),
+	}
 
-	// Pre-fill activeExecs to simulate load
-	for i := range 10000 {
-		jobID := fmt.Sprintf("job_%d", i)
-		srv.activeExecs[jobID] = &JobExecInfo{AppID: "test"}
+	// Pre-fill webhookConns to simulate load
+	for i := 0; i < 1000; i++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", 10000+i)
+		srv.webhookConns[addr] = nil
 	}
 
 	b.ResetTimer()
 
-	// Simulate heavy concurrent Read/Writes to activeExecs map
+	// Simulate heavy concurrent Read/Writes to webhookConns map
 	b.RunParallel(func(p *testing.PB) {
 		i := 0
 		for p.Next() {
-			jobID := fmt.Sprintf("job-%d", i)
+			addr := fmt.Sprintf("127.0.0.1:%d", 10000+(i%1000))
 
-			// Simulate Write (Add Job)
-			srv.activeExecMu.Lock()
-			srv.activeExecs[jobID] = &JobExecInfo{AppID: "test"}
-			srv.activeExecMu.Unlock()
-
-			// Simulate Read (Check Job)
-			srv.activeExecMu.RLock()
-			_, exists := srv.activeExecs[jobID]
-			srv.activeExecMu.RUnlock()
+			// Simulate Read (Check Conn)
+			srv.webhookConnMu.RLock()
+			_, exists := srv.webhookConns[addr]
+			srv.webhookConnMu.RUnlock()
 
 			if !exists {
-				b.Errorf("Expected job to exist in map")
+				b.Errorf("Expected conn to exist in map")
 			}
 			i++
 		}

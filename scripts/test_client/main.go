@@ -23,7 +23,7 @@ type ArtemisCallbackServer struct {
 	ResultChan chan string
 }
 
-func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCallbackService_OnNodeExecutionCompleteServer) error {
+func (s *ArtemisCallbackServer) OnTaskExecutionComplete(stream pb.OrchestratorCallbackService_OnTaskExecutionCompleteServer) error {
 	for {
 		req, err := stream.Recv()
 		if err != nil {
@@ -36,40 +36,33 @@ func (s *ArtemisCallbackServer) OnNodeExecutionComplete(stream pb.OrchestratorCa
 		fmt.Printf("\n[Step %s] Received Callback for Job: %s\n", req.StepId, jobID)
 
 		var bytes string
-		if req.GlobalState != nil {
-			if b, err := protojson.Marshal(req.GlobalState); err == nil {
+		if req.Payload != nil {
+			if b, err := protojson.Marshal(req.Payload); err == nil {
 				bytes = string(b)
 			}
 		}
-		var outBytes string
-		if req.NodeOutput != nil {
-			if b, err := protojson.Marshal(req.NodeOutput); err == nil {
-				outBytes = string(b)
-			}
-		}
-		fmt.Printf("[%s] Step Succeeded!\nStep Output: %s\nGlobal State JSON:\n%s\n", jobID, outBytes, bytes)
+		fmt.Printf("[%s] Step Succeeded!\nStep Output Payload:\n%s\n", jobID, bytes)
 		s.ResultChan <- bytes
 
-		if err := stream.Send(&pb.NodeExecutionCompleteResponse{Success: true}); err != nil {
+		if err := stream.Send(&pb.TaskExecutionCompleteResponse{Success: true}); err != nil {
 			return err
 		}
 	}
 }
 
-func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobSuspendedResponse, error) {
-	fmt.Printf("\n[Step %s] Suspended for Job: %s. Reason: %s\n", req.StepId, req.Identity.JobId, req.GetErrorContract().GetMessage())
-	s.ResultChan <- "SUSPENDED: " + req.GetErrorContract().GetMessage()
+func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobSuspendedResponse, error) {
+	fmt.Printf("\n[Step %s] Suspended for Job: %s.\n", req.StepId, req.Identity.JobId)
+	s.ResultChan <- "SUSPENDED"
 	return &pb.JobSuspendedResponse{Success: true}, nil
 }
 
-func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteWorkflowNodeRequest) (*pb.JobFailedResponse, error) {
+func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobFailedResponse, error) {
 	jobID := ""
 	if req.Identity != nil {
 		jobID = req.Identity.JobId
 	}
 	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.StepId, jobID)
-	fmt.Printf("[%s] Step Failed! Error: %s\n", jobID, req.GetErrorContract().GetMessage())
-	s.ResultChan <- "ERROR: " + req.GetErrorContract().GetMessage()
+	s.ResultChan <- "ERROR"
 
 	return &pb.JobFailedResponse{Success: true}, nil
 }
@@ -146,62 +139,33 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 		"document_b64": b64Doc,
 	})
 	if err != nil {
-		logger.Fatal("Orchestrator", "Failed to create functional struct: %v", err)
-	}
-	globalState := pb.GlobalState{
-		Functional: funcStruct,
+		logger.Fatal("Orchestrator", "Failed to create payload struct: %v", err)
 	}
 
-	nodeReq := &pb.ExecuteWorkflowNodeRequest{
+	nodeReq := &pb.ExecuteTaskRequest{
 		Identity: &pb.InfrastructureIdentity{
 			JobId:    "job_test_123",
 			AppId:    "CLI_TEST_APP",
 			TenantId: "TEST_TENANT",
 		},
-		GraphId: "00000000-0000-0000-0000-000000000001", InitialNodeId: "00000000-0000-0000-0000-000000000002",
 		StepId:          "step_1",
-		GlobalState:     &globalState,
-		Metadata:        map[string]string{},
-		CallbackAddress: "localhost:11115",
-		NodeConfig: &pb.NodeConfiguration{
-			TargetWorkerSubject: "worker.human.validation",
-			NodeName:            "Generic Extraction Worker",
-			SystemInstructions:  "Extract required target fields.",
-			ExpectedSchemaStruct: &structpb.Struct{
-				Fields: map[string]*structpb.Value{
-					"type": structpb.NewStringValue("object"),
-					"properties": structpb.NewStructValue(&structpb.Struct{
-						Fields: map[string]*structpb.Value{
-							"field_1": structpb.NewStructValue(&structpb.Struct{
-								Fields: map[string]*structpb.Value{
-									"type": structpb.NewStringValue("string"),
-								},
-							}),
-							"total": structpb.NewStructValue(&structpb.Struct{
-								Fields: map[string]*structpb.Value{
-									"type": structpb.NewStringValue("number"),
-								},
-							}),
-						},
-					}),
-				},
-			},
-		},
+		TaskSubject: "worker.human.validation",
+		Payload: funcStruct,
 	}
 
-	nodeRes, err := client.ExecuteWorkflowNode(context.Background(), nodeReq)
+	nodeRes, err := client.ExecuteTask(context.Background(), nodeReq)
 	if err != nil {
 		logger.Info("Orchestrator", "Failed to execute workflow node: %v", err)
 		return
 	}
 	jobID := "job_test_123"
-	fmt.Printf("✅ Document Cached! Job ID: %s, Message: %s\n", jobID, nodeRes.Message)
+	fmt.Printf("✅ Task Queued! Job ID: %s, Message: %s\n", jobID, nodeRes.Message)
 
 	fmt.Printf("⏳ [%s] Waiting for Orchestrator Callback...\n", jobID)
 
 	result := <-artemis.ResultChan
 
-	fmt.Printf("\n[%s] PHASE 4: Step Output Evaluation\n", jobID)
+	fmt.Printf("\n[%s] PHASE 4: Task Output Evaluation\n", jobID)
 	fmt.Printf("Decision Engine analyzed output: %s\n", result)
 	fmt.Println("Decision: Next path selected based on classification. End of demo loop.")
 }

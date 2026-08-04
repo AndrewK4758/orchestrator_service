@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -248,8 +247,7 @@ func (p *Publisher) LogQueueSizeAsync(parentCtx context.Context, action string, 
 		}
 		info, err := cons.Info(ctx)
 		if err == nil {
-			log.Printf("METRIC: [%s] Queue: %s | Pending: %d | AckPending: %d | Waiting: %d",
-				action, consumerName, info.NumPending, info.NumAckPending, info.NumWaiting)
+			logger.Info("Queue metrics", "%s: %s, %s: %s, %s: %d, %s: %d, %s: %d", "action", action, "consumer", consumerName, "pending", info.NumPending, "ackPending", info.NumAckPending, "waiting", info.NumWaiting)
 		}
 	}()
 }
@@ -643,6 +641,74 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start consuming webhooks: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		cc.Stop()
+	}()
+
+	return nil
+}
+
+// ConsumeOrchestratorResponses handles consuming responses from workers
+func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler func(ctx context.Context, msg jetstream.Msg) error) error {
+	cons, err := p.js.CreateOrUpdateConsumer(ctx, StreamOrchestratorResponses, jetstream.ConsumerConfig{
+		Durable:       "orchestrator_responses_consumer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxDeliver:    5,
+		FilterSubject: "orchestrator.response.>",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create orchestrator responses consumer: %w", err)
+	}
+
+	logger.Debug("System", "Consumer started on stream %s. Waiting for messages...", StreamOrchestratorResponses)
+
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		go func(m jetstream.Msg) {
+			startTime := time.Now()
+			md, _ := m.Metadata()
+			attempt := uint64(1)
+			if md != nil {
+				attempt = md.NumDelivered
+			}
+
+			// Try parsing subject (orchestrator.response.<app>.<tenant>.<job>.<step>)
+			parts := strings.Split(m.Subject(), ".")
+			a, t, j := "N/A", "N/A", "N/A"
+			if len(parts) >= 5 {
+				a = parts[2]
+				t = parts[3]
+				j = parts[4]
+			}
+
+			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			err := handler(ctxMsg, m)
+			cancelMsg()
+			durationMs := time.Since(startTime).Milliseconds()
+			if err != nil {
+				logger.Error("System", "Failed to process orchestrator response, nacking: %v", err)
+				_ = m.Nak()
+			} else {
+				natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+					Component:  "Orchestrator",
+					Event:      "ACKNOWLEDGED",
+					Stream:     StreamOrchestratorResponses,
+					Subject:    m.Subject(),
+					Consumer:   "orchestrator_responses_consumer",
+					TenantID:   t,
+					AppID:      a,
+					JobID:      j,
+					Attempt:    attempt,
+					DurationMs: durationMs,
+				})
+				_ = m.Ack()
+			}
+		}(msg)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start consuming orchestrator responses: %w", err)
 	}
 
 	go func() {
