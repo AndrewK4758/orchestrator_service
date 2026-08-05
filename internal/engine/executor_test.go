@@ -1,6 +1,9 @@
 package engine
 
+import "github.com/AndrewK4758/shared_utils/payloadkeys"
+
 import (
+	"strings"
 	"context"
 	"errors"
 	"os"
@@ -34,6 +37,24 @@ func (m *mockJetStream) PublishMsg(ctx context.Context, msg *nats.Msg, opts ...j
 	return args.Get(0).(*jetstream.PubAck), args.Error(1)
 }
 
+func assertPanicsWithError(t *testing.T, expectedErr string, f func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Errorf("The code did not panic")
+		} else {
+			err, ok := r.(error)
+			if !ok {
+				t.Errorf("Expected panic with error, got %v", r)
+			} else if !strings.Contains(err.Error(), expectedErr) {
+				t.Errorf("Expected error to contain %q, but got %q", expectedErr, err.Error())
+			}
+		}
+	}()
+	f()
+}
+
 func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 	eng := &Engine{
 		clientID: "orchestrator-task-router",
@@ -41,18 +62,18 @@ func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("nil request", func(t *testing.T) {
-		err := eng.ExecuteTask(ctx, nil)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing infrastructure identity")
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			eng.ExecuteTask(ctx, nil)
+		})
 	})
 
 	t.Run("nil identity", func(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{
 			TaskSubject: "worker.test",
 		}
-		err := eng.ExecuteTask(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing infrastructure identity")
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			eng.ExecuteTask(ctx, req)
+		})
 	})
 
 	t.Run("empty tenant_id", func(t *testing.T) {
@@ -60,9 +81,9 @@ func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 			Identity:    &pb.InfrastructureIdentity{AppId: "app1", JobId: "job1"},
 			TaskSubject: "worker.test",
 		}
-		err := eng.ExecuteTask(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing infrastructure identity")
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			eng.ExecuteTask(ctx, req)
+		})
 	})
 
 	t.Run("empty app_id", func(t *testing.T) {
@@ -70,9 +91,9 @@ func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", JobId: "job1"},
 			TaskSubject: "worker.test",
 		}
-		err := eng.ExecuteTask(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing infrastructure identity")
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			eng.ExecuteTask(ctx, req)
+		})
 	})
 
 	t.Run("empty job_id", func(t *testing.T) {
@@ -80,18 +101,18 @@ func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1"},
 			TaskSubject: "worker.test",
 		}
-		err := eng.ExecuteTask(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing infrastructure identity")
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			eng.ExecuteTask(ctx, req)
+		})
 	})
 
 	t.Run("missing task subject", func(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{
 			Identity: &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "j1"},
 		}
-		err := eng.ExecuteTask(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "missing task subject")
+		assertPanicsWithError(t, "missing task subject", func() {
+			eng.ExecuteTask(ctx, req)
+		})
 	})
 }
 
@@ -103,7 +124,7 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 	}
 
 	payload, err := structpb.NewStruct(map[string]interface{}{
-		"metadata": map[string]interface{}{
+		payloadkeys.MetadataKey: map[string]interface{}{
 			"callback_address": "localhost:1234",
 		},
 	})
@@ -139,7 +160,7 @@ func TestEngine_ExecuteTask_PublishError(t *testing.T) {
 	}
 
 	payload, err := structpb.NewStruct(map[string]interface{}{
-		"metadata": map[string]interface{}{
+		payloadkeys.MetadataKey: map[string]interface{}{
 			"callback_address": "localhost:1234",
 		},
 	})

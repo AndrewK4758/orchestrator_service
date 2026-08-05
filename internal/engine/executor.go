@@ -51,11 +51,12 @@ func (e *Engine) Close() {
 
 // ExecuteTask acts as a pure Task Router. It validates identity and routes to the generic worker queue.
 func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) error {
+	//DO NOT CHANGE THIS. THIS IS HOW I WANT MY FAIL FAST TO WORK FOR REQUIRED FIELDS
 	if req == nil || req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
-		return fmt.Errorf("invalid request: missing infrastructure identity")
+		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing infrastructure identity"))
 	}
 	if req.TaskSubject == "" {
-		return fmt.Errorf("invalid request: missing task subject")
+		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing task subject"))
 	}
 
 	t, a, j := req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId
