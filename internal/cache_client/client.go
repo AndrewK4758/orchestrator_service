@@ -14,7 +14,7 @@ func NewClient(addr string) (pb.SemanticCacheServiceClient, *grpc.ClientConn, er
 
 	maxMsgSizeMb := envutil.MustGetInt("GRPC_MAX_MESSAGE_SIZE_MB")
 	if maxMsgSizeMb <= 0 {
-		maxMsgSizeMb = 4
+		panic(fmt.Errorf("[Context: cache_client/NewCacheClient] Invalid maxMsgSizeMb: %d, must be > 0", maxMsgSizeMb))
 	}
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSizeMb*1024*1024)))

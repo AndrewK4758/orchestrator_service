@@ -2,11 +2,13 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/AndrewK4758/shared_utils/envutil"
 	"github.com/AndrewK4758/shared_utils/logger"
 	"github.com/AndrewK4758/shared_utils/natsutil"
+	"github.com/AndrewK4758/shared_utils/workflowparser"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/nats-io/nats.go"
@@ -64,8 +66,11 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	callbackAddr := workflowparser.NewTaskRequestParser(req).MustGetCallbackAddress(req.Identity.JobId)
+	encodedCallback := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(callbackAddr))
+
 	// Artemis (the client) will be listening on this subject for completion
-	replySubj := fmt.Sprintf("orchestrator.response.%s.%s.%s.%s", a, t, j, req.StepId)
+	replySubj := fmt.Sprintf("orchestrator.response.%s.%s.%s.%s.%s", a, t, j, req.StepId, encodedCallback)
 
 	msgID := fmt.Sprintf("%s-%s", j, req.StepId)
 	nMsg := nats.NewMsg(subject)

@@ -52,11 +52,16 @@ func (m *mockPublisher) PurgeQueues(ctx context.Context) error {
 
 type mockMsg struct {
 	jetstream.Msg
-	data []byte
+	data    []byte
+	subject string
 }
 
 func (m mockMsg) Data() []byte {
 	return m.data
+}
+
+func (m mockMsg) Subject() string {
+	return m.subject
 }
 
 func TestOrchestratorServer_ExecuteTask(t *testing.T) {
@@ -68,20 +73,20 @@ func TestOrchestratorServer_ExecuteTask(t *testing.T) {
 		grpcTimeout:  30,
 	}
 
-	t.Run("ExecuteTask missing identity returns error", func(t *testing.T) {
+	t.Run("ExecuteTask missing identity panics", func(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{}
-		_, err := srv.ExecuteTask(context.Background(), req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "InfrastructureIdentity is strictly required")
+		assert.Panics(t, func() {
+			_, _ = srv.ExecuteTask(context.Background(), req)
+		})
 	})
 
-	t.Run("ExecuteTask missing jobId returns error", func(t *testing.T) {
+	t.Run("ExecuteTask missing jobId panics", func(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{
 			Identity: &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1"},
 		}
-		_, err := srv.ExecuteTask(context.Background(), req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "InfrastructureIdentity.JobId is strictly required")
+		assert.Panics(t, func() {
+			_, _ = srv.ExecuteTask(context.Background(), req)
+		})
 	})
 
 	t.Run("ExecuteTask integration requires NATS", func(t *testing.T) {
@@ -93,11 +98,11 @@ type mockCallbackServer struct {
 	pb.UnimplementedOrchestratorCallbackServiceServer
 	mu                      sync.Mutex
 	receivedSuccess         *pb.ExecuteTaskRequest
-	receivedFail            *pb.ExecuteTaskRequest
-	receivedSuspend         *pb.ExecuteTaskRequest
+	receivedFail            *pb.JobFailedRequest
+	receivedSuspend         *pb.JobSuspendedRequest
 	receivedSuccessRequests []*pb.ExecuteTaskRequest
-	receivedFailRequests    []*pb.ExecuteTaskRequest
-	receivedSuspendRequests []*pb.ExecuteTaskRequest
+	receivedFailRequests    []*pb.JobFailedRequest
+	receivedSuspendRequests []*pb.JobSuspendedRequest
 	onSuccessCount          int
 	onFailCount             int
 	onSuspendCount          int
@@ -127,7 +132,7 @@ func (s *mockCallbackServer) OnTaskExecutionComplete(stream grpc.BidiStreamingSe
 	return stream.Send(&pb.TaskExecutionCompleteResponse{Success: true})
 }
 
-func (s *mockCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobFailedResponse, error) {
+func (s *mockCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failError != nil {
@@ -139,7 +144,7 @@ func (s *mockCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteTas
 	return &pb.JobFailedResponse{Success: true}, nil
 }
 
-func (s *mockCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobSuspendedResponse, error) {
+func (s *mockCallbackServer) OnJobSuspended(ctx context.Context, req *pb.JobSuspendedRequest) (*pb.JobSuspendedResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.suspendError != nil {
@@ -159,18 +164,18 @@ func (s *mockCallbackServer) GetSuccessRequests() []*pb.ExecuteTaskRequest {
 	return cp
 }
 
-func (s *mockCallbackServer) GetFailRequests() []*pb.ExecuteTaskRequest {
+func (s *mockCallbackServer) GetFailRequests() []*pb.JobFailedRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := make([]*pb.ExecuteTaskRequest, len(s.receivedFailRequests))
+	cp := make([]*pb.JobFailedRequest, len(s.receivedFailRequests))
 	copy(cp, s.receivedFailRequests)
 	return cp
 }
 
-func (s *mockCallbackServer) GetSuspendRequests() []*pb.ExecuteTaskRequest {
+func (s *mockCallbackServer) GetSuspendRequests() []*pb.JobSuspendedRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := make([]*pb.ExecuteTaskRequest, len(s.receivedSuspendRequests))
+	cp := make([]*pb.JobSuspendedRequest, len(s.receivedSuspendRequests))
 	copy(cp, s.receivedSuspendRequests)
 	return cp
 }
@@ -258,7 +263,7 @@ type webhookRoutingTestCase struct {
 	expectOnSuccess int
 	expectOnFail    int
 	expectOnSuspend int
-	validatePayload func(t *testing.T, req *pb.ExecuteTaskRequest)
+	validatePayload func(t *testing.T, req interface{})
 }
 
 func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T) {
@@ -285,9 +290,10 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 1,
 			expectOnFail:    0,
 			expectOnSuspend: 0,
-			validatePayload: func(t *testing.T, req *pb.ExecuteTaskRequest) {
-				assert.Equal(t, "job_success_100", req.Identity.JobId)
-				assert.Equal(t, "step_parse_doc", req.StepId)
+			validatePayload: func(t *testing.T, req interface{}) {
+				r := req.(*pb.ExecuteTaskRequest)
+				assert.Equal(t, "job_success_100", r.Identity.JobId)
+				assert.Equal(t, "step_parse_doc", r.StepId)
 			},
 		},
 		{
@@ -304,9 +310,10 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 0,
 			expectOnFail:    1,
 			expectOnSuspend: 0,
-			validatePayload: func(t *testing.T, req *pb.ExecuteTaskRequest) {
-				assert.Equal(t, "job_failed_200", req.Identity.JobId)
-				assert.Equal(t, "step_llm_inference", req.StepId)
+			validatePayload: func(t *testing.T, req interface{}) {
+				r := req.(*pb.JobFailedRequest)
+				assert.Equal(t, "job_failed_200", r.Identity.JobId)
+				assert.Equal(t, "step_llm_inference", r.StepId)
 			},
 		},
 		{
@@ -320,9 +327,10 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 0,
 			expectOnFail:    0,
 			expectOnSuspend: 1,
-			validatePayload: func(t *testing.T, req *pb.ExecuteTaskRequest) {
-				assert.Equal(t, "job_suspended_300", req.Identity.JobId)
-				assert.Equal(t, "step_human_validation", req.StepId)
+			validatePayload: func(t *testing.T, req interface{}) {
+				r := req.(*pb.JobSuspendedRequest)
+				assert.Equal(t, "job_suspended_300", r.Identity.JobId)
+				assert.Equal(t, "step_human_validation", r.StepId)
 			},
 		},
 	}
@@ -364,15 +372,12 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 				assert.Equal(t, tt.expectOnFail, cbMock.OnFailCount(), "OnFail count mismatch")
 				assert.Equal(t, tt.expectOnSuspend, cbMock.OnSuspendCount(), "OnSuspend count mismatch")
 				if tt.validatePayload != nil {
-					reqs := cbMock.GetSuccessRequests()
-					if len(reqs) == 0 {
-						reqs = cbMock.GetFailRequests()
-					}
-					if len(reqs) == 0 {
-						reqs = cbMock.GetSuspendRequests()
-					}
-					if len(reqs) > 0 {
-						tt.validatePayload(t, reqs[0])
+					if len(cbMock.GetSuccessRequests()) > 0 {
+						tt.validatePayload(t, cbMock.GetSuccessRequests()[0])
+					} else if len(cbMock.GetFailRequests()) > 0 {
+						tt.validatePayload(t, cbMock.GetFailRequests()[0])
+					} else if len(cbMock.GetSuspendRequests()) > 0 {
+						tt.validatePayload(t, cbMock.GetSuspendRequests()[0])
 					}
 				}
 			}

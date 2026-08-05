@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/AndrewK4758/shared_utils/envutil"
-	"github.com/AndrewK4758/shared_utils/logger"
 	pb "github.com/AndrewK4758/shared_protos"
+	"github.com/AndrewK4758/shared_utils/envutil"
+	_ "github.com/AndrewK4758/shared_utils/identityparser"
+	"github.com/AndrewK4758/shared_utils/logger"
+	"github.com/AndrewK4758/shared_utils/workflowparser"
 
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
@@ -63,13 +65,20 @@ func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.Traceabilit
 }
 
 func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.ExecuteTaskResponse, error) {
+	if req == nil {
+		panic(fmt.Errorf("action failed for job ExecuteTask: missing required property request"))
+	}
 	if req.Identity == nil {
-		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity is strictly required")
+		panic(fmt.Errorf("action failed for job ExecuteTask: missing required property Identity"))
 	}
 
 	jobID := req.Identity.JobId
-	if jobID == "" {
-		return nil, fmt.Errorf("rpc error: code = InvalidArgument desc = InfrastructureIdentity.JobId is strictly required")
+	if jobID == "" || req.Identity.AppId == "" || req.Identity.TenantId == "" {
+		panic(fmt.Errorf("action failed for job ExecuteTask: incomplete Identity"))
+	}
+
+	if req.TaskSubject == "" {
+		panic(fmt.Errorf("action failed for job %s: missing required property TaskSubject", jobID))
 	}
 
 	logger.Info("System", "Received ExecuteTask for JobID: %s, StepID: %s, TaskSubject: %s", jobID, req.StepId, req.TaskSubject)
@@ -91,18 +100,22 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstream.Msg) error {
 	var evt events.WebhookEvent
 	if err := json.Unmarshal(msg.Data(), &evt); err != nil {
-		logger.Error("System", "Failed to unmarshal webhook msg: %v", err)
-		return nil
+		panic(fmt.Errorf("action failed for job processWebhookMsg: corrupted JSON: %v", err))
 	}
 
-	if evt.Request == nil || evt.Request.Identity == nil {
-		logger.Error("System", "Webhook msg missing request or identity")
-		return nil
+	if evt.Request == nil {
+		panic(fmt.Errorf("action failed for job processWebhookMsg: missing required property request"))
+	}
+	if evt.Request.Identity == nil {
+		panic(fmt.Errorf("action failed for job processWebhookMsg: invalid identity"))
+	}
+	if evt.Request.Identity.TenantId == "" || evt.Request.Identity.AppId == "" || evt.Request.Identity.JobId == "" {
+		panic(fmt.Errorf("action failed for job processWebhookMsg: invalid identity"))
 	}
 
 	addr := evt.Request.TaskSubject
 	if addr == "" {
-		addr = s.getCallbackAddress(evt.Request.Identity.AppId)
+		addr = workflowparser.NewTaskRequestParser(evt.Request).MustGetCallbackAddress(evt.Request.Identity.JobId)
 	}
 
 	s.webhookConnMu.RLock()
@@ -128,12 +141,20 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 
 	if evt.ErrorContract != nil {
 		if evt.IsSuspended {
-			_, err := client.OnJobSuspended(ctx, evt.Request)
+			_, err := client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
+				Identity: evt.Request.Identity,
+				StepId:   evt.Request.StepId,
+				Error:    evt.ErrorContract,
+			})
 			if err != nil {
 				return fmt.Errorf("failed to call OnJobSuspended: %w", err)
 			}
 		} else {
-			_, err := client.OnJobFailed(ctx, evt.Request)
+			_, err := client.OnJobFailed(ctx, &pb.JobFailedRequest{
+				Identity: evt.Request.Identity,
+				StepId:   evt.Request.StepId,
+				Error:    evt.ErrorContract,
+			})
 			if err != nil {
 				return fmt.Errorf("failed to call OnJobFailed: %w", err)
 			}
@@ -142,7 +163,10 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 	}
 
 	if evt.IsSuspended {
-		_, err := client.OnJobSuspended(ctx, evt.Request)
+		_, err := client.OnJobSuspended(ctx, &pb.JobSuspendedRequest{
+			Identity: evt.Request.Identity,
+			StepId:   evt.Request.StepId,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to call OnJobSuspended: %w", err)
 		}
@@ -179,4 +203,3 @@ func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.Purge
 	}
 	return &pb.PurgeSystemStateResponse{Success: true}, nil
 }
-

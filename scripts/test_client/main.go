@@ -50,18 +50,21 @@ func (s *ArtemisCallbackServer) OnTaskExecutionComplete(stream pb.OrchestratorCa
 	}
 }
 
-func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobSuspendedResponse, error) {
+func (s *ArtemisCallbackServer) OnJobSuspended(ctx context.Context, req *pb.JobSuspendedRequest) (*pb.JobSuspendedResponse, error) {
 	fmt.Printf("\n[Step %s] Suspended for Job: %s.\n", req.StepId, req.Identity.JobId)
 	s.ResultChan <- "SUSPENDED"
 	return &pb.JobSuspendedResponse{Success: true}, nil
 }
 
-func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.ExecuteTaskRequest) (*pb.JobFailedResponse, error) {
+func (s *ArtemisCallbackServer) OnJobFailed(ctx context.Context, req *pb.JobFailedRequest) (*pb.JobFailedResponse, error) {
 	jobID := ""
 	if req.Identity != nil {
 		jobID = req.Identity.JobId
 	}
 	fmt.Printf("\n[Step %s] Failed for Job: %s\n", req.StepId, jobID)
+	if req.Error != nil {
+		fmt.Printf("Error: %s - %s\n", req.Error.Code, req.Error.Message)
+	}
 	s.ResultChan <- "ERROR"
 
 	return &pb.JobFailedResponse{Success: true}, nil

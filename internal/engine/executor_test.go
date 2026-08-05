@@ -103,7 +103,9 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 	}
 
 	payload, err := structpb.NewStruct(map[string]interface{}{
-		"key": "value",
+		"metadata": map[string]interface{}{
+			"callback_address": "localhost:1234",
+		},
 	})
 	assert.NoError(t, err)
 
@@ -120,7 +122,7 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 
 	mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
 		expectedSubject := "worker.ai.inference.app1.tenant1.job1"
-		expectedReply := "orchestrator.response.app1.tenant1.job1.step123"
+		expectedReply := "orchestrator.response.app1.tenant1.job1.step123.bG9jYWxob3N0OjEyMzQ"
 		return msg.Subject == expectedSubject && msg.Header.Get("Reply-Subject") == expectedReply
 	}), mock.Anything).Return(&jetstream.PubAck{Sequence: 1}, nil)
 
@@ -136,19 +138,27 @@ func TestEngine_ExecuteTask_PublishError(t *testing.T) {
 		clientID: "orchestrator-task-router",
 	}
 
+	payload, err := structpb.NewStruct(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"callback_address": "localhost:1234",
+		},
+	})
+	assert.NoError(t, err)
+
 	req := &pb.ExecuteTaskRequest{
 		Identity: &pb.InfrastructureIdentity{
 			TenantId: "tenant1",
 			AppId:    "app1",
 			JobId:    "job1",
 		},
-		TaskSubject: "worker.ai.inference",
+		TaskSubject: "worker.error",
 		StepId:      "step123",
+		Payload:     payload,
 	}
 
 	mockJS.On("PublishMsg", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("nats publish failed"))
 
-	err := eng.ExecuteTask(context.Background(), req)
+	err = eng.ExecuteTask(context.Background(), req)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to publish to worker")
 }
