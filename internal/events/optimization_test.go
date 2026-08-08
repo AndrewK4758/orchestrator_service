@@ -14,7 +14,7 @@ func BenchmarkJSONMarshal_ZeroAlloc(b *testing.B) {
 		Identity:  &pb.InfrastructureIdentity{JobId: "test_job", AppId: "Artemis"},
 		Timestamp: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType: "Started",
-		Metadata:  map[string]any{"step": "step_1"},
+		Metadata:  json.RawMessage(`{"step": "step_1"}`),
 	}
 
 	b.ResetTimer()
@@ -31,7 +31,7 @@ func TestJSONMarshal_DataLocality(t *testing.T) {
 		Identity:  &pb.InfrastructureIdentity{JobId: "test_job", AppId: "Artemis"},
 		Timestamp: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
 		EventType: "Started",
-		Metadata:  map[string]any{"step": "step_1"},
+		Metadata:  json.RawMessage(`{"step": "step_1"}`),
 	}
 
 	allocs := testing.AllocsPerRun(10, func() {

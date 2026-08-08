@@ -7,7 +7,6 @@ import (
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc"
 	"orchestrator_service/internal/events"
 )
 
@@ -15,7 +14,7 @@ import (
 // mandated for Milestone 2 by GEMINI.md and SCOPE.md.
 func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 	srv := &OrchestratorServer{
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcMaxMsgMb: 4,
 		grpcTimeout:  30,
 	}
@@ -67,18 +66,14 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 
 	t.Run("ProcessWebhookMsg_CorruptedJSON_Panics", func(t *testing.T) {
 		msg := mockMsg{data: []byte("{invalid-json-data}")}
-		assert.Panics(t, func() {
-			_ = srv.processWebhookMsg(context.Background(), msg)
-		})
+		assert.Panics(t, func() { srv.processWebhookMsg(context.Background(), msg) })
 	})
 
 	t.Run("ProcessWebhookMsg_NilRequest_Panics", func(t *testing.T) {
 		evtBytes, err := json.Marshal(&events.WebhookEvent{Request: nil})
 		assert.NoError(t, err)
 		msg := mockMsg{data: evtBytes}
-		assert.Panics(t, func() {
-			_ = srv.processWebhookMsg(context.Background(), msg)
-		})
+		assert.Panics(t, func() { srv.processWebhookMsg(context.Background(), msg) })
 	})
 
 	t.Run("ProcessWebhookMsg_InvalidIdentity_Panics", func(t *testing.T) {
@@ -89,17 +84,13 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		msg := mockMsg{data: evtBytes}
-		assert.Panics(t, func() {
-			_ = srv.processWebhookMsg(context.Background(), msg)
-		})
+		assert.Panics(t, func() { srv.processWebhookMsg(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_MalformedSubject_Panics", func(t *testing.T) {
 		// Subject with fewer than 6 parts
 		msg := mockMsg{subject: "orchestrator.response.app"}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_CorruptedProtobuf_Panics", func(t *testing.T) {
@@ -107,36 +98,26 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 			subject: "orchestrator.response.app1.tenant1.job1.step1",
 			data:    []byte("\xff\xff\xff\xff invalid proto bytes"),
 		}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_EmptyAppId_Panics", func(t *testing.T) {
-		msg := mockMsg{subject: "orchestrator.response..tenant1.job1.step1"}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		msg := mockMsg{subject: "orchestrator.response..tenant1.job1.step1.callback"}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_EmptyTenantId_Panics", func(t *testing.T) {
-		msg := mockMsg{subject: "orchestrator.response.app1..job1.step1"}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		msg := mockMsg{subject: "orchestrator.response.app1..job1.step1.callback"}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_EmptyJobId_Panics", func(t *testing.T) {
-		msg := mockMsg{subject: "orchestrator.response.app1.tenant1..step1"}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		msg := mockMsg{subject: "orchestrator.response.app1.tenant1..step1.callback"}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 
 	t.Run("ProcessOrchestratorResponses_EmptyStepId_Panics", func(t *testing.T) {
-		msg := mockMsg{subject: "orchestrator.response.app1.tenant1.job1."}
-		assert.Panics(t, func() {
-			_ = srv.processOrchestratorResponses(context.Background(), msg)
-		})
+		msg := mockMsg{subject: "orchestrator.response.app1.tenant1.job1..callback"}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 }

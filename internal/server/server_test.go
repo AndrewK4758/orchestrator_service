@@ -68,7 +68,7 @@ func TestOrchestratorServer_ExecuteTask(t *testing.T) {
 	pub := &mockPublisher{}
 	srv := &OrchestratorServer{
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcMaxMsgMb: 4,
 		grpcTimeout:  30,
 	}
@@ -273,7 +273,7 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 	pub := &mockPublisher{}
 	srv := &OrchestratorServer{
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcTimeout:  30,
 		grpcMaxMsgMb: 4,
 	}
@@ -395,7 +395,7 @@ func TestServer_ProcessWebhookMsg_DirectClientPoolRouting_MultiServer(t *testing
 	pub := &mockPublisher{}
 	srv := &OrchestratorServer{
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcTimeout:  30,
 		grpcMaxMsgMb: 4,
 	}

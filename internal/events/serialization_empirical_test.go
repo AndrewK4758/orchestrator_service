@@ -30,8 +30,8 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 			Message: "Something failed",
 			Source:  "ai_worker",
 		},
-		Metadata:       map[string]any{"key1": "val1"},
-		NodeOutput:     map[string]any{"result": "ok"},
+		Metadata:       json.RawMessage(`{"key1": "val1"}`),
+		NodeOutput:     json.RawMessage(`{"result": "ok"}`),
 		ExtractedData:  "sample extracted data",
 	}
 
@@ -77,8 +77,12 @@ func TestTraceabilityEvent_JSONRoundTrip(t *testing.T) {
 	if unmarshaled.ErrorContract.GetCode() != "ERR_001" {
 		t.Errorf("ErrorContract.Code mismatch: expected 'ERR_001', got %q", unmarshaled.ErrorContract.GetCode())
 	}
-	if val, ok := unmarshaled.NodeOutput["result"]; !ok || val != "ok" {
-		t.Errorf("NodeOutput mismatch: expected result: ok, got %+v", unmarshaled.NodeOutput)
+	var nodeOutput map[string]any
+	if err := json.Unmarshal(unmarshaled.NodeOutput, &nodeOutput); err != nil {
+		t.Fatalf("Failed to unmarshal NodeOutput: %v", err)
+	}
+	if val, ok := nodeOutput["result"]; !ok || val != "ok" {
+		t.Errorf("NodeOutput mismatch: expected result: ok, got %+v", nodeOutput)
 	}
 }
 

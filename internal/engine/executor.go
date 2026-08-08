@@ -17,6 +17,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	ResponseSubjectFormat = "orchestrator.response.%s.%s.%s.%s.%s"
+)
+
 type Engine struct {
 	nc       *nats.Conn
 	js       jetstream.JetStream
@@ -59,8 +63,7 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing task subject"))
 	}
 
-	t, a, j := req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId
-	subject := fmt.Sprintf("%s.%s.%s.%s", req.TaskSubject, a, t, j)
+	subject := fmt.Sprintf("%s.%s.%s.%s", req.TaskSubject, req.Identity.AppId, req.Identity.TenantId, req.Identity.JobId)
 
 	reqBytes, err := proto.Marshal(req)
 	if err != nil {
@@ -71,9 +74,9 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	encodedCallback := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(callbackAddr))
 
 	// Artemis (the client) will be listening on this subject for completion
-	replySubj := fmt.Sprintf("orchestrator.response.%s.%s.%s.%s.%s", a, t, j, req.StepId, encodedCallback)
+	replySubj := fmt.Sprintf(ResponseSubjectFormat, req.Identity.AppId, req.Identity.TenantId, req.Identity.JobId, req.StepId, encodedCallback)
 
-	msgID := fmt.Sprintf("%s-%s", j, req.StepId)
+	msgID := fmt.Sprintf("%s-%s", req.Identity.JobId, req.StepId)
 	nMsg := nats.NewMsg(subject)
 	nMsg.Reply = replySubj
 	nMsg.Header = make(nats.Header)
@@ -94,9 +97,9 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 		Event:     envutil.MustGetString("LOG_EVENT_ENQUEUED"),
 		Stream:    envutil.MustGetString("NATS_WORKERS_STREAM"),
 		Subject:   subject,
-		TenantID:  t,
-		AppID:     a,
-		JobID:     j,
+		TenantID:  req.Identity.TenantId,
+		AppID:     req.Identity.AppId,
+		JobID:     req.Identity.JobId,
 		MsgID:     msgID,
 		SizeBytes: len(reqBytes),
 		Error:     err,

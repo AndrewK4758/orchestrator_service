@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/AndrewK4758/shared_utils/envutil"
@@ -21,13 +22,18 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+type clientConnEntry struct {
+	conn       *grpc.ClientConn
+	lastAccess time.Time
+}
+
 type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
 	eng *engine.Engine
 	pub JobPublisher
 
 	webhookConnMu sync.RWMutex
-	webhookConns  map[string]*grpc.ClientConn
+	webhookConns  map[string]*clientConnEntry
 	grpcMaxMsgMb  int
 	grpcTimeout   int
 }
@@ -42,24 +48,45 @@ type JobPublisher interface {
 func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
 	eng, err := engine.NewEngine(ctx)
 	if err != nil {
-		logger.Fatal("System", "Failed to initialize engine: %v", err)
+		panic(fmt.Errorf("Failed to initialize engine: %v", err))
 	}
 
 	srv := &OrchestratorServer{
 		eng:          eng,
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcMaxMsgMb: envutil.MustGetInt("GRPC_MAX_MESSAGE_SIZE_MB"),
 		grpcTimeout:  envutil.MustGetInt("GRPC_TIMEOUT_SECONDS"),
 	}
 
 	if err := srv.pub.ConsumeWebhooks(ctx, srv.processWebhookMsg); err != nil {
-		logger.Error("System", "Failed to start webhooks consumer: %v", err)
+		panic(fmt.Errorf("Failed to start webhooks consumer: %v", err))
 	}
 
 	if err := srv.pub.ConsumeOrchestratorResponses(ctx, srv.processOrchestratorResponses); err != nil {
-		logger.Error("System", "Failed to start orchestrator responses consumer: %v", err)
+		panic(fmt.Errorf("Failed to start orchestrator responses consumer: %v", err))
 	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				srv.webhookConnMu.Lock()
+				now := time.Now()
+				for k, v := range srv.webhookConns {
+					if now.Sub(v.lastAccess) > 15*time.Minute {
+						v.conn.Close()
+						delete(srv.webhookConns, k)
+					}
+				}
+				srv.webhookConnMu.Unlock()
+			}
+		}
+	}()
 
 	return srv
 }
@@ -100,7 +127,7 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstream.Msg) error {
 	var evt events.WebhookEvent
 	if err := json.Unmarshal(msg.Data(), &evt); err != nil {
-		panic(fmt.Errorf("action failed for job processWebhookMsg: corrupted JSON: %v", err))
+		panic(fmt.Errorf("action failed for job processWebhookMsg: corrupted JSON: %w", err))
 	}
 
 	if evt.Request == nil {
@@ -118,26 +145,24 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		addr = workflowparser.NewTaskRequestParser(evt.Request).MustGetCallbackAddress(evt.Request.Identity.JobId)
 	}
 
-	s.webhookConnMu.RLock()
-	conn, ok := s.webhookConns[addr]
-	s.webhookConnMu.RUnlock()
-
+	s.webhookConnMu.Lock()
+	entry, ok := s.webhookConns[addr]
 	if !ok {
-		s.webhookConnMu.Lock()
-		conn, ok = s.webhookConns[addr]
-		if !ok {
-			var err error
-			conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				s.webhookConnMu.Unlock()
-				return fmt.Errorf("failed to dial callback address %s: %w", addr, err)
-			}
-			s.webhookConns[addr] = conn
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			s.webhookConnMu.Unlock()
+			return fmt.Errorf("failed to dial callback address %s: %w", addr, err)
 		}
-		s.webhookConnMu.Unlock()
+		entry = &clientConnEntry{
+			conn:       conn,
+			lastAccess: time.Now(),
+		}
+		s.webhookConns[addr] = entry
+	} else {
+		entry.lastAccess = time.Now()
 	}
-
-	client := pb.NewOrchestratorCallbackServiceClient(conn)
+	client := pb.NewOrchestratorCallbackServiceClient(entry.conn)
+	s.webhookConnMu.Unlock()
 
 	if evt.ErrorContract != nil {
 		if evt.IsSuspended {

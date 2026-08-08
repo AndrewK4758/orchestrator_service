@@ -6,10 +6,8 @@ require (
 	buf.build/go/protovalidate v1.2.0
 	github.com/AndrewK4758/shared_protos v0.0.0-20260709011136-f55ddc746c56
 	github.com/AndrewK4758/shared_utils v0.0.0-00010101000000-000000000000
-	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3
 	github.com/nats-io/nats.go v1.52.0
-	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260720211330-0afa2a65878a
 	google.golang.org/grpc v1.82.1

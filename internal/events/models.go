@@ -1,6 +1,7 @@
 package events
 
 import (
+	"encoding/json"
 	"time"
 
 	pb "github.com/AndrewK4758/shared_protos"
@@ -43,8 +44,8 @@ type TraceabilityEvent struct {
 	ChunkIndex          int               `json:"chunk_index,omitempty"`
 	Message             string            `json:"message,omitempty"`
 	ErrorContract       *pb.ErrorContract `json:"error_contract,omitempty"`
-	Metadata            map[string]any    `json:"metadata,omitempty"`
-	NodeOutput          map[string]any    `json:"node_output,omitempty"`
+	Metadata            json.RawMessage   `json:"metadata,omitempty"`
+	NodeOutput          json.RawMessage   `json:"node_output,omitempty"`
 	RequestSnapshotJson string            `json:"request_snapshot_json,omitempty"`
 	ExtractedData       string            `json:"extracted_data,omitempty"` // Only populated on completion if needed
 }

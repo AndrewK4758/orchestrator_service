@@ -3,13 +3,11 @@ package server
 import (
 	"fmt"
 	"testing"
-
-	"google.golang.org/grpc"
 )
 
 func BenchmarkWebhookConnsLockContention(b *testing.B) {
 	srv := &OrchestratorServer{
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 	}
 
 	// Pre-fill webhookConns to simulate load

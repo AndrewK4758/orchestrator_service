@@ -32,7 +32,7 @@ func TestAdversarial_Orchestrator_RoutingAgnosticism_ExtremeInputs(t *testing.T)
 	pub := &mockPublisher{}
 	srv := &OrchestratorServer{
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcTimeout:  30,
 		grpcMaxMsgMb: 4,
 	}
@@ -94,7 +94,7 @@ func TestAdversarial_Orchestrator_ProcessWebhookMsg_ConcurrentStress(t *testing.
 	pub := &mockPublisher{}
 	srv := &OrchestratorServer{
 		pub:          pub,
-		webhookConns: make(map[string]*grpc.ClientConn),
+		webhookConns: make(map[string]*clientConnEntry),
 		grpcTimeout:  30,
 		grpcMaxMsgMb: 4,
 	}

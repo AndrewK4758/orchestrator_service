@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"net"
 	"os"
 	"os/signal"
@@ -20,7 +21,6 @@ import (
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
 
-
 	"orchestrator_service/internal/events"
 	"orchestrator_service/internal/server"
 
@@ -31,7 +31,9 @@ import (
 
 func main() {
 	// Attempt to load .env, ignore error if it doesn't exist
-	envutil.LoadEnv(".env", "orchestrator_service/.env", "../.env", "../../.env")
+	envPath := flag.String("env", ".env", "Path to environment file")
+	flag.Parse()
+	envutil.LoadEnv(*envPath)
 	logger.InitLogger()
 
 	port := envutil.MustGetString("PORT")

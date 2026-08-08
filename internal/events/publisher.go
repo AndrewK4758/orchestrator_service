@@ -29,6 +29,9 @@ const (
 
 	KVActiveJobs         = "active_jobs"
 	KVCacheRequestsStore = "cache.requests.store"
+
+	SubjectIncomingJobFormat = "jobs.%s.%s.%s.incoming"
+	SubjectTraceFormat       = "trace.%s"
 )
 
 // Publisher handles pushing state and trace events to JetStream.
@@ -115,12 +118,12 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 
 	if envutil.MustGetString("PURGE_QUEUE_ON_STARTUP") == "true" {
 		logger.Info("System", "DEVELOPMENT MODE: Purging JOBS, TRACE_EVENTS, WEBHOOKS, WORKERS, AI_RESPONSES, and ORCHESTRATOR_RESPONSES streams on startup...")
-		_ = jobsStream.Purge(ctx)
-		_ = traceStream.Purge(ctx)
-		_ = webhooksStream.Purge(ctx)
-		_ = workersStream.Purge(ctx)
-		_ = aiResponsesStream.Purge(ctx)
-		_ = orchestratorResponsesStream.Purge(ctx)
+		if err := jobsStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge jobs stream: %v", err) }
+		if err := traceStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge trace stream: %v", err) }
+		if err := webhooksStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge webhooks stream: %v", err) }
+		if err := workersStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge workers stream: %v", err) }
+		if err := aiResponsesStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge aiResponses stream: %v", err) }
+		if err := orchestratorResponsesStream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge orchestratorResponses stream: %v", err) }
 		if kvStream, err := js.Stream(ctx, "KV_"+KVActiveJobs); err == nil {
 			_ = kvStream.Purge(ctx)
 		}
@@ -142,7 +145,7 @@ func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) e
 	}
 
 	// Publish to a specific subject, e.g., "trace.job.started"
-	subject := fmt.Sprintf("trace.%s", event.EventType)
+	subject := fmt.Sprintf(SubjectTraceFormat, event.EventType)
 	logger.Info("Publisher", "Publishing to NATS subject: '%s'", subject)
 
 	// Use JetStream publish for guaranteed delivery
@@ -189,7 +192,7 @@ func (p *Publisher) PublishJob(ctx context.Context, identity *pb.InfrastructureI
 	tenantId := sanitizeSubjectToken(identity.GetTenantId())
 	appId := sanitizeSubjectToken(identity.GetAppId())
 	jobId := sanitizeSubjectToken(identity.GetJobId())
-	subject := fmt.Sprintf("jobs.%s.%s.%s.incoming", tenantId, appId, jobId)
+	subject := fmt.Sprintf(SubjectIncomingJobFormat, tenantId, appId, jobId)
 	msg := &nats.Msg{
 		Subject: subject,
 		Data:    payload,
@@ -259,7 +262,7 @@ func (p *Publisher) PurgeQueues(ctx context.Context) error {
 	for _, streamName := range streams {
 		stream, err := p.js.Stream(ctx, streamName)
 		if err == nil {
-			_ = stream.Purge(ctx)
+			if err := stream.Purge(ctx); err != nil { logger.Error("System", "Failed to purge stream: %v", err) }
 			logger.Info("Publisher", "Purged stream %s", streamName)
 		}
 	}
@@ -448,23 +451,24 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 						DurationMs: durationMs,
 						Error:      err,
 					})
-					_ = m.Nak()
-				} else {
-					natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-						Component:  "Orchestrator",
-						Event:      "ACKNOWLEDGED",
-						Stream:     StreamJobs,
-						Subject:    m.Subject(),
-						Consumer:   consumerName,
-						TenantID:   t,
-						AppID:      a,
-						JobID:      j,
-						MsgID:      msgID,
-						Attempt:    attempt,
-						DurationMs: durationMs,
-					})
-					_ = m.Ack()
+					if nakErr := m.Nak(); nakErr != nil { logger.Error("System", "Failed to NAK message: %v", nakErr) }
+					return
 				}
+				
+				natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+					Component:  "Orchestrator",
+					Event:      "ACKNOWLEDGED",
+					Stream:     StreamJobs,
+					Subject:    m.Subject(),
+					Consumer:   consumerName,
+					TenantID:   t,
+					AppID:      a,
+					JobID:      j,
+					MsgID:      msgID,
+					Attempt:    attempt,
+					DurationMs: durationMs,
+				})
+				if ackErr := m.Ack(); ackErr != nil { logger.Error("System", "Failed to ACK message: %v", ackErr) }
 			}(msg)
 		}
 	}
@@ -621,22 +625,23 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 					DurationMs: durationMs,
 					Error:      err,
 				})
-				_ = m.Nak()
-			} else {
-				natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-					Component:  "Orchestrator",
-					Event:      "ACKNOWLEDGED",
-					Stream:     StreamWebhooks,
-					Subject:    m.Subject(),
-					Consumer:   "orchestrator_webhooks_consumer",
-					TenantID:   t,
-					AppID:      a,
-					JobID:      j,
-					Attempt:    attempt,
-					DurationMs: durationMs,
-				})
-				_ = m.Ack()
+				if nakErr := m.Nak(); nakErr != nil { logger.Error("System", "Failed to NAK message: %v", nakErr) }
+				return
 			}
+			
+			natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+				Component:  "Orchestrator",
+				Event:      "ACKNOWLEDGED",
+				Stream:     StreamWebhooks,
+				Subject:    m.Subject(),
+				Consumer:   "orchestrator_webhooks_consumer",
+				TenantID:   t,
+				AppID:      a,
+				JobID:      j,
+				Attempt:    attempt,
+				DurationMs: durationMs,
+			})
+			if ackErr := m.Ack(); ackErr != nil { logger.Error("System", "Failed to ACK message: %v", ackErr) }
 		}(msg)
 	})
 	if err != nil {
@@ -689,22 +694,23 @@ func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler fu
 			durationMs := time.Since(startTime).Milliseconds()
 			if err != nil {
 				logger.Error("System", "Failed to process orchestrator response, nacking: %v", err)
-				_ = m.Nak()
-			} else {
-				natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
-					Component:  "Orchestrator",
-					Event:      "ACKNOWLEDGED",
-					Stream:     StreamOrchestratorResponses,
-					Subject:    m.Subject(),
-					Consumer:   "orchestrator_responses_consumer",
-					TenantID:   t,
-					AppID:      a,
-					JobID:      j,
-					Attempt:    attempt,
-					DurationMs: durationMs,
-				})
-				_ = m.Ack()
+				if nakErr := m.Nak(); nakErr != nil { logger.Error("System", "Failed to NAK message: %v", nakErr) }
+				return
 			}
+			
+			natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
+				Component:  "Orchestrator",
+				Event:      "ACKNOWLEDGED",
+				Stream:     StreamOrchestratorResponses,
+				Subject:    m.Subject(),
+				Consumer:   "orchestrator_responses_consumer",
+				TenantID:   t,
+				AppID:      a,
+				JobID:      j,
+				Attempt:    attempt,
+				DurationMs: durationMs,
+			})
+			if ackErr := m.Ack(); ackErr != nil { logger.Error("System", "Failed to ACK message: %v", ackErr) }
 		}(msg)
 	})
 	if err != nil {
