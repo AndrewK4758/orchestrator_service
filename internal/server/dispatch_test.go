@@ -32,9 +32,10 @@ func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 	}
 
 	req := &pb.ExecuteTaskRequest{
-		Identity:    &pb.InfrastructureIdentity{JobId: "job_active_dup", TenantId: "tenant_1", AppId: "app_1"},
-		StepId:      "step_1",
-		TaskSubject: "worker.test",
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_active_dup", TenantId: "tenant_1", AppId: "app_1"},
+		StepId:          "step_1",
+		TaskSubject:     "worker.test",
+		CallbackAddress: "localhost:1234",
 	}
 
 	res, err := srv.ExecuteTask(context.Background(), req)
@@ -55,9 +56,10 @@ func TestDispatch_PurgedStateRedelivery(t *testing.T) {
 	}
 
 	req := &pb.ExecuteTaskRequest{
-		Identity:    &pb.InfrastructureIdentity{JobId: "job_purged_redelivery", TenantId: "tenant_1", AppId: "app_1"},
-		StepId:      "step_1",
-		TaskSubject: "worker.test",
+		Identity:        &pb.InfrastructureIdentity{JobId: "job_purged_redelivery", TenantId: "tenant_1", AppId: "app_1"},
+		StepId:          "step_1",
+		TaskSubject:     "worker.test",
+		CallbackAddress: "localhost:1234",
 	}
 
 	res, err := srv.ExecuteTask(context.Background(), req)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 
@@ -57,7 +58,24 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 				JobId:    "job-1",
 			},
 			// Missing TaskSubject
-			StepId: "step-1",
+			StepId:          "step-1",
+			CallbackAddress: "localhost:1234",
+		}
+		assert.Panics(t, func() {
+			_, _ = srv.ExecuteTask(context.Background(), req)
+		})
+	})
+
+	t.Run("ExecuteTask_MissingCallbackAddress_Panics", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity: &pb.InfrastructureIdentity{
+				TenantId: "tenant-1",
+				AppId:    "app-1",
+				JobId:    "job-1",
+			},
+			TaskSubject: "worker.test",
+			StepId:      "step-1",
+			// Missing CallbackAddress
 		}
 		assert.Panics(t, func() {
 			_, _ = srv.ExecuteTask(context.Background(), req)
@@ -80,6 +98,23 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 		evtBytes, err := json.Marshal(&events.WebhookEvent{
 			Request: &pb.ExecuteTaskRequest{
 				Identity: &pb.InfrastructureIdentity{TenantId: "t1"}, // incomplete identity
+			},
+		})
+		assert.NoError(t, err)
+		msg := mockMsg{data: evtBytes}
+		assert.Panics(t, func() { srv.processWebhookMsg(context.Background(), msg) })
+	})
+
+	t.Run("ProcessWebhookMsg_MissingCallbackAddress_Panics", func(t *testing.T) {
+		evtBytes, err := json.Marshal(&events.WebhookEvent{
+			Request: &pb.ExecuteTaskRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "tenant-1",
+					AppId:    "app-1",
+					JobId:    "job-1",
+				},
+				StepId: "step-1",
+				// Missing CallbackAddress
 			},
 		})
 		assert.NoError(t, err)
@@ -118,6 +153,17 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 
 	t.Run("ProcessOrchestratorResponses_EmptyStepId_Panics", func(t *testing.T) {
 		msg := mockMsg{subject: "orchestrator.response.app1.tenant1.job1..callback"}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
+	})
+
+	t.Run("ProcessOrchestratorResponses_EmptyCallbackAddress_Panics", func(t *testing.T) {
+		msg := mockMsg{subject: "orchestrator.response.app1.tenant1.job1.step1."}
+		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
+	})
+
+	t.Run("ProcessOrchestratorResponses_WhitespaceCallbackAddress_Panics", func(t *testing.T) {
+		wsCallback := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte("   "))
+		msg := mockMsg{subject: "orchestrator.response.app1.tenant1.job1.step1." + wsCallback}
 		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})
 }

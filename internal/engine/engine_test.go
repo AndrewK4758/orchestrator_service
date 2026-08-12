@@ -14,6 +14,7 @@ func TestProcessingState_Initialization(t *testing.T) {
 			AppId:    "test_app",
 			JobId:    "test_job_1",
 		},
+		CallbackAddress: "localhost:1234",
 	}
 
 	if req.Identity.JobId != "test_job_1" {
@@ -22,5 +23,9 @@ func TestProcessingState_Initialization(t *testing.T) {
 
 	if req.Identity.TenantId != "test_tenant" {
 		t.Errorf("Expected tenant_id test_tenant, got %s", req.Identity.TenantId)
+	}
+
+	if req.CallbackAddress != "localhost:1234" {
+		t.Errorf("Expected CallbackAddress localhost:1234, got %s", req.CallbackAddress)
 	}
 }

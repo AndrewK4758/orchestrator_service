@@ -86,7 +86,7 @@ func main() {
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMsgSizeMb*1024*1024),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time: 30 * time.Second,
+			Time: 30 * time.Second, //move to config
 		}),
 		grpc.ChainUnaryInterceptor(
 			recovery.UnaryServerInterceptor(),

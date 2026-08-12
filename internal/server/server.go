@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,7 +12,6 @@ import (
 	"github.com/AndrewK4758/shared_utils/envutil"
 	_ "github.com/AndrewK4758/shared_utils/identityparser"
 	"github.com/AndrewK4758/shared_utils/logger"
-	"github.com/AndrewK4758/shared_utils/workflowparser"
 
 	"orchestrator_service/internal/engine"
 	"orchestrator_service/internal/events"
@@ -107,6 +107,9 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 	if req.TaskSubject == "" {
 		panic(fmt.Errorf("action failed for job %s: missing required property TaskSubject", jobID))
 	}
+	if strings.TrimSpace(req.CallbackAddress) == "" {
+		panic(fmt.Errorf("action failed for job %s: missing required property CallbackAddress", jobID))
+	}
 
 	logger.Info("System", "Received ExecuteTask for JobID: %s, StepID: %s, TaskSubject: %s", jobID, req.StepId, req.TaskSubject)
 	reqJSON := protojson.MarshalOptions{Multiline: false}.Format(req)
@@ -140,9 +143,9 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		panic(fmt.Errorf("action failed for job processWebhookMsg: invalid identity"))
 	}
 
-	addr := evt.Request.TaskSubject
-	if addr == "" {
-		addr = workflowparser.NewTaskRequestParser(evt.Request).MustGetCallbackAddress(evt.Request.Identity.JobId)
+	addr := evt.Request.CallbackAddress
+	if strings.TrimSpace(addr) == "" {
+		panic(fmt.Errorf("action failed for job processWebhookMsg: missing required property CallbackAddress"))
 	}
 
 	s.webhookConnMu.Lock()

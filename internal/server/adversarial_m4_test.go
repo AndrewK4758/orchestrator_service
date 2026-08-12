@@ -116,8 +116,9 @@ func TestAdversarial_Orchestrator_ProcessWebhookMsg_ConcurrentStress(t *testing.
 						AppId:    "app_stress",
 						JobId:    fmt.Sprintf("job_stress_%d", id),
 					},
-					StepId:      fmt.Sprintf("step_stress_%d", id),
-					TaskSubject: targetAddr,
+					StepId:          fmt.Sprintf("step_stress_%d", id),
+					TaskSubject:     "worker.test",
+					CallbackAddress: targetAddr,
 				},
 			}
 

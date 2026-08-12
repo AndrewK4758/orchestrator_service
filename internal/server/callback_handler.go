@@ -61,17 +61,21 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 	inputJSON := protojson.MarshalOptions{Multiline: false}.Format(&resp)
 	logger.Info("System", "Received worker response (input) for Job: %s, Step: %s, Payload: %s", respSubj.Identity.JobId, respSubj.StepID, inputJSON)
 
-	req := &pb.ExecuteTaskRequest{
-		Identity: respSubj.Identity,
-		StepId:  respSubj.StepID,
-		Payload: resp.ActionResult,
-	}
-
 	dec, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(respSubj.Callback)
 	if err != nil {
 		return fmt.Errorf("action failed for job processOrchestratorResponses: invalid base64 callback address in subject: %w", err)
 	}
 	addr := string(dec)
+	if strings.TrimSpace(addr) == "" {
+		panic(fmt.Errorf("action failed for job processOrchestratorResponses: missing required property CallbackAddress"))
+	}
+
+	req := &pb.ExecuteTaskRequest{
+		Identity:        respSubj.Identity,
+		StepId:          respSubj.StepID,
+		Payload:         resp.ActionResult,
+		CallbackAddress: addr,
+	}
 
 	s.webhookConnMu.Lock()
 	entry, ok := s.webhookConns[addr]

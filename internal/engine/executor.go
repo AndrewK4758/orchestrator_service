@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/AndrewK4758/shared_utils/envutil"
 	"github.com/AndrewK4758/shared_utils/logger"
 	"github.com/AndrewK4758/shared_utils/natsutil"
-	"github.com/AndrewK4758/shared_utils/workflowparser"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/nats-io/nats.go"
@@ -59,6 +59,9 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	if req == nil || req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing infrastructure identity"))
 	}
+	if strings.TrimSpace(req.CallbackAddress) == "" {
+		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing callback address"))
+	}
 	if req.TaskSubject == "" {
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing task subject"))
 	}
@@ -70,7 +73,7 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	callbackAddr := workflowparser.NewTaskRequestParser(req).MustGetCallbackAddress(req.Identity.JobId)
+	callbackAddr := req.CallbackAddress
 	encodedCallback := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(callbackAddr))
 
 	// Artemis (the client) will be listening on this subject for completion

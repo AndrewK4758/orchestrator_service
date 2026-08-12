@@ -1,7 +1,5 @@
 package engine
 
-import "github.com/AndrewK4758/shared_utils/payloadkeys"
-
 import (
 	"strings"
 	"context"
@@ -106,9 +104,20 @@ func TestEngine_ExecuteTask_ValidationErrors(t *testing.T) {
 		})
 	})
 
+	t.Run("missing callback address", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "j1"},
+			TaskSubject: "worker.test",
+		}
+		assertPanicsWithError(t, "missing callback address", func() {
+			eng.ExecuteTask(ctx, req)
+		})
+	})
+
 	t.Run("missing task subject", func(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{
-			Identity: &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "j1"},
+			Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "j1"},
+			CallbackAddress: "localhost:1234",
 		}
 		assertPanicsWithError(t, "missing task subject", func() {
 			eng.ExecuteTask(ctx, req)
@@ -124,9 +133,7 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 	}
 
 	payload, err := structpb.NewStruct(map[string]interface{}{
-		payloadkeys.MetadataKey: map[string]interface{}{
-			"callback_address": "localhost:1234",
-		},
+		"key": "val",
 	})
 	assert.NoError(t, err)
 
@@ -136,9 +143,10 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 			AppId:    "app1",
 			JobId:    "job1",
 		},
-		TaskSubject: "worker.ai.inference",
-		StepId:      "step123",
-		Payload:     payload,
+		TaskSubject:     "worker.ai.inference",
+		StepId:          "step123",
+		CallbackAddress: "localhost:1234",
+		Payload:         payload,
 	}
 
 	mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
@@ -160,9 +168,7 @@ func TestEngine_ExecuteTask_PublishError(t *testing.T) {
 	}
 
 	payload, err := structpb.NewStruct(map[string]interface{}{
-		payloadkeys.MetadataKey: map[string]interface{}{
-			"callback_address": "localhost:1234",
-		},
+		"key": "val",
 	})
 	assert.NoError(t, err)
 
@@ -172,9 +178,10 @@ func TestEngine_ExecuteTask_PublishError(t *testing.T) {
 			AppId:    "app1",
 			JobId:    "job1",
 		},
-		TaskSubject: "worker.error",
-		StepId:      "step123",
-		Payload:     payload,
+		TaskSubject:     "worker.error",
+		StepId:          "step123",
+		CallbackAddress: "localhost:1234",
+		Payload:         payload,
 	}
 
 	mockJS.On("PublishMsg", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("nats publish failed"))

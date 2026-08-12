@@ -124,8 +124,9 @@ func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 				AppId:    "app-Y",
 				JobId:    "job-Z",
 			},
-			StepId:      "step-42",
-			TaskSubject: "worker.ai.inference",
+			StepId:          "step-42",
+			TaskSubject:     "worker.ai.inference",
+			CallbackAddress: "localhost:1234",
 			Payload: &structpb.Struct{
 				Fields: map[string]*structpb.Value{
 					"status": structpb.NewStringValue("completed"),
@@ -156,6 +157,9 @@ func TestWebhookEvent_JSONRoundTrip(t *testing.T) {
 	}
 	if unmarshaled.Request == nil {
 		t.Fatalf("Request is nil after unmarshaling!")
+	}
+	if unmarshaled.Request.CallbackAddress != "localhost:1234" {
+		t.Errorf("Request.CallbackAddress mismatch: expected 'localhost:1234', got %q", unmarshaled.Request.CallbackAddress)
 	}
 	if val := unmarshaled.Request.Payload.Fields["status"].GetStringValue(); val != "completed" {
 		t.Errorf("Payload mismatch: expected %q, got %q", "completed", val)

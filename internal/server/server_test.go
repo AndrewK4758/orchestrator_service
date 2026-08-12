@@ -89,6 +89,16 @@ func TestOrchestratorServer_ExecuteTask(t *testing.T) {
 		})
 	})
 
+	t.Run("ExecuteTask missing CallbackAddress panics", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "j1"},
+			TaskSubject: "worker.test",
+		}
+		assert.Panics(t, func() {
+			_, _ = srv.ExecuteTask(context.Background(), req)
+		})
+	})
+
 	t.Run("ExecuteTask integration requires NATS", func(t *testing.T) {
 		t.Skip("Skipping integration test requiring NATS")
 	})
@@ -351,8 +361,9 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 						AppId:    "app_test",
 						JobId:    tt.jobID,
 					},
-					StepId:      tt.stepID,
-					TaskSubject: targetAddr,
+					StepId:          tt.stepID,
+					TaskSubject:     "worker.test",
+					CallbackAddress: targetAddr,
 				},
 				ErrorContract: tt.errorContract,
 				IsSuspended:   tt.isSuspended,
@@ -402,9 +413,10 @@ func TestServer_ProcessWebhookMsg_DirectClientPoolRouting_MultiServer(t *testing
 
 	evt1 := &events.WebhookEvent{
 		Request: &pb.ExecuteTaskRequest{
-			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_a"},
-			StepId:      "step_a",
-			TaskSubject: addrA,
+			Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_a"},
+			StepId:          "step_a",
+			TaskSubject:     "worker.test",
+			CallbackAddress: addrA,
 		},
 	}
 	evt1Bytes, _ := json.Marshal(evt1)
@@ -413,9 +425,10 @@ func TestServer_ProcessWebhookMsg_DirectClientPoolRouting_MultiServer(t *testing
 
 	evt2 := &events.WebhookEvent{
 		Request: &pb.ExecuteTaskRequest{
-			Identity:    &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_b"},
-			StepId:      "step_b",
-			TaskSubject: addrB,
+			Identity:        &pb.InfrastructureIdentity{TenantId: "t1", AppId: "a1", JobId: "job_server_b"},
+			StepId:          "step_b",
+			TaskSubject:     "worker.test",
+			CallbackAddress: addrB,
 		},
 	}
 	evt2Bytes, _ := json.Marshal(evt2)
