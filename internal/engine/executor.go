@@ -81,6 +81,11 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	nMsg.Reply = replySubj
 	nMsg.Header = make(nats.Header)
 	nMsg.Header.Set("Reply-Subject", replySubj)
+	if req.Headers != nil {
+		for k, v := range req.Headers {
+			nMsg.Header.Set(k, v)
+		}
+	}
 	nMsg.Data = reqBytes
 
 	reqJSON := protojson.MarshalOptions{Multiline: false}.Format(req)

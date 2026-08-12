@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"net"
 	"os"
 	"os/signal"
@@ -30,10 +29,8 @@ import (
 )
 
 func main() {
-	// Attempt to load .env, ignore error if it doesn't exist
-	envPath := flag.String("env", ".env", "Path to environment file")
-	flag.Parse()
-	envutil.LoadEnv(*envPath)
+	// Attempt to load .env from standard deterministic execution paths
+	envutil.LoadEnv(".env", "orchestrator_service/.env", "../../.env")
 	logger.InitLogger()
 
 	port := envutil.MustGetString("PORT")
