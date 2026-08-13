@@ -373,7 +373,15 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 			sem <- struct{}{}
 			p.LogQueueSizeAsync(ctx, "Dequeue", consumerName)
 			go func(m jetstream.Msg) {
-				defer func() { <-sem }()
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("System", "Panic recovered in ConsumeJobs: %v", r)
+						if nakErr := m.Nak(); nakErr != nil {
+							logger.Error("System", "Failed to NAK message after panic: %v", nakErr)
+						}
+					}
+					<-sem
+				}()
 				startTime := time.Now()
 				meta, _ := m.Metadata()
 				var attempt uint64 = 1
@@ -517,7 +525,7 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 
 	msgId := fmt.Sprintf("%s-%s", jobID, stepID)
 	msg := &nats.Msg{
-		Subject: "webhooks.callback",
+		Subject: fmt.Sprintf("webhooks.callback.%s", tenantID),
 		Data:    data,
 		Header:  nats.Header{},
 	}
@@ -528,7 +536,7 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 		Component: "Orchestrator",
 		Event:     "ENQUEUED",
 		Stream:    StreamWebhooks,
-		Subject:   "webhooks.callback",
+		Subject:   fmt.Sprintf("webhooks.callback.%s", tenantID),
 		TenantID:  tenantID,
 		AppID:     appID,
 		JobID:     jobID,
@@ -550,7 +558,7 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxAckPending: envutil.MustGetInt("WEBHOOKS_MAX_ACK_PENDING"),
 		MaxDeliver:    envutil.MustGetInt("WEBHOOKS_MAX_DELIVER"),
-		FilterSubject: "webhooks.callback",
+		FilterSubject: "webhooks.callback.*",
 		BackOff: []time.Duration{
 			10 * time.Second,
 			30 * time.Second,
@@ -578,7 +586,15 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		sem <- struct{}{}
 		go func(m jetstream.Msg) {
-			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("System", "Panic recovered in ConsumeWebhooks: %v", r)
+					if nakErr := m.Nak(); nakErr != nil {
+						logger.Error("System", "Failed to NAK message after panic: %v", nakErr)
+					}
+				}
+				<-sem
+			}()
 			startTime := time.Now()
 			meta, _ := m.Metadata()
 			var attempt uint64 = 1
@@ -606,7 +622,7 @@ func (p *Publisher) ConsumeWebhooks(ctx context.Context, handler func(ctx contex
 				Attempt:   attempt,
 			})
 
-			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(envutil.MustGetInt("GRPC_TIMEOUT_SECONDS"))*time.Second)
 			err := handler(ctxMsg, m)
 			cancelMsg()
 			durationMs := time.Since(startTime).Milliseconds()
@@ -661,8 +677,19 @@ func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler fu
 	cons, err := p.js.CreateOrUpdateConsumer(ctx, StreamOrchestratorResponses, jetstream.ConsumerConfig{
 		Durable:       "orchestrator_responses_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: 100,
 		MaxDeliver:    5,
 		FilterSubject: "orchestrator.response.>",
+		BackOff: []time.Duration{
+			10 * time.Second,
+			30 * time.Second,
+			1 * time.Minute,
+			2 * time.Minute,
+			5 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			1 * time.Hour,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create orchestrator responses consumer: %w", err)
@@ -670,8 +697,25 @@ func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler fu
 
 	logger.Debug("System", "Consumer started on stream %s. Waiting for messages...", StreamOrchestratorResponses)
 
+	maxConcurrency := 50
+	if envVal := envutil.MustGetString("ORCHESTRATOR_MAX_CONCURRENCY"); envVal != "" {
+		if parsed, err := strconv.Atoi(envVal); err == nil {
+			maxConcurrency = parsed
+		}
+	}
+	sem := make(chan struct{}, maxConcurrency)
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		sem <- struct{}{}
 		go func(m jetstream.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("System", "Panic recovered in ConsumeOrchestratorResponses: %v", r)
+					if nakErr := m.Nak(); nakErr != nil {
+						logger.Error("System", "Failed to NAK message after panic: %v", nakErr)
+					}
+				}
+				<-sem
+			}()
 			startTime := time.Now()
 			md, _ := m.Metadata()
 			attempt := uint64(1)
@@ -688,7 +732,7 @@ func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler fu
 				j = parts[4]
 			}
 
-			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(envutil.MustGetInt("GRPC_TIMEOUT_SECONDS"))*time.Second)
 			err := handler(ctxMsg, m)
 			cancelMsg()
 			durationMs := time.Since(startTime).Milliseconds()
