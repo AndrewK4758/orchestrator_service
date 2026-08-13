@@ -678,7 +678,7 @@ func (p *Publisher) ConsumeOrchestratorResponses(ctx context.Context, handler fu
 		Durable:       "orchestrator_responses_consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxAckPending: 100,
-		MaxDeliver:    5,
+		MaxDeliver:    9,
 		FilterSubject: "orchestrator.response.>",
 		BackOff: []time.Duration{
 			10 * time.Second,
