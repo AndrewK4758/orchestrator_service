@@ -25,3 +25,4 @@ obj
 cmake-build-*/
 out/
 .vs/
+cmake-build-*/
