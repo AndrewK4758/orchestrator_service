@@ -20,3 +20,8 @@ orchestrator_bin
 /bin/go_build_orchestrator_service_cmd_server
 bin/
 bin
+obj/
+obj
+cmake-build-*/
+out/
+.vs/
