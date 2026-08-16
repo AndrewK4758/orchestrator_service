@@ -13,7 +13,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,8 +57,7 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 		return fmt.Errorf("action failed for job processOrchestratorResponses: corrupted protobuf: %w", err)
 	}
 
-	inputJSON := protojson.MarshalOptions{Multiline: false}.Format(&resp)
-	logger.Info("System", "Received worker response (input) for Job: %s, Step: %s, Payload: %s", respSubj.Identity.JobId, respSubj.StepID, inputJSON)
+	logger.Info("System", "Received worker response (input) for Job: %s, Step: %s, Success: %v", respSubj.Identity.JobId, respSubj.StepID, resp.Success)
 
 	dec, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(respSubj.Callback)
 	if err != nil {
@@ -103,8 +101,7 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 				StepId:   req.StepId,
 				Error:    resp.ErrorContract,
 			}
-			outputJSON := protojson.MarshalOptions{Multiline: false}.Format(suspendReq)
-			logger.Info("System", "Pushing callback to client (output): %s", outputJSON)
+			logger.Info("System", "Pushing callback to client (output suspend request) for Job: %s", req.Identity.JobId)
 			_, err := client.OnJobSuspended(ctx, suspendReq)
 			if err != nil {
 				return fmt.Errorf("failed to call OnJobSuspended: %w", err)
@@ -117,8 +114,7 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 			StepId:   req.StepId,
 			Error:    resp.ErrorContract,
 		}
-		outputJSON := protojson.MarshalOptions{Multiline: false}.Format(failReq)
-		logger.Info("System", "Pushing callback to client (output): %s", outputJSON)
+		logger.Info("System", "Pushing callback to client (output fail request) for Job: %s", req.Identity.JobId)
 		_, err := client.OnJobFailed(ctx, failReq)
 		if err != nil {
 			return fmt.Errorf("failed to call OnJobFailed: %w", err)
@@ -126,8 +122,7 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 		return nil
 	}
 
-	outputJSON := protojson.MarshalOptions{Multiline: false}.Format(req)
-	logger.Info("System", "Pushing callback to client (output): %s", outputJSON)
+	logger.Info("System", "Pushing callback to client (output success request) for Job: %s, Step: %s", req.Identity.JobId, req.StepId)
 
 	stream, err := client.OnTaskExecutionComplete(ctx)
 	if err != nil {

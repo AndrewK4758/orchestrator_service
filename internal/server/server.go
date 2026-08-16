@@ -19,7 +19,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type clientConnEntry struct {
@@ -112,8 +111,6 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 	}
 
 	logger.Info("System", "Received ExecuteTask for JobID: %s, StepID: %s, TaskSubject: %s", jobID, req.StepId, req.TaskSubject)
-	reqJSON := protojson.MarshalOptions{Multiline: false}.Format(req)
-	logger.Info("System", "Incoming ExecuteTask request payload: %s", reqJSON)
 
 	err := s.eng.ExecuteTask(ctx, req)
 	if err != nil {

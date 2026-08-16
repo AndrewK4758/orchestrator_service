@@ -13,7 +13,6 @@ import (
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -91,8 +90,7 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	}
 	nMsg.Data = reqBytes
 
-	reqJSON := protojson.MarshalOptions{Multiline: false}.Format(req)
-	logger.Info("Engine", "Outbound task dispatch payload for subject %s: %s", subject, reqJSON)
+	logger.Info("Engine", "Outbound task dispatch to subject %s (JobId: %s, StepId: %s)", subject, req.Identity.JobId, req.StepId)
 
 	if e.js != nil {
 		_, err = e.js.PublishMsg(ctx, nMsg, jetstream.WithMsgID(msgID))
