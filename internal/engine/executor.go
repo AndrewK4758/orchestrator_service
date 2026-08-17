@@ -61,7 +61,7 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	if strings.TrimSpace(req.CallbackAddress) == "" {
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing callback address"))
 	}
-	if req.TaskSubject == "" {
+	if req.TaskSubject == pb.WorkerSubject_WORKER_SUBJECT_UNSPECIFIED {
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing task subject"))
 	}
 

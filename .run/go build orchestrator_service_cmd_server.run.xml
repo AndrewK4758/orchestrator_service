@@ -1,13 +1,17 @@
-<?xml version='1.0' encoding='utf-8'?>
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="go build orchestrator_service/cmd/server" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
     <module name="doc_processor_Service" />
     <working_directory value="$PROJECT_DIR$" />
+    <go_parameters value="-o &quot;$PROJECT_DIR$/bin/orchestrator_service&quot;" />
+    <EXTENSION ID="software.aws.toolkits.jetbrains.core.execution.GoAwsConnectionRunConfigurationExtension">
+      <option name="credential" />
+      <option name="region" />
+      <option name="useCurrentConnection" value="false" />
+    </EXTENSION>
     <kind value="PACKAGE" />
     <package value="orchestrator_service/cmd/server" />
     <directory value="$PROJECT_DIR$" />
-    <go_parameters value="-o &quot;$PROJECT_DIR$/bin/orchestrator_service&quot;" />
-    <method v="2" />
     <output_directory value="$PROJECT_DIR$/bin" />
+    <method v="2" />
   </configuration>
 </component>

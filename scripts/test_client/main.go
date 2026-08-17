@@ -152,7 +152,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 			TenantId: "TEST_TENANT",
 		},
 		StepId:          "step_1",
-		TaskSubject:     "worker.human.validation",
+		TaskSubject:     pb.WorkerSubject_WORKER_HUMAN_VALIDATION,
 		Payload:         funcStruct,
 		CallbackAddress: "localhost:11115",
 	}
