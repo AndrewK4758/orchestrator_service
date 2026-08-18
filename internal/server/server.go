@@ -103,7 +103,7 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 		panic(fmt.Errorf("action failed for job ExecuteTask: incomplete Identity"))
 	}
 
-	if req.TaskSubject == pb.WorkerSubject_WORKER_SUBJECT_UNSPECIFIED {
+	if strings.TrimSpace(req.TaskSubject) == "" {
 		panic(fmt.Errorf("action failed for job %s: missing required property TaskSubject", jobID))
 	}
 	if strings.TrimSpace(req.CallbackAddress) == "" {
