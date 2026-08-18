@@ -65,7 +65,9 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 		panic(fmt.Errorf("[EXECUTE TASK] invalid request: missing task subject"))
 	}
 
-	subject := fmt.Sprintf("%s.%s.%s.%s", req.TaskSubject, req.Identity.AppId, req.Identity.TenantId, req.Identity.JobId)
+	enumStr := req.TaskSubject.String()
+	subjectPrefix := strings.ToLower(strings.ReplaceAll(enumStr, "_", "."))
+	subject := fmt.Sprintf("%s.%s.%s.%s", subjectPrefix, req.Identity.AppId, req.Identity.TenantId, req.Identity.JobId)
 
 	reqBytes, err := proto.Marshal(req)
 	if err != nil {

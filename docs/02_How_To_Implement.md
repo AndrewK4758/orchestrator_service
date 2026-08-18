@@ -15,12 +15,15 @@ The Orchestrator will be available to clients on **port 11112**.
 ### Local Development (Linux / macOS)
 Ensure the `ai_service` is already running on port 11111. Then run:
 ```bash
-cd /home/ak/projects/doc_processor_service/orchestrator_service
+cd /home/ak/projects/doc_processor_service
+cd orchestrator_service
 export AI_SERVICE_ADDRESS=localhost:11111
 export SEMANTIC_CACHE_SERVICE_ADDRESS=localhost:11115
 export DEFAULT_CALLBACK_ADDRESS=localhost:5133
 go run cmd/server/main.go
 ```
+
+> **Note**: To cleanly build and run all ecosystem microservices simultaneously with correct relative paths and multiplexed logs, execute `./scripts/run_all.zsh` from the project root instead.
 
 ### Local Development (Windows PowerShell)
 Ensure the `ai_service` is already running on port 11111. Then run:
