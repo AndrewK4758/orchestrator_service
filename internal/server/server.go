@@ -26,9 +26,14 @@ type clientConnEntry struct {
 	lastAccess time.Time
 }
 
+type EngineInterface interface {
+	ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) error
+	ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) error
+}
+
 type OrchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
-	eng *engine.Engine
+	eng EngineInterface
 	pub JobPublisher
 
 	webhookConnMu sync.RWMutex
@@ -217,6 +222,33 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 
 	logger.Info("System", "Successfully relayed webhook callback for Job: %s, Step: %s to %s", evt.Request.Identity.JobId, evt.Request.StepId, addr)
 	return nil
+}
+
+func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) (*pb.ResumeJobResponse, error) {
+	if req == nil {
+		panic(fmt.Errorf("action failed for job ResumeJob: missing required property request"))
+	}
+	if req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
+		panic(fmt.Errorf("action failed for job ResumeJob: missing required infrastructure identity"))
+	}
+	if strings.TrimSpace(req.StepId) == "" {
+		panic(fmt.Errorf("action failed for job %s: missing required property StepId", req.Identity.JobId))
+	}
+
+	logger.Info("System", "Received ResumeJob for JobID: %s, StepID: %s", req.Identity.JobId, req.StepId)
+
+	err := s.eng.ResumeJob(ctx, req)
+	if err != nil {
+		return &pb.ResumeJobResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to resume job: %v", err),
+		}, nil
+	}
+
+	return &pb.ResumeJobResponse{
+		Success: true,
+		Message: "Job resumed successfully",
+	}, nil
 }
 
 func (s *OrchestratorServer) PurgeSystemState(ctx context.Context, req *pb.PurgeSystemStateRequest) (*pb.PurgeSystemStateResponse, error) {

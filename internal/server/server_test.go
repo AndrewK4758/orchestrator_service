@@ -440,3 +440,83 @@ func TestServer_ProcessWebhookMsg_DirectClientPoolRouting_MultiServer(t *testing
 	assert.Equal(t, "job_server_a", mockServerA.GetSuccessRequests()[0].Identity.JobId)
 	assert.Equal(t, "job_server_b", mockServerB.GetSuccessRequests()[0].Identity.JobId)
 }
+
+type mockEngine struct {
+	resumeJobFunc func(ctx context.Context, req *pb.ResumeJobRequest) error
+}
+
+func (m *mockEngine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) error {
+	return nil
+}
+
+func (m *mockEngine) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) error {
+	if m.resumeJobFunc != nil {
+		return m.resumeJobFunc(ctx, req)
+	}
+	return nil
+}
+
+func TestOrchestratorServer_ResumeJob(t *testing.T) {
+	mockEng := &mockEngine{}
+	srv := &OrchestratorServer{
+		eng: mockEng,
+	}
+
+	ctx := context.Background()
+
+	t.Run("Happy Path", func(t *testing.T) {
+		var capturedReq *pb.ResumeJobRequest
+		mockEng.resumeJobFunc = func(ctx context.Context, req *pb.ResumeJobRequest) error {
+			capturedReq = req
+			return nil
+		}
+
+		req := &pb.ResumeJobRequest{
+			Identity: &pb.InfrastructureIdentity{
+				TenantId: "tenant_resume",
+				AppId:    "app_resume",
+				JobId:    "job_resume_123",
+			},
+			StepId: "step_classify",
+		}
+
+		resp, err := srv.ResumeJob(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.True(t, resp.GetSuccess())
+		assert.Equal(t, "Job resumed successfully", resp.GetMessage())
+		assert.Equal(t, "job_resume_123", capturedReq.GetIdentity().GetJobId())
+		assert.Equal(t, "step_classify", capturedReq.GetStepId())
+	})
+
+	t.Run("Fail-fast panics on missing identity", func(t *testing.T) {
+		assert.Panics(t, func() {
+			_, _ = srv.ResumeJob(ctx, &pb.ResumeJobRequest{
+				StepId: "step1",
+			})
+		})
+
+		assert.Panics(t, func() {
+			_, _ = srv.ResumeJob(ctx, &pb.ResumeJobRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "",
+					AppId:    "app",
+					JobId:    "job",
+				},
+				StepId: "step1",
+			})
+		})
+
+		assert.Panics(t, func() {
+			_, _ = srv.ResumeJob(ctx, &pb.ResumeJobRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "tenant",
+					AppId:    "app",
+					JobId:    "job",
+				},
+				StepId: "",
+			})
+		})
+	})
+}
+

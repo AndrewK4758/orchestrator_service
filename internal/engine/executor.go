@@ -119,3 +119,35 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 
 	return nil
 }
+
+// ResumeJob handles workflow resumption after human validation corrections have been submitted.
+func (e *Engine) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) error {
+	if req == nil || req.Identity == nil || req.Identity.TenantId == "" || req.Identity.AppId == "" || req.Identity.JobId == "" {
+		panic(fmt.Errorf("[RESUME JOB] invalid request: missing infrastructure identity"))
+	}
+	if strings.TrimSpace(req.StepId) == "" {
+		panic(fmt.Errorf("[RESUME JOB] invalid request: missing step id"))
+	}
+
+	logger.Info("Engine", "Resuming workflow execution for Job: %s, Step: %s (Tenant: %s, App: %s)",
+		req.Identity.JobId, req.StepId, req.Identity.TenantId, req.Identity.AppId)
+
+	subject := fmt.Sprintf("orchestrator.job.resumed.%s.%s.%s", req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId)
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ResumeJobRequest: %w", err)
+	}
+
+	if e.js != nil {
+		nMsg := nats.NewMsg(subject)
+		nMsg.Data = reqBytes
+		_, err = e.js.PublishMsg(ctx, nMsg)
+		if err != nil && e.nc != nil {
+			_ = e.nc.Publish(subject, reqBytes)
+		}
+	} else if e.nc != nil {
+		_ = e.nc.Publish(subject, reqBytes)
+	}
+
+	return nil
+}

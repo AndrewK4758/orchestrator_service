@@ -197,3 +197,57 @@ func TestEngine_Close_NilConn(t *testing.T) {
 		eng.Close()
 	})
 }
+
+func TestEngine_ResumeJob(t *testing.T) {
+	mockJS := new(mockJetStream)
+	eng := &Engine{
+		js:       mockJS,
+		clientID: "orchestrator-task-router",
+	}
+
+	ctx := context.Background()
+
+	t.Run("Happy path publishes to JetStream", func(t *testing.T) {
+		req := &pb.ResumeJobRequest{
+			Identity: &pb.InfrastructureIdentity{
+				TenantId: "tenant1",
+				AppId:    "app1",
+				JobId:    "job1",
+			},
+			StepId: "step_resumed",
+		}
+
+		mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+			expectedSubject := "orchestrator.job.resumed.tenant1.app1.job1"
+			return msg.Subject == expectedSubject
+		}), mock.Anything).Return(&jetstream.PubAck{Sequence: 1}, nil)
+
+		err := eng.ResumeJob(ctx, req)
+		assert.NoError(t, err)
+		mockJS.AssertExpectations(t)
+	})
+
+	t.Run("Fail fast panics on invalid identity", func(t *testing.T) {
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			_ = eng.ResumeJob(ctx, nil)
+		})
+
+		assertPanicsWithError(t, "missing infrastructure identity", func() {
+			_ = eng.ResumeJob(ctx, &pb.ResumeJobRequest{
+				StepId: "step1",
+			})
+		})
+
+		assertPanicsWithError(t, "missing step id", func() {
+			_ = eng.ResumeJob(ctx, &pb.ResumeJobRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "t1",
+					AppId:    "a1",
+					JobId:    "j1",
+				},
+				StepId: "",
+			})
+		})
+	})
+}
+
