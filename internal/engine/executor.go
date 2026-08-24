@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/AndrewK4758/shared_utils/envutil"
@@ -79,7 +80,24 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 	// Artemis (the client) will be listening on this subject for completion
 	replySubj := fmt.Sprintf(ResponseSubjectFormat, req.Identity.AppId, req.Identity.TenantId, req.Identity.JobId, req.StepId, encodedCallback)
 
-	msgID := fmt.Sprintf("%s-%s", req.Identity.JobId, req.StepId)
+	attempt := 0
+	if req.Headers != nil {
+		if val, ok := req.Headers["x-attempt"]; ok {
+			var parseErr error
+			attempt, parseErr = strconv.Atoi(val)
+			if parseErr != nil {
+				panic(fmt.Errorf("[EXECUTE TASK] invalid x-attempt header: %w", parseErr))
+			}
+		} else if val, ok := req.Headers["attempt"]; ok {
+			var parseErr error
+			attempt, parseErr = strconv.Atoi(val)
+			if parseErr != nil {
+				panic(fmt.Errorf("[EXECUTE TASK] invalid attempt header: %w", parseErr))
+			}
+		}
+	}
+
+	msgID := fmt.Sprintf("%s-%s-%s-%d", req.Identity.JobId, req.StepId, subjectPrefix, attempt)
 	nMsg := nats.NewMsg(subject)
 	nMsg.Reply = replySubj
 	nMsg.Header = make(nats.Header)
@@ -89,6 +107,7 @@ func (e *Engine) ExecuteTask(ctx context.Context, req *pb.ExecuteTaskRequest) er
 			nMsg.Header.Set(k, v)
 		}
 	}
+	nMsg.Header.Set(nats.MsgIdHdr, msgID)
 	nMsg.Data = reqBytes
 
 	logger.Info("Engine", "Outbound task dispatch to subject %s (JobId: %s, StepId: %s)", subject, req.Identity.JobId, req.StepId)

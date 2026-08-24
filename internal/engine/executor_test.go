@@ -251,3 +251,211 @@ func TestEngine_ResumeJob(t *testing.T) {
 	})
 }
 
+func TestEngine_ExecuteTask_MsgID_UniquenessAcrossTaskTypes(t *testing.T) {
+	mockJS := new(mockJetStream)
+	eng := &Engine{
+		js:       mockJS,
+		clientID: "orchestrator-task-router",
+	}
+
+	identity := &pb.InfrastructureIdentity{
+		TenantId: "tenant-101",
+		AppId:    "app-alpha",
+		JobId:    "job-unique-test",
+	}
+
+	req1 := &pb.ExecuteTaskRequest{
+		Identity:        identity,
+		TaskSubject:     "worker.cache.lookup",
+		StepId:          "step-500",
+		CallbackAddress: "localhost:8080",
+	}
+
+	req2 := &pb.ExecuteTaskRequest{
+		Identity:        identity,
+		TaskSubject:     "worker.doc.processing.cpp_ml",
+		StepId:          "step-500",
+		CallbackAddress: "localhost:8080",
+	}
+
+	var publishedMsgIDs []string
+	mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+		msgID := msg.Header.Get(nats.MsgIdHdr)
+		publishedMsgIDs = append(publishedMsgIDs, msgID)
+		return true
+	}), mock.Anything).Return(&jetstream.PubAck{Sequence: 1}, nil)
+
+	err := eng.ExecuteTask(context.Background(), req1)
+	assert.NoError(t, err)
+
+	err = eng.ExecuteTask(context.Background(), req2)
+	assert.NoError(t, err)
+
+	assert.Len(t, publishedMsgIDs, 2)
+	assert.Equal(t, "job-unique-test-step-500-worker.cache.lookup-0", publishedMsgIDs[0])
+	assert.Equal(t, "job-unique-test-step-500-worker.doc.processing.cpp_ml-0", publishedMsgIDs[1])
+	assert.NotEqual(t, publishedMsgIDs[0], publishedMsgIDs[1], "Task message IDs must be unique under identical JobId and StepId")
+}
+
+func TestEngine_ExecuteTask_MsgID_AttemptHandling(t *testing.T) {
+	mockJS := new(mockJetStream)
+	eng := &Engine{
+		js:       mockJS,
+		clientID: "orchestrator-task-router",
+	}
+
+	identity := &pb.InfrastructureIdentity{
+		TenantId: "tenant-101",
+		AppId:    "app-alpha",
+		JobId:    "job-attempt-test",
+	}
+
+	t.Run("x-attempt header sets attempt index", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:        identity,
+			TaskSubject:     "worker.ai.inference",
+			StepId:          "step-600",
+			CallbackAddress: "localhost:8080",
+			Headers:         map[string]string{"x-attempt": "2"},
+		}
+
+		var capturedMsgID string
+		mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+			capturedMsgID = msg.Header.Get(nats.MsgIdHdr)
+			return true
+		}), mock.Anything).Return(&jetstream.PubAck{Sequence: 1}, nil).Once()
+
+		err := eng.ExecuteTask(context.Background(), req)
+		assert.NoError(t, err)
+		assert.Equal(t, "job-attempt-test-step-600-worker.ai.inference-2", capturedMsgID)
+	})
+
+	t.Run("attempt header sets attempt index", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:        identity,
+			TaskSubject:     "worker.ai.inference",
+			StepId:          "step-600",
+			CallbackAddress: "localhost:8080",
+			Headers:         map[string]string{"attempt": "3"},
+		}
+
+		var capturedMsgID string
+		mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+			capturedMsgID = msg.Header.Get(nats.MsgIdHdr)
+			return true
+		}), mock.Anything).Return(&jetstream.PubAck{Sequence: 2}, nil).Once()
+
+		err := eng.ExecuteTask(context.Background(), req)
+		assert.NoError(t, err)
+		assert.Equal(t, "job-attempt-test-step-600-worker.ai.inference-3", capturedMsgID)
+	})
+
+	t.Run("default attempt index is 0 when unsupplied", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:        identity,
+			TaskSubject:     "worker.ai.inference",
+			StepId:          "step-600",
+			CallbackAddress: "localhost:8080",
+		}
+
+		var capturedMsgID string
+		mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+			capturedMsgID = msg.Header.Get(nats.MsgIdHdr)
+			return true
+		}), mock.Anything).Return(&jetstream.PubAck{Sequence: 3}, nil).Once()
+
+		err := eng.ExecuteTask(context.Background(), req)
+		assert.NoError(t, err)
+		assert.Equal(t, "job-attempt-test-step-600-worker.ai.inference-0", capturedMsgID)
+	})
+}
+
+func TestEngine_ExecuteTask_MsgID_InvalidAttempt_Panics(t *testing.T) {
+	eng := &Engine{
+		clientID: "orchestrator-task-router",
+	}
+
+	identity := &pb.InfrastructureIdentity{
+		TenantId: "tenant-101",
+		AppId:    "app-alpha",
+		JobId:    "job-attempt-test",
+	}
+
+	t.Run("invalid x-attempt header panics", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:        identity,
+			TaskSubject:     "worker.ai.inference",
+			StepId:          "step-600",
+			CallbackAddress: "localhost:8080",
+			Headers:         map[string]string{"x-attempt": "invalid_num"},
+		}
+
+		assertPanicsWithError(t, "invalid x-attempt header", func() {
+			_ = eng.ExecuteTask(context.Background(), req)
+		})
+	})
+
+	t.Run("invalid attempt header panics", func(t *testing.T) {
+		req := &pb.ExecuteTaskRequest{
+			Identity:        identity,
+			TaskSubject:     "worker.ai.inference",
+			StepId:          "step-600",
+			CallbackAddress: "localhost:8080",
+			Headers:         map[string]string{"attempt": "invalid_num"},
+		}
+
+		assertPanicsWithError(t, "invalid attempt header", func() {
+			_ = eng.ExecuteTask(context.Background(), req)
+		})
+	})
+}
+
+func TestEngine_ExecuteTask_MultiWorkerChain_NoDeduplicationDrop(t *testing.T) {
+	mockJS := new(mockJetStream)
+	eng := &Engine{
+		js:       mockJS,
+		clientID: "orchestrator-task-router",
+	}
+
+	identity := &pb.InfrastructureIdentity{
+		TenantId: "tenant-multi",
+		AppId:    "app-multi",
+		JobId:    "job-multi-worker",
+	}
+
+	// Simulate JetStream deduplication window: if the exact same msgID is published twice, return error
+	seenMsgIDs := make(map[string]bool)
+	mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
+		msgID := msg.Header.Get(nats.MsgIdHdr)
+		if seenMsgIDs[msgID] {
+			return false
+		}
+		seenMsgIDs[msgID] = true
+		return true
+	}), mock.Anything).Return(&jetstream.PubAck{Sequence: 1}, nil)
+
+	// Step dispatches worker 1: cache lookup
+	req1 := &pb.ExecuteTaskRequest{
+		Identity:        identity,
+		TaskSubject:     "worker.cache.lookup",
+		StepId:          "step-chain-1",
+		CallbackAddress: "localhost:9000",
+	}
+	err := eng.ExecuteTask(context.Background(), req1)
+	assert.NoError(t, err)
+
+	// Step dispatches worker 2: doc processing (same JobId and StepId)
+	req2 := &pb.ExecuteTaskRequest{
+		Identity:        identity,
+		TaskSubject:     "worker.doc.processing.cpp_ml",
+		StepId:          "step-chain-1",
+		CallbackAddress: "localhost:9000",
+	}
+	err = eng.ExecuteTask(context.Background(), req2)
+	assert.NoError(t, err)
+
+	assert.True(t, seenMsgIDs["job-multi-worker-step-chain-1-worker.cache.lookup-0"])
+	assert.True(t, seenMsgIDs["job-multi-worker-step-chain-1-worker.doc.processing.cpp_ml-0"])
+	assert.Equal(t, 2, len(seenMsgIDs))
+}
+
