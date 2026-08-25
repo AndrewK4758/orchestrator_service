@@ -1,18 +1,18 @@
 package engine
 
 import (
-	"strings"
-	"context"
-	"errors"
-	"os"
-	"testing"
+    "context"
+    "errors"
+    "os"
+    "strings"
+    "testing"
 
-	pb "github.com/AndrewK4758/shared_protos"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"google.golang.org/protobuf/types/known/structpb"
+    pb "github.com/AndrewK4758/shared_protos"
+    "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go/jetstream"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+    "google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestMain(m *testing.M) {
@@ -132,7 +132,7 @@ func TestEngine_ExecuteTask_PublishSuccess(t *testing.T) {
 		clientID: "orchestrator-task-router",
 	}
 
-	payload, err := structpb.NewStruct(map[string]interface{}{
+	payload, err := structpb.NewStruct(map[string]any{
 		"key": "val",
 	})
 	assert.NoError(t, err)
@@ -167,7 +167,7 @@ func TestEngine_ExecuteTask_PublishError(t *testing.T) {
 		clientID: "orchestrator-task-router",
 	}
 
-	payload, err := structpb.NewStruct(map[string]interface{}{
+	payload, err := structpb.NewStruct(map[string]any{
 		"key": "val",
 	})
 	assert.NoError(t, err)
@@ -214,7 +214,8 @@ func TestEngine_ResumeJob(t *testing.T) {
 				AppId:    "app1",
 				JobId:    "job1",
 			},
-			StepId: "step_resumed",
+			StepId:          "step_resumed",
+			CallbackAddress: "http://localhost:50051",
 		}
 
 		mockJS.On("PublishMsg", mock.Anything, mock.MatchedBy(func(msg *nats.Msg) bool {
@@ -234,7 +235,8 @@ func TestEngine_ResumeJob(t *testing.T) {
 
 		assertPanicsWithError(t, "missing infrastructure identity", func() {
 			_ = eng.ResumeJob(ctx, &pb.ResumeJobRequest{
-				StepId: "step1",
+				StepId:          "step1",
+				CallbackAddress: "http://localhost:50051",
 			})
 		})
 
@@ -245,7 +247,20 @@ func TestEngine_ResumeJob(t *testing.T) {
 					AppId:    "a1",
 					JobId:    "j1",
 				},
-				StepId: "",
+				StepId:          "",
+				CallbackAddress: "http://localhost:50051",
+			})
+		})
+
+		assertPanicsWithError(t, "missing callback address", func() {
+			_ = eng.ResumeJob(ctx, &pb.ResumeJobRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "t1",
+					AppId:    "a1",
+					JobId:    "j1",
+				},
+				StepId:          "step1",
+				CallbackAddress: "",
 			})
 		})
 	})

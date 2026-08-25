@@ -12,16 +12,8 @@ type EventType string
 
 const (
 	EventChunkTrace           EventType = "chunk.trace"
-	EventJobStepFailed        EventType = "step.failed"
-	EventJobStepPendingHuman  EventType = "step.pending_human"
-	EventStepValidationFailed EventType = "step.validation_failed"
 
-	EventPlanApproved              EventType = "plan.approved"
-	EventPlanRejectedRetry         EventType = "plan.rejected_retry"
-	EventStepValidationFailedRetry EventType = "step.validation_failed_retry"
-	EventActionStarted             EventType = "action.started"
-	EventActionCompleted           EventType = "action.completed"
-	EventActionFailed              EventType = "action.failed"
+    EventActionCompleted           EventType = "action.completed"
 )
 
 // TraceabilityEvent is the core wrapper for all compliance and tracing data.

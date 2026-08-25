@@ -14,7 +14,7 @@ import (
 
 // ValidationInterceptor creates a gRPC interceptor that validates incoming requests.
 func ValidationInterceptor(v protovalidate.Validator) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		msg, ok := req.(proto.Message)
 		if !ok {
 			// Not a proto message, pass through
@@ -23,8 +23,7 @@ func ValidationInterceptor(v protovalidate.Validator) grpc.UnaryServerIntercepto
 
 		// Run protovalidate
 		if err := v.Validate(msg); err != nil {
-			var valErr *protovalidate.ValidationError
-			if errors.As(err, &valErr) {
+			if valErr, ok := errors.AsType[*protovalidate.ValidationError](err); ok {
 				st := status.New(codes.InvalidArgument, "Request validation failed")
 
 				// Map protovalidate violations to gRPC errdetails.BadRequest

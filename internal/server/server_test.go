@@ -273,7 +273,7 @@ type webhookRoutingTestCase struct {
 	expectOnSuccess int
 	expectOnFail    int
 	expectOnSuspend int
-	validatePayload func(t *testing.T, req interface{})
+	validatePayload func(t *testing.T, req any)
 }
 
 func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T) {
@@ -300,7 +300,7 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 1,
 			expectOnFail:    0,
 			expectOnSuspend: 0,
-			validatePayload: func(t *testing.T, req interface{}) {
+			validatePayload: func(t *testing.T, req any) {
 				r := req.(*pb.ExecuteTaskRequest)
 				assert.Equal(t, "job_success_100", r.Identity.JobId)
 				assert.Equal(t, "step_parse_doc", r.StepId)
@@ -320,7 +320,7 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 0,
 			expectOnFail:    1,
 			expectOnSuspend: 0,
-			validatePayload: func(t *testing.T, req interface{}) {
+			validatePayload: func(t *testing.T, req any) {
 				r := req.(*pb.JobFailedRequest)
 				assert.Equal(t, "job_failed_200", r.Identity.JobId)
 				assert.Equal(t, "step_llm_inference", r.StepId)
@@ -337,7 +337,7 @@ func TestServer_ProcessWebhookMsg_ClientCallbackRouting_TableDriven(t *testing.T
 			expectOnSuccess: 0,
 			expectOnFail:    0,
 			expectOnSuspend: 1,
-			validatePayload: func(t *testing.T, req interface{}) {
+			validatePayload: func(t *testing.T, req any) {
 				r := req.(*pb.JobSuspendedRequest)
 				assert.Equal(t, "job_suspended_300", r.Identity.JobId)
 				assert.Equal(t, "step_human_validation", r.StepId)
@@ -457,17 +457,24 @@ func (m *mockEngine) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) er
 }
 
 func TestOrchestratorServer_ResumeJob(t *testing.T) {
+	cbMock, cbAddr, cleanup := setupMockCallbackServer(t)
+	defer cleanup()
+
 	mockEng := &mockEngine{}
 	srv := &OrchestratorServer{
-		eng: mockEng,
+		eng:          mockEng,
+		webhookConns: make(map[string]*clientConnEntry),
+		grpcTimeout:  30,
+		grpcMaxMsgMb: 4,
 	}
 
 	ctx := context.Background()
 
-	t.Run("Happy Path", func(t *testing.T) {
-		var capturedReq *pb.ResumeJobRequest
+	t.Run("Happy Path Dispatches gRPC Callback", func(t *testing.T) {
+		cbMock.Reset()
+		var capturedEngReq *pb.ResumeJobRequest
 		mockEng.resumeJobFunc = func(ctx context.Context, req *pb.ResumeJobRequest) error {
-			capturedReq = req
+			capturedEngReq = req
 			return nil
 		}
 
@@ -477,7 +484,8 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 				AppId:    "app_resume",
 				JobId:    "job_resume_123",
 			},
-			StepId: "step_classify",
+			StepId:          "step_classify",
+			CallbackAddress: cbAddr,
 		}
 
 		resp, err := srv.ResumeJob(ctx, req)
@@ -485,14 +493,40 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 		assert.NotNil(t, resp)
 		assert.True(t, resp.GetSuccess())
 		assert.Equal(t, "Job resumed successfully", resp.GetMessage())
-		assert.Equal(t, "job_resume_123", capturedReq.GetIdentity().GetJobId())
-		assert.Equal(t, "step_classify", capturedReq.GetStepId())
+		assert.Equal(t, "job_resume_123", capturedEngReq.GetIdentity().GetJobId())
+		assert.Equal(t, "step_classify", capturedEngReq.GetStepId())
+		assert.Equal(t, 1, cbMock.OnSuccessCount())
+		assert.Equal(t, "job_resume_123", cbMock.GetSuccessRequests()[0].Identity.JobId)
+		assert.Equal(t, "step_classify", cbMock.GetSuccessRequests()[0].StepId)
 	})
 
-	t.Run("Fail-fast panics on missing identity", func(t *testing.T) {
+	t.Run("Callback dispatch failure returns Success false", func(t *testing.T) {
+		req := &pb.ResumeJobRequest{
+			Identity: &pb.InfrastructureIdentity{
+				TenantId: "tenant_resume",
+				AppId:    "app_resume",
+				JobId:    "job_resume_fail",
+			},
+			StepId:          "step_fail",
+			CallbackAddress: "127.0.0.1:54321", // non-existent server
+		}
+
+		resp, err := srv.ResumeJob(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.False(t, resp.GetSuccess())
+		assert.Contains(t, resp.GetMessage(), "failed to resume job callback")
+	})
+
+	t.Run("Fail-fast panics on missing identity or callback address", func(t *testing.T) {
+		assert.Panics(t, func() {
+			_, _ = srv.ResumeJob(ctx, nil)
+		})
+
 		assert.Panics(t, func() {
 			_, _ = srv.ResumeJob(ctx, &pb.ResumeJobRequest{
-				StepId: "step1",
+				StepId:          "step1",
+				CallbackAddress: cbAddr,
 			})
 		})
 
@@ -503,7 +537,8 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 					AppId:    "app",
 					JobId:    "job",
 				},
-				StepId: "step1",
+				StepId:          "step1",
+				CallbackAddress: cbAddr,
 			})
 		})
 
@@ -514,7 +549,20 @@ func TestOrchestratorServer_ResumeJob(t *testing.T) {
 					AppId:    "app",
 					JobId:    "job",
 				},
-				StepId: "",
+				StepId:          "",
+				CallbackAddress: cbAddr,
+			})
+		})
+
+		assert.Panics(t, func() {
+			_, _ = srv.ResumeJob(ctx, &pb.ResumeJobRequest{
+				Identity: &pb.InfrastructureIdentity{
+					TenantId: "tenant",
+					AppId:    "app",
+					JobId:    "job",
+				},
+				StepId:          "step1",
+				CallbackAddress: "",
 			})
 		})
 	})

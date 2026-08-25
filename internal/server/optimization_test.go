@@ -11,7 +11,7 @@ func BenchmarkWebhookConnsLockContention(b *testing.B) {
 	}
 
 	// Pre-fill webhookConns to simulate load
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		addr := fmt.Sprintf("127.0.0.1:%d", 10000+i)
 		srv.webhookConns[addr] = nil
 	}

@@ -47,7 +47,7 @@ func TestAdversarial_Orchestrator_RoutingAgnosticism_ExtremeInputs(t *testing.T)
 
 	for i, uri := range extremeURIs {
 		t.Run(fmt.Sprintf("Extreme_StorageUri_%d", i), func(t *testing.T) {
-			funcStruct, _ := structpb.NewStruct(map[string]interface{}{
+			funcStruct, _ := structpb.NewStruct(map[string]any{
 				"ClaimCheckUri": uri,
 				"ArbitraryData": "some_value",
 			})
@@ -75,7 +75,7 @@ func TestAdversarial_Orchestrator_ProcessWebhookMsg_ConcurrentStress(t *testing.
 	addrs := make([]string, serverCount)
 	cbMocks := make([]*mockCallbackServer, serverCount)
 
-	for i := 0; i < serverCount; i++ {
+	for i := range serverCount {
 		lis, err := net.Listen("tcp", "127.0.0.1:0")
 		assert.NoError(t, err)
 
@@ -103,7 +103,7 @@ func TestAdversarial_Orchestrator_ProcessWebhookMsg_ConcurrentStress(t *testing.
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		go func(id int) {
 			defer wg.Done()
 			targetServerIdx := id % serverCount

@@ -98,7 +98,7 @@ func main() {
 	)
 
 	// Register the Orchestrator service and inject dependencies
-	orchestratorServer := server.NewServer(ctx, pub, traceClient)
+	orchestratorServer := server.NewServer(ctx, pub)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
 	// Register reflection service on gRPC server so clients can query it

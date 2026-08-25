@@ -5,14 +5,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
-	"time"
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/AndrewK4758/shared_utils/logger"
 
 	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -75,24 +72,10 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 		CallbackAddress: addr,
 	}
 
-	s.webhookConnMu.Lock()
-	entry, ok := s.webhookConns[addr]
-	if !ok {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			s.webhookConnMu.Unlock()
-			return fmt.Errorf("failed to dial callback address %s: %w", addr, err)
-		}
-		entry = &clientConnEntry{
-			conn:       conn,
-			lastAccess: time.Now(),
-		}
-		s.webhookConns[addr] = entry
-	} else {
-		entry.lastAccess = time.Now()
+	client, err := s.getCallbackClient(addr)
+	if err != nil {
+		return err
 	}
-	client := pb.NewOrchestratorCallbackServiceClient(entry.conn)
-	s.webhookConnMu.Unlock()
 
 	if !resp.Success {
 		if resp.IsTransientError {
@@ -124,22 +107,8 @@ func (s *OrchestratorServer) processOrchestratorResponses(ctx context.Context, m
 
 	logger.Info("System", "Pushing callback to client (output success request) for Job: %s, Step: %s", req.Identity.JobId, req.StepId)
 
-	stream, err := client.OnTaskExecutionComplete(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to open OnTaskExecutionComplete stream: %w", err)
-	}
-
-	if err := stream.Send(req); err != nil {
-		return fmt.Errorf("failed to send on stream: %w", err)
-	}
-
-	if err := stream.CloseSend(); err != nil {
-		return fmt.Errorf("failed to close stream: %w", err)
-	}
-
-	// Wait for ack
-	if _, err := stream.Recv(); err != nil {
-		return fmt.Errorf("failed to receive ack: %w", err)
+	if err := sendTaskExecutionComplete(ctx, client, req); err != nil {
+		return err
 	}
 
 	logger.Info("System", "Successfully relayed TaskCompleted event for Job: %s, Step: %s to %s", req.Identity.JobId, req.StepId, addr)

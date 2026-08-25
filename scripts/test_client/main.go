@@ -138,7 +138,7 @@ func processFile(client pb.OrchestratorServiceClient, artemis *ArtemisCallbackSe
 	fmt.Println("\n[test_client] PHASE 1: Submitting Initial State...")
 
 	b64Doc := base64.StdEncoding.EncodeToString(pdfBytes)
-	funcStruct, err := structpb.NewStruct(map[string]interface{}{
+	funcStruct, err := structpb.NewStruct(map[string]any{
 		"document_b64": b64Doc,
 	})
 	if err != nil {

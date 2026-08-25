@@ -9,21 +9,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-type mockTraceClient struct {
-	pb.TraceabilityQueryClient
-	getJobStateFn func(ctx context.Context, in *pb.GetJobStateRequest, opts ...grpc.CallOption) (*pb.GetJobStateResponse, error)
-}
-
-func (m *mockTraceClient) GetJobState(ctx context.Context, in *pb.GetJobStateRequest, opts ...grpc.CallOption) (*pb.GetJobStateResponse, error) {
-	if m.getJobStateFn != nil {
-		return m.getJobStateFn(ctx, in, opts...)
-	}
-	return &pb.GetJobStateResponse{
-		Found: true,
-		Job:   &pb.JobStateRecord{Status: "PENDING"},
-	}, nil
-}
-
 func TestDispatch_DuplicateActiveDispatch(t *testing.T) {
 	t.Skip("Skipping integration test requiring NATS")
 	pub := &mockPublisher{}

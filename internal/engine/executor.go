@@ -27,7 +27,7 @@ type Engine struct {
 	clientID string
 }
 
-func NewEngine(ctx context.Context) (*Engine, error) {
+func NewEngine() (*Engine, error) {
 	natsURL := envutil.MustGetString("NATS_URL")
 
 	nc, err := nats.Connect(natsURL)
@@ -147,9 +147,12 @@ func (e *Engine) ResumeJob(ctx context.Context, req *pb.ResumeJobRequest) error 
 	if strings.TrimSpace(req.StepId) == "" {
 		panic(fmt.Errorf("[RESUME JOB] invalid request: missing step id"))
 	}
+	if strings.TrimSpace(req.CallbackAddress) == "" {
+		panic(fmt.Errorf("[RESUME JOB] invalid request: missing callback address"))
+	}
 
-	logger.Info("Engine", "Resuming workflow execution for Job: %s, Step: %s (Tenant: %s, App: %s)",
-		req.Identity.JobId, req.StepId, req.Identity.TenantId, req.Identity.AppId)
+	logger.Info("Engine", "Resuming workflow execution for Job: %s, Step: %s (Tenant: %s, App: %s, Callback: %s)",
+		req.Identity.JobId, req.StepId, req.Identity.TenantId, req.Identity.AppId, req.CallbackAddress)
 
 	subject := fmt.Sprintf("orchestrator.job.resumed.%s.%s.%s", req.Identity.TenantId, req.Identity.AppId, req.Identity.JobId)
 	reqBytes, err := proto.Marshal(req)

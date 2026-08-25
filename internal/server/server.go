@@ -49,10 +49,10 @@ type JobPublisher interface {
 	PurgeQueues(ctx context.Context) error
 }
 
-func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.TraceabilityQueryClient) *OrchestratorServer {
-	eng, err := engine.NewEngine(ctx)
+func NewServer(ctx context.Context, pub JobPublisher) *OrchestratorServer {
+	eng, err := engine.NewEngine()
 	if err != nil {
-		panic(fmt.Errorf("Failed to initialize engine: %v", err))
+		panic(fmt.Errorf("failed to initialize engine: %v", err))
 	}
 
 	srv := &OrchestratorServer{
@@ -64,11 +64,11 @@ func NewServer(ctx context.Context, pub JobPublisher, traceClient pb.Traceabilit
 	}
 
 	if err := srv.pub.ConsumeWebhooks(ctx, srv.processWebhookMsg); err != nil {
-		panic(fmt.Errorf("Failed to start webhooks consumer: %v", err))
+		panic(fmt.Errorf("failed to start webhooks consumer: %v", err))
 	}
 
 	if err := srv.pub.ConsumeOrchestratorResponses(ctx, srv.processOrchestratorResponses); err != nil {
-		panic(fmt.Errorf("Failed to start orchestrator responses consumer: %v", err))
+		panic(fmt.Errorf("failed to start orchestrator responses consumer: %v", err))
 	}
 
 	go func() {
@@ -129,6 +129,49 @@ func (s *OrchestratorServer) ExecuteTask(ctx context.Context, req *pb.ExecuteTas
 	}, nil
 }
 
+func (s *OrchestratorServer) getCallbackClient(addr string) (pb.OrchestratorCallbackServiceClient, error) {
+	s.webhookConnMu.Lock()
+	entry, ok := s.webhookConns[addr]
+	if !ok {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			s.webhookConnMu.Unlock()
+			return nil, fmt.Errorf("failed to dial callback address %s: %w", addr, err)
+		}
+		entry = &clientConnEntry{
+			conn:       conn,
+			lastAccess: time.Now(),
+		}
+		s.webhookConns[addr] = entry
+	} else {
+		entry.lastAccess = time.Now()
+	}
+	client := pb.NewOrchestratorCallbackServiceClient(entry.conn)
+	s.webhookConnMu.Unlock()
+	return client, nil
+}
+
+func sendTaskExecutionComplete(ctx context.Context, client pb.OrchestratorCallbackServiceClient, req *pb.ExecuteTaskRequest) error {
+	stream, err := client.OnTaskExecutionComplete(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open OnTaskExecutionComplete stream: %w", err)
+	}
+
+	if err := stream.Send(req); err != nil {
+		return fmt.Errorf("failed to send on stream: %w", err)
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		return fmt.Errorf("failed to close stream: %w", err)
+	}
+
+	if _, err := stream.Recv(); err != nil {
+		return fmt.Errorf("failed to receive ack: %w", err)
+	}
+
+	return nil
+}
+
 func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstream.Msg) error {
 	var evt events.WebhookEvent
 	if err := json.Unmarshal(msg.Data(), &evt); err != nil {
@@ -150,24 +193,10 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		panic(fmt.Errorf("action failed for job processWebhookMsg: missing required property CallbackAddress"))
 	}
 
-	s.webhookConnMu.Lock()
-	entry, ok := s.webhookConns[addr]
-	if !ok {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			s.webhookConnMu.Unlock()
-			return fmt.Errorf("failed to dial callback address %s: %w", addr, err)
-		}
-		entry = &clientConnEntry{
-			conn:       conn,
-			lastAccess: time.Now(),
-		}
-		s.webhookConns[addr] = entry
-	} else {
-		entry.lastAccess = time.Now()
+	client, err := s.getCallbackClient(addr)
+	if err != nil {
+		return err
 	}
-	client := pb.NewOrchestratorCallbackServiceClient(entry.conn)
-	s.webhookConnMu.Unlock()
 
 	if evt.ErrorContract != nil {
 		if evt.IsSuspended {
@@ -203,24 +232,37 @@ func (s *OrchestratorServer) processWebhookMsg(ctx context.Context, msg jetstrea
 		return nil
 	}
 
-	stream, err := client.OnTaskExecutionComplete(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to open OnTaskExecutionComplete stream: %w", err)
-	}
-
-	if err := stream.Send(evt.Request); err != nil {
-		return fmt.Errorf("failed to send on stream: %w", err)
-	}
-
-	if err := stream.CloseSend(); err != nil {
-		return fmt.Errorf("failed to close stream: %w", err)
-	}
-
-	if _, err := stream.Recv(); err != nil {
-		return fmt.Errorf("failed to receive ack: %w", err)
+	if err := sendTaskExecutionComplete(ctx, client, evt.Request); err != nil {
+		return err
 	}
 
 	logger.Info("System", "Successfully relayed webhook callback for Job: %s, Step: %s to %s", evt.Request.Identity.JobId, evt.Request.StepId, addr)
+	return nil
+}
+
+func (s *OrchestratorServer) relayResumeCallback(ctx context.Context, req *pb.ResumeJobRequest) error {
+	addr := req.CallbackAddress
+	if strings.TrimSpace(addr) == "" {
+		panic(fmt.Errorf("action failed for job %s: missing required property CallbackAddress", req.Identity.JobId))
+	}
+
+	client, err := s.getCallbackClient(addr)
+	if err != nil {
+		return err
+	}
+
+	taskReq := &pb.ExecuteTaskRequest{
+		Identity:        req.Identity,
+		StepId:          req.StepId,
+		Payload:         req.Corrected,
+		CallbackAddress: req.CallbackAddress,
+	}
+
+	if err := sendTaskExecutionComplete(ctx, client, taskReq); err != nil {
+		return err
+	}
+
+	logger.Info("System", "Successfully relayed resumption callback for Job: %s, Step: %s to %s", req.Identity.JobId, req.StepId, addr)
 	return nil
 }
 
@@ -234,14 +276,23 @@ func (s *OrchestratorServer) ResumeJob(ctx context.Context, req *pb.ResumeJobReq
 	if strings.TrimSpace(req.StepId) == "" {
 		panic(fmt.Errorf("action failed for job %s: missing required property StepId", req.Identity.JobId))
 	}
+	if strings.TrimSpace(req.CallbackAddress) == "" {
+		panic(fmt.Errorf("action failed for job %s: missing required property CallbackAddress", req.Identity.JobId))
+	}
 
-	logger.Info("System", "Received ResumeJob for JobID: %s, StepID: %s", req.Identity.JobId, req.StepId)
+	logger.Info("System", "Received ResumeJob for JobID: %s, StepID: %s, CallbackAddress: %s", req.Identity.JobId, req.StepId, req.CallbackAddress)
 
-	err := s.eng.ResumeJob(ctx, req)
-	if err != nil {
+	if s.eng != nil {
+		if err := s.eng.ResumeJob(ctx, req); err != nil {
+			logger.Error("System", "Engine ResumeJob failed for JobID %s: %v", req.Identity.JobId, err)
+		}
+	}
+
+	if err := s.relayResumeCallback(ctx, req); err != nil {
+		logger.Error("System", "Failed to relay resumption callback for JobID %s: %v", req.Identity.JobId, err)
 		return &pb.ResumeJobResponse{
 			Success: false,
-			Message: fmt.Sprintf("failed to resume job: %v", err),
+			Message: fmt.Sprintf("failed to resume job callback: %v", err),
 		}, nil
 	}
 

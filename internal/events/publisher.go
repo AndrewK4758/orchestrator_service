@@ -519,9 +519,6 @@ func (p *Publisher) PublishWebhook(ctx context.Context, payload *WebhookEvent) e
 	}
 
 	tenantID, appID, jobID := natsutil.ExtractIdentity(identity)
-	if tenantID == "" || appID == "" || jobID == "" {
-		return fmt.Errorf("invalid identity: tenantID, appID, and jobID are all required and cannot be empty")
-	}
 
 	msgId := fmt.Sprintf("%s-%s", jobID, stepID)
 	msg := &nats.Msg{

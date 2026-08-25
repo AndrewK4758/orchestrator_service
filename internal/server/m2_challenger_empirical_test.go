@@ -6,9 +6,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	"orchestrator_service/internal/events"
+
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/stretchr/testify/assert"
-	"orchestrator_service/internal/events"
 )
 
 // TestM2_Challenger_EmpiricalPanicVerification explicitly validates every panic trigger
