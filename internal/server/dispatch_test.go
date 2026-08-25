@@ -6,7 +6,6 @@ import (
 
 	pb "github.com/AndrewK4758/shared_protos"
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc"
 )
 
 func TestDispatch_DuplicateActiveDispatch(t *testing.T) {

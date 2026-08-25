@@ -77,6 +77,7 @@ func main() {
 	}
 	defer traceConn.Close()
 	traceClient := pb.NewTraceabilityQueryClient(traceConn)
+	_ = traceClient
 
 	v, err := protovalidate.New()
 	if err != nil {
