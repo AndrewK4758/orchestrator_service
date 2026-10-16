@@ -29,7 +29,6 @@ import (
 )
 
 func main() {
-	// Attempt to load .env from standard deterministic execution paths
 	envutil.LoadEnv(".env", "orchestrator_service/.env", "../../.env")
 	logger.InitLogger()
 
@@ -43,7 +42,6 @@ func main() {
 		logger.Fatal("Orchestrator", "Failed to listen on port %s: %v", port, err)
 	}
 
-	// Connect to NATS JetStream
 	natsURL := envutil.MustGetString("NATS_URL")
 	if natsURL == "" {
 		logger.Fatal("Orchestrator", "NATS_URL environment variable is required")
@@ -58,7 +56,6 @@ func main() {
 	}
 	defer pub.Close()
 
-	// Connect to Traceability Service
 	traceabilityAddr := envutil.MustGetString("TRACEABILITY_SERVICE_ADDRESS")
 	if traceabilityAddr == "" {
 		logger.Fatal("Orchestrator", "TRACEABILITY_SERVICE_ADDRESS environment variable is required")
@@ -98,11 +95,9 @@ func main() {
 		),
 	)
 
-	// Register the Orchestrator service and inject dependencies
 	orchestratorServer := server.NewServer(ctx, pub)
 	pb.RegisterOrchestratorServiceServer(grpcServer, orchestratorServer)
 
-	// Register reflection service on gRPC server so clients can query it
 	reflection.Register(grpcServer)
 
 	go func() {

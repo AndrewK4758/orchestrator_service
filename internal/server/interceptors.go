@@ -17,16 +17,12 @@ func ValidationInterceptor(v protovalidate.Validator) grpc.UnaryServerIntercepto
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		msg, ok := req.(proto.Message)
 		if !ok {
-			// Not a proto message, pass through
 			return handler(ctx, req)
 		}
 
-		// Run protovalidate
 		if err := v.Validate(msg); err != nil {
 			if valErr, ok := errors.AsType[*protovalidate.ValidationError](err); ok {
 				st := status.New(codes.InvalidArgument, "Request validation failed")
-
-				// Map protovalidate violations to gRPC errdetails.BadRequest
 				badReq := &errdetails.BadRequest{}
 
 				for _, violation := range valErr.Violations {
@@ -36,17 +32,14 @@ func ValidationInterceptor(v protovalidate.Validator) grpc.UnaryServerIntercepto
 					})
 				}
 
-				// Attach the rich error details to the status
 				stWithDetails, attachErr := st.WithDetails(badReq)
 				if attachErr == nil {
 					return nil, stWithDetails.Err()
 				}
 			}
-			// Fallback if it's not a ValidationError or WithDetails fails
 			return nil, status.Errorf(codes.InvalidArgument, "invalid request: %v", err)
 		}
 
-		// Request is valid, proceed to handler
 		return handler(ctx, req)
 	}
 }

@@ -10,7 +10,6 @@ func BenchmarkWebhookConnsLockContention(b *testing.B) {
 		webhookConns: make(map[string]*clientConnEntry),
 	}
 
-	// Pre-fill webhookConns to simulate load
 	for i := range 1000 {
 		addr := fmt.Sprintf("127.0.0.1:%d", 10000+i)
 		srv.webhookConns[addr] = nil
@@ -18,13 +17,11 @@ func BenchmarkWebhookConnsLockContention(b *testing.B) {
 
 	b.ResetTimer()
 
-	// Simulate heavy concurrent Read/Writes to webhookConns map
 	b.RunParallel(func(p *testing.PB) {
 		i := 0
 		for p.Next() {
 			addr := fmt.Sprintf("127.0.0.1:%d", 10000+(i%1000))
 
-			// Simulate Read (Check Conn)
 			srv.webhookConnMu.RLock()
 			_, exists := srv.webhookConns[addr]
 			srv.webhookConnMu.RUnlock()

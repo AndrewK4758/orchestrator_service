@@ -12,8 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestM2_Challenger_EmpiricalPanicVerification explicitly validates every panic trigger
-// mandated for Milestone 2 by GEMINI.md and SCOPE.md.
+// TestM2_Challenger_EmpiricalPanicVerification verifies that missing or malformed required inputs trigger panics.
 func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 	srv := &OrchestratorServer{
 		webhookConns: make(map[string]*clientConnEntry),
@@ -41,7 +40,6 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 		req := &pb.ExecuteTaskRequest{
 			Identity: &pb.InfrastructureIdentity{
 				TenantId: "tenant-1",
-				// Missing AppId and JobId
 			},
 			TaskSubject: "worker.test",
 			StepId:      "step-1",
@@ -58,7 +56,6 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 				AppId:    "app-1",
 				JobId:    "job-1",
 			},
-			// Missing TaskSubject
 			StepId:          "step-1",
 			CallbackAddress: "localhost:1234",
 		}
@@ -76,7 +73,6 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 			},
 			TaskSubject: "worker.test",
 			StepId:      "step-1",
-			// Missing CallbackAddress
 		}
 		assert.Panics(t, func() {
 			_, _ = srv.ExecuteTask(context.Background(), req)
@@ -98,7 +94,7 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 	t.Run("ProcessWebhookMsg_InvalidIdentity_Panics", func(t *testing.T) {
 		evtBytes, err := json.Marshal(&events.WebhookEvent{
 			Request: &pb.ExecuteTaskRequest{
-				Identity: &pb.InfrastructureIdentity{TenantId: "t1"}, // incomplete identity
+				Identity: &pb.InfrastructureIdentity{TenantId: "t1"},
 			},
 		})
 		assert.NoError(t, err)
@@ -115,7 +111,6 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 					JobId:    "job-1",
 				},
 				StepId: "step-1",
-				// Missing CallbackAddress
 			},
 		})
 		assert.NoError(t, err)
@@ -124,7 +119,6 @@ func TestM2_Challenger_EmpiricalPanicVerification(t *testing.T) {
 	})
 
 	t.Run("ProcessOrchestratorResponses_MalformedSubject_Panics", func(t *testing.T) {
-		// Subject with fewer than 6 parts
 		msg := mockMsg{subject: "orchestrator.response.app"}
 		assert.Panics(t, func() { srv.processOrchestratorResponses(context.Background(), msg) })
 	})

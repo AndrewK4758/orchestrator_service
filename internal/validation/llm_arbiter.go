@@ -57,7 +57,7 @@ func NewDefaultLLMArbiter(client InferenceClient) *DefaultLLMArbiter {
 	}
 }
 
-// BuildPrompt constructs the deterministic zero-creativity arbitration prompt.
+// BuildPrompt formats the field comparison prompt for the LLM arbiter.
 func (a *DefaultLLMArbiter) BuildPrompt(fieldKey, fieldType, dbVal, docVal string, contextInfo map[string]any) string {
 	ctxBytes, _ := json.Marshal(contextInfo)
 	return fmt.Sprintf(`You are a deterministic semantic entity arbiter for financial and legal document verification.

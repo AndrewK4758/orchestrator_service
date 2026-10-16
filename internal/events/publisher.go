@@ -47,13 +47,11 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	// Create JetStream Context (v2 API)
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
 
-	// Ensure the Trace Stream exists
 	traceStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     StreamTraceEvents,
 		Subjects: []string{"trace.>"},
@@ -62,7 +60,6 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update trace stream: %w", err)
 	}
 
-	// Ensure the Jobs Stream exists
 	jobsStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     StreamJobs,
 		Subjects: []string{"jobs.>"},
@@ -71,7 +68,6 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update jobs stream: %w", err)
 	}
 
-	// Ensure the Webhooks Stream exists
 	webhooksStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     StreamWebhooks,
 		Subjects: []string{"webhooks.>"},
@@ -80,7 +76,6 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update webhooks stream: %w", err)
 	}
 
-	// Ensure the Workers Stream exists
 	workersStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      StreamWorkers,
 		Subjects:  []string{"worker.>"},
@@ -90,7 +85,6 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update workers stream: %w", err)
 	}
 
-	// Ensure the AI_RESPONSES Stream exists
 	aiResponsesStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     StreamAiResponses,
 		Subjects: []string{"ai.responses.>", "ai.response.>"},
@@ -103,7 +97,6 @@ func NewPublisher(ctx context.Context, natsURL string) (*Publisher, error) {
 		return nil, fmt.Errorf("failed to create or update ai_responses stream: %w", err)
 	}
 
-	// Ensure the ORCHESTRATOR_RESPONSES Stream exists
 	orchestratorResponsesStream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     StreamOrchestratorResponses,
 		Subjects: []string{"orchestrator.responses.>", "orchestrator.response.>"},
@@ -144,11 +137,9 @@ func (p *Publisher) PublishTrace(ctx context.Context, event TraceabilityEvent) e
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	// Publish to a specific subject, e.g., "trace.job.started"
 	subject := fmt.Sprintf(SubjectTraceFormat, event.EventType)
 	logger.Info("Publisher", "Publishing to NATS subject: '%s'", subject)
 
-	// Use JetStream publish for guaranteed delivery
 	_, err = p.js.Publish(ctx, subject, eventBytes)
 	tenantID, appID, jobID := natsutil.ExtractIdentity(event.Identity)
 	natsutil.LogJetStreamEvent(natsutil.JetStreamLogEvent{
@@ -178,7 +169,6 @@ func (p *Publisher) Close() {
 	}
 }
 
-// PublishJob publishes a new job request to JetStream.
 func sanitizeSubjectToken(token string) string {
 	token = strings.ReplaceAll(token, " ", "_")
 	token = strings.ReplaceAll(token, ".", "_")
@@ -326,7 +316,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		}
 	}
 
-	ackWaitSecs, errNatsTimeout := strconv.Atoi(envutil.MustGetString("NATS_TIMEOUT_SECONDS")) // 2 minutes default
+	ackWaitSecs, errNatsTimeout := strconv.Atoi(envutil.MustGetString("NATS_TIMEOUT_SECONDS"))
 	if errNatsTimeout != nil {
 		return fmt.Errorf("failed to parse NATS_TIMEOUT_SECONDS: %w", errNatsTimeout)
 	}
@@ -341,7 +331,6 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		SubjectNormal               = "jobs.*.*.*.incoming"
 	)
 
-	// Priority Consumer
 	priorityCons, err := p.js.CreateOrUpdateConsumer(ctx, StreamJobs, jetstream.ConsumerConfig{
 		Durable:       DurablePriorityConsumerName,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -354,7 +343,6 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 		return fmt.Errorf("failed to create priority consumer: %w", err)
 	}
 
-	// Normal Consumer
 	normalCons, err := p.js.CreateOrUpdateConsumer(ctx, StreamJobs, jetstream.ConsumerConfig{
 		Durable:       DurableNormalConsumerName,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -440,7 +428,7 @@ func (p *Publisher) ConsumeJobs(ctx context.Context, handler func(ctx context.Co
 				ctxMsg, cancelMsg := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Minute)
 				err := handler(ctxMsg, m)
 				cancelMsg()
-				close(done) // Signal heartbeat to stop
+				close(done)
 
 				durationMs := time.Since(startTime).Milliseconds()
 				if err != nil {

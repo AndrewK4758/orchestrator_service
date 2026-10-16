@@ -31,7 +31,6 @@ func EvaluateTier1(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 		return nil, false
 	}
 
-	// Exact string equality check (case-insensitive, trimmed)
 	if strings.EqualFold(s1, s2) {
 		return &FieldValidationResult{
 			FieldKey:   fieldKey,
@@ -47,7 +46,6 @@ func EvaluateTier1(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 		}, true
 	}
 
-	// SHA-256 fingerprint match
 	if canonical.Fingerprint(s1) == canonical.Fingerprint(s2) {
 		return &FieldValidationResult{
 			FieldKey:   fieldKey,
@@ -79,7 +77,6 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 	typeLower := strings.ToLower(strings.TrimSpace(fieldType))
 	keyLower := strings.ToLower(strings.TrimSpace(fieldKey))
 
-	// 1. Currency & Financial amounts
 	if typeLower == "currency" || strings.Contains(keyLower, "amount") || strings.Contains(keyLower, "fee") || strings.Contains(keyLower, "price") || strings.Contains(keyLower, "balance") {
 		matched, delta := canonical.MatchCurrencies(s1, s2)
 		if matched && delta == 0 {
@@ -96,7 +93,7 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 				LatencyMs:  time.Since(start).Milliseconds(),
 			}, true
 		}
-		// If delta > 0 for currency, Tier 2 deterministically declares mismatch (no LLM ambiguity for numbers)
+		// Numeric currency mismatches are rejected directly without falling back to the LLM.
 		return &FieldValidationResult{
 			FieldKey:   fieldKey,
 			FieldType:  fieldType,
@@ -111,7 +108,6 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 		}, true
 	}
 
-	// 2. Dates & Timestamps
 	if typeLower == "date" || strings.Contains(keyLower, "date") || strings.Contains(keyLower, "dob") || strings.Contains(keyLower, "timestamp") {
 		matched, delta := canonical.MatchDates(s1, s2)
 		if matched && delta == 0 {
@@ -128,7 +124,6 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 				LatencyMs:  time.Since(start).Milliseconds(),
 			}, true
 		}
-		// Date mismatch
 		return &FieldValidationResult{
 			FieldKey:   fieldKey,
 			FieldType:  fieldType,
@@ -143,7 +138,6 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 		}, true
 	}
 
-	// 3. Strict Identifiers (Tax ID, SSN, EIN, Loan Number)
 	if typeLower == "id" || strings.Contains(keyLower, "ssn") || strings.Contains(keyLower, "tax_id") || strings.Contains(keyLower, "tin") || strings.Contains(keyLower, "ein") || strings.Contains(keyLower, "loan_number") {
 		matched, score := canonical.MatchIdentifiers(s1, s2)
 		if matched {
@@ -174,7 +168,6 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 		}, true
 	}
 
-	// 4. Physical / Property Addresses
 	if typeLower == "address" || strings.Contains(keyLower, "address") || strings.Contains(keyLower, "street") || strings.Contains(keyLower, "property") {
 		matched, score := canonical.MatchAddresses(s1, s2)
 		if matched {
@@ -191,11 +184,10 @@ func EvaluateTier2(fieldKey, fieldType, dbVal, docVal string) (*FieldValidationR
 				LatencyMs:  time.Since(start).Milliseconds(),
 			}, true
 		}
-		// If address score is low, let Tier 3 evaluate if there's complex unit/suite or developer naming variation
+		// Fall through to Tier 3 to evaluate complex unit/suite or naming variations.
 		return nil, false
 	}
 
-	// 5. Names & General Text
 	matched, score := canonical.MatchNames(s1, s2)
 	if matched {
 		return &FieldValidationResult{

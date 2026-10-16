@@ -32,7 +32,6 @@ func TestCascadeEngine_Tier1_ExactBypass(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Identical strings
 	res, err := engine.ValidateField(ctx, "borrower_name", "text", "Jane Smith", "Jane Smith", nil)
 	assert.NoError(t, err)
 	assert.True(t, res.IsMatch)
@@ -40,7 +39,6 @@ func TestCascadeEngine_Tier1_ExactBypass(t *testing.T) {
 	assert.Equal(t, "EXACT_STRING", res.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// Identical dates
 	resDate, err := engine.ValidateField(ctx, "closing_date", "date", "2026-03-15", "2026-03-15", nil)
 	assert.NoError(t, err)
 	assert.True(t, resDate.IsMatch)
@@ -59,7 +57,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	engine := NewCascadeEngine(arbiter, nil)
 	ctx := context.Background()
 
-	// 1. Name typo / middle initial via Jaro-Winkler
 	resName, err := engine.ValidateField(ctx, "borrower_name", "name", "John Doe", "John A. Doe", nil)
 	assert.NoError(t, err)
 	assert.True(t, resName.IsMatch)
@@ -67,7 +64,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	assert.Equal(t, "JARO_WINKLER", resName.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// 2. Address CASS / Jaccard
 	resAddr, err := engine.ValidateField(ctx, "property_address", "address", "123 North Main Street, Suite 400, Atlanta, GA 30303", "123 n main st ste 400, atlanta ga 30303", nil)
 	assert.NoError(t, err)
 	assert.True(t, resAddr.IsMatch)
@@ -75,7 +71,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	assert.Equal(t, "ADDRESS_CASS_JACCARD", resAddr.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// 3. Currency exact cents
 	resCurr, err := engine.ValidateField(ctx, "loan_amount", "currency", "$450,000.00", "450000.00", nil)
 	assert.NoError(t, err)
 	assert.True(t, resCurr.IsMatch)
@@ -83,7 +78,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	assert.Equal(t, "CURRENCY_EXACT_CENTS", resCurr.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// 4. Currency delta mismatch (deterministic rejection at Tier 2)
 	resCurrMismatch, err := engine.ValidateField(ctx, "loan_amount", "currency", "$450,000.00", "$450,050.00", nil)
 	assert.NoError(t, err)
 	assert.False(t, resCurrMismatch.IsMatch)
@@ -91,7 +85,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	assert.Equal(t, "CURRENCY_DELTA", resCurrMismatch.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// 5. Date multi-format parsing
 	resDate, err := engine.ValidateField(ctx, "closing_date", "date", "March 15, 2026", "2026-03-15", nil)
 	assert.NoError(t, err)
 	assert.True(t, resDate.IsMatch)
@@ -99,7 +92,6 @@ func TestCascadeEngine_Tier2_DomainEvaluators(t *testing.T) {
 	assert.Equal(t, "DATE_EXACT_SECONDS", resDate.Algorithm)
 	assert.False(t, arbiterCalled)
 
-	// 6. Identifier sanitized matching
 	resSSN, err := engine.ValidateField(ctx, "ssn", "id", "123-45-6789", "123456789", nil)
 	assert.NoError(t, err)
 	assert.True(t, resSSN.IsMatch)

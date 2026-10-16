@@ -12,7 +12,7 @@ type FieldPair struct {
 	DocValue  string `json:"doc_value"`
 }
 
-// CascadeEngine orchestrates the 3-Tier Cascading Semantic Validation Engine.
+// CascadeEngine runs cascading field validation across exact, deterministic, and LLM tiers.
 type CascadeEngine struct {
 	arbiter      LLMArbiter
 	driftTracker *DriftTracker
@@ -28,22 +28,18 @@ func NewCascadeEngine(arbiter LLMArbiter, pub JetStreamPublisher) *CascadeEngine
 
 // ValidateField validates a single field pair across Tier 1 -> Tier 2 -> Tier 3.
 func (e *CascadeEngine) ValidateField(ctx context.Context, fieldKey, fieldType, dbVal, docVal string, contextInfo map[string]any) (*FieldValidationResult, error) {
-	// Tier 1: Exact / SHA-256 Match
 	if res, ok := EvaluateTier1(fieldKey, fieldType, dbVal, docVal); ok {
 		return res, nil
 	}
 
-	// Tier 2: Deterministic Distance & Metric Evaluators
 	if res, ok := EvaluateTier2(fieldKey, fieldType, dbVal, docVal); ok {
 		return res, nil
 	}
 
-	// Tier 3: LLM Semantic Arbiter
 	if e.arbiter != nil {
 		return e.arbiter.ArbitrateField(ctx, fieldKey, fieldType, dbVal, docVal, contextInfo)
 	}
 
-	// Fallback if arbiter not provided
 	return &FieldValidationResult{
 		FieldKey:   fieldKey,
 		FieldType:  fieldType,
@@ -61,7 +57,6 @@ func (e *CascadeEngine) ValidateField(ctx context.Context, fieldKey, fieldType, 
 
 // ValidateDocument validates all field pairs for a document and compiles the DocumentValidationReport.
 func (e *CascadeEngine) ValidateDocument(ctx context.Context, tenantID, appID, jobID string, fields map[string]FieldPair, contextInfo map[string]any) (*DocumentValidationReport, error) {
-	// Absolute Fail Fast: Panic immediately on missing identity
 	if tenantID == "" || appID == "" || jobID == "" {
 		panic(fmt.Sprintf("action failed: invalid identity - tenantID=%q, appID=%q, jobID=%q", tenantID, appID, jobID))
 	}
@@ -82,7 +77,6 @@ func (e *CascadeEngine) ValidateDocument(ctx context.Context, tenantID, appID, j
 	for fieldKey, pair := range fields {
 		res, err := e.ValidateField(ctx, fieldKey, pair.FieldType, pair.DbValue, pair.DocValue, contextInfo)
 		if err != nil {
-			// Record error result
 			res = &FieldValidationResult{
 				FieldKey:   fieldKey,
 				FieldType:  pair.FieldType,
@@ -120,7 +114,6 @@ func (e *CascadeEngine) ValidateDocument(ctx context.Context, tenantID, appID, j
 		report.OverallStatus = "REVIEW_REQUIRED"
 	}
 
-	// Track decision drift telemetry
 	if e.driftTracker != nil && len(observedTiers) > 0 {
 		_, _ = e.driftTracker.RecordAndCheck(ctx, tenantID, appID, jobID, observedTiers)
 	}

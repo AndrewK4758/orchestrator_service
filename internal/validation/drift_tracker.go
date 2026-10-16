@@ -62,13 +62,11 @@ func (dt *DriftTracker) RecordAndCheck(ctx context.Context, tenantID, appID, job
 	current := dt.history[tenantID]
 	current = append(current, tiers...)
 
-	// Trim to window size
 	if len(current) > dt.windowSize {
 		current = current[len(current)-dt.windowSize:]
 	}
 	dt.history[tenantID] = current
 
-	// Calculate Tier 3 percentage
 	tier3Count := 0
 	for _, t := range current {
 		if t == 3 {
